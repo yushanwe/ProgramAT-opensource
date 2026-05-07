@@ -1,4 +1,4 @@
-# Microsoft Open Source Code of Conduct
+# Microsoft Open Source Code of Conduct 
 
 This project has adopted the [Microsoft Open Source Code of Conduct][01], which is based on the [Contributor Covenant][03].
 
