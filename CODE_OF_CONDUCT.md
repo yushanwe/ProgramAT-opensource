@@ -5,7 +5,7 @@ This project has adopted the [Microsoft Open Source Code of Conduct][01], which 
 We pledge to act and interact in ways that contribute to an open, welcoming, diverse, inclusive, and
 healthy community.
 
-**All users must sign this code of conduct before contributing. You will be directed through this process when you make your first contribution**
+**All users must sign this code of conduct before contributing. You will be directed through the signing process when you make your first contribution**
 
 ## Our Standards
 
