@@ -1,0 +1,41 @@
+name: Code of Conduct check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-coc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Check signer
+        id: check
+        run: |
+          USER="${{ github.event.pull_request.user.login }}"
+          if yq '.signed[]' .github/code-of-conduct-signatures.yml | grep -Fxq "$USER"; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::$USER has not signed the Code of Conduct"
+            exit 1
+          fi
+
+      - name: Prompt contributor
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body \
+          "Thanks for contributing! Before this PR can be reviewed, please sign our Code of Conduct by commenting:
+
+          \`/sign-coc\`
+
+          Once signed, you won’t need to do this again."
