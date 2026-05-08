@@ -60,7 +60,7 @@ However, since they modify ProgramAT's underlying structure, they are also somew
 For this type of contribution to be accepted, you should first create an issue describing your proposed contribution and assign it the community-proposed label (alongside other labels that are appropriate).
 This issue should clearly describe what you propose (e.g. feature and proposed implementation, bug and proposed fix, etc.). 
 Community members can then react to the issue, giving a thumbs up react to indicate they would like to see this change and a thumbs down react to indicate that they do not want to see this change.
-Once the issue has recieved an aggregate of positive three thumbs up (i.e. at least three more thumbs up than thumbs down), AND a comment from a member of the research team indicating the change is given the go-ahead upon reaching three votes, it is eligible for a pull request.
+Once the issue has recieved an aggregate of positive three thumbs up (i.e. at least three more thumbs up than thumbs down), **and** a comment from a member of the research team indicating the change is given the go-ahead upon reaching three votes, it is eligible for a pull request.
 A list of research team members who are qualified to leave such a comment can be found here: (TODO: make list of who is on the research team and link it)
 Contributors' reactions to their own issues will not count towards the total of net three positive reactions.
 
