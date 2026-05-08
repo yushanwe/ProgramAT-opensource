@@ -62,7 +62,8 @@ Please include a link to your approved issue in this pull request. Pull requests
 In this pull request, you should detail how your submitted code changes address the plans laid out in your approved issue.
 For fastest approval, this description should include not just what you changed, but the line numbers, file names, and function names where appropriate for the associated changes.
 To be approved for merging upstream, the pull request needs to achieve at least three approving reviews, including at least one from a member of the research team.
-To be counted towards this total, the body of the review comment should contain the text "CORE CODE BASE REVIEW" (case sensitive).
+To be counted towards this total, the body of the review comment should contain the text "CORE CODE BASE REVIEW" (case sensitive). 
+If a review is for a contribution of multiple types, it can contain multiple phrases, to satisfy both counts.
 Contributors are not eligible to be a reviewer on their own pull request.
 
 You may recieve a review that requests additional changes: if you recieve such a review from a member of the research team, you must make these changes regardless of outside number of acceptances before merging, and recieve an approving review from the same research team member before proceeding to merge.
@@ -87,6 +88,7 @@ If a PR contains multiple types of contributions, of which documentation is just
 
 To be approved for merging upstream, the pull request needs to achieve at least three approving reviews.
 To be counted towards this total, the body of the review comment should contain the text "DOCUMENTATION REVIEW" (case sensitive).
+If a review is for a contribution of multiple types, it can contain multiple phrases, to satisfy both counts.
 Contributors are not eligible to be a reviewer on their own pull request.
 
 For this contribution type, a review from a member of the research team is not strictly required, though it still may occur. 
