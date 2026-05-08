@@ -20,7 +20,6 @@
     * Assistant Professor, Tufts University [Computer Science](https://engineering.tufts.edu/cs/)
     * [Github username: jayhersk](https://github.com/jayhersk)
     * [Personal site](https://jayl.in/)
-    * [Research group site (TADA)](https://jayl.in/newstudents.html)
 
  * Yushan Wei
     * Undergraduate, University of Michigan [Computer Science and Engineering (CSE)](https://cse.engin.umich.edu/) and [Mechanical Engineering](https://me.engin.umich.edu/)
