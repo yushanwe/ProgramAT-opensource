@@ -18,14 +18,14 @@ If you forget to do so, a configured Github action will prompt you to sign, and 
 This is only required for the first contribution, afterwards, your "signature" (Github username) will have been recorded as in agreement.
 
 ## Visual Assistive Tools
-### Why do I want to make this contribution?
+### Why do I want to make a Visual Assistive Tools contribution?
 As mentioned earlier, visual assistive tool contributions intend to push visual assistive tools upstream.
 You may want to make this kind of contribution for several reasons. Firstly, doing so makes a tool you've made and find useful available to the broader community so they can use it too.
 Secondly, ProgramAT's structure is modular, so new tools may borrow functionality from existing tools on main. 
 Thus, contributing visual assistive tools offers not just your specific tool to the community, but also allows future tools to leverage its component functionality.
 By contributing your tool, you also support other users and developers in making tools of their own that share some aspect of functionality.
 
-### What needs to happen for this contribution to be approved?
+### What needs to happen for a Visual Assistive Tools contribution to be approved?
 Since tools on main influence the development and behavior of other tools that come after it, it is very important that tools that make it upstream work properly.
 To ensure this, we require 3 members of the community (other than the contributor themselves) to verify the tool works as it says it does.
 
@@ -40,13 +40,13 @@ We request that these approvals be made from the app only, to encourage seriousl
 Once a visual tool PR has three approvals (i.e. three submitted reviews of the "yes, this tool works" variety from distinct users other than the contributor), it is eligible to be merged upstream.
 The exception to this is if a contribution is of multiple types, it does not become eligible to merge until _all_ relevant criteria or met, but three successful "this works" reviews satisfies the criteria for the visual assistive tool aspect of the contribution.
 
-## Core code base
-### Why do I want to make this contribution?
+## Core Code Base
+### Why do I want to make a Core Code Base contribution?
 Contributions to the core codebase are designed to make changes to the underlying server or mobile app code.
 If you would like to see a new feature in ProgramAT, or change how an existing feature works, this type of contribution may be of interest to you, as this is your opportunity to take implementation of things you would find helpful into your own hands.
 If you encounter a bug in the app or server and believe you have fixed it on your end, this contribution type is the most appropriate for distributing this change broadly.
 
-### What needs to happen for this contribution to be approved?
+### What needs to happen for a Core Code Base contribution to be approved?
 Core code base contributions are highly valuable: they are a big piece of how we expect ProgramAT to evolve and improve. 
 However, since they modify ProgramAT's underlying structure, they are also somewhat risky, and as such are subject to a more stringent process of review.
 
@@ -73,14 +73,14 @@ After meeting these criteria, the contribution is eligible to be merged upstream
 Again, the exception to this is if a contribution is of multiple types, it does not become eligible until criteria for _all_ types are met, but the box for the core code base contribution will be checked.
 
 ## Documentation
-### Why do I want to make this contribution?
+### Why do I want to make a Documentation contribution?
 Documentation is a very important part of the health of any codebase.
 You may want to make a contribution adding new documentation when submitting a contribution about the core code base or a new visual assistive tool, to make sure it is appropriately understood.
 You may also want to make a contribution adding new documentation outside of submitting new code if you notice an area where documentation is absent or underspecified.
 You may want to make a contribution updating existing documentation as well: for instance, if you notice existing documentation has become out of date, a documentation contribution empowers you to update it.
 Similarly, if you notice conflicts within existing documentation, a documentation contribution is the appropriate way to resolve the conflict.
 
-### What needs to happen for this contribution to be approved
+### What needs to happen for a Documentation contribution to be approved?
 To make a documentation contribution, you should submit a pull request containing the changed documentation, and assign the pull request the documentation label.
 If the pull request is solely for documentation, this should be present in the PR title. 
 If a PR contains multiple types of contributions, of which documentation is just one, however, this titling criteria does not apply 
