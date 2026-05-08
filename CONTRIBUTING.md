@@ -25,7 +25,7 @@ Secondly, ProgramAT's structure is modular, so new tools may borrow functionalit
 Thus, contributing visual assistive tools offers not just your specific tool to the community, but also allows future tools to leverage its component functionality.
 By contributing your tool, you also support other users and developers in making tools of their own that share some aspect of functionality.
 
-### What needs to happen for this contribution to be approved
+### What needs to happen for this contribution to be approved?
 Since tools on main influence the development and behavior of other tools that come after it, it is very important that tools that make it upstream work properly.
 To ensure this, we require 3 members of the community (other than the contributor themselves) to verify the tool works as it says it does.
 
@@ -46,7 +46,7 @@ Contributions to the core codebase are designed to make changes to the underlyin
 If you would like to see a new feature in ProgramAT, or change how an existing feature works, this type of contribution may be of interest to you, as this is your opportunity to take implementation of things you would find helpful into your own hands.
 If you encounter a bug in the app or server and believe you have fixed it on your end, this contribution type is the most appropriate for distributing this change broadly.
 
-### What needs to happen for this contribution to be approved
+### What needs to happen for this contribution to be approved?
 Core code base contributions are highly valuable: they are a big piece of how we expect ProgramAT to evolve and improve. 
 However, since they modify ProgramAT's underlying structure, they are also somewhat risky, and as such are subject to a more stringent process of review.
 
