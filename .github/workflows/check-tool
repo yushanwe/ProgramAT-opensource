@@ -1,0 +1,77 @@
+name: Validate Visual Assistive Tool PR
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  validate-tool-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate PR template fields
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || "";
+
+            const toolContributionChecked =
+              /- \[x\] This contribution is a new or modified visual assistive tool/i.test(body);
+
+            if (!toolContributionChecked) {
+              core.info("Not a visual assistive tool contribution. Skipping validation.");
+              return;
+            }
+
+            core.info("Visual assistive tool contribution detected.");
+
+            const requiredSections = [
+              "#### What does this tool do?",
+              "#### What mode or modes do you anticipate the tool will run in?",
+              "#### What has your own testing process been so far?",
+              "#### What eronious behavior, if any, do you expect from the tool?",
+              "#### Why are you merging this tool?"
+            ];
+
+            const failures = [];
+
+            for (const heading of requiredSections) {
+
+              const escapedHeading = heading.replace(
+                /[.*+?^$()|[\]\\]/g,
+                "\\$&"
+              );
+
+              const regex = new RegExp(
+                escapedHeading + "\\s*([\\s\\S]*?)(?=\\n####|\\n###|$)",
+                "i"
+              );
+
+              const match = body.match(regex);
+
+              if (!match) {
+                failures.push("Missing section: " + heading);
+                continue;
+              }
+
+              const content = match[1]
+                .replace(/<!--[\s\S]*?-->/g, "")
+                .trim();
+
+              if (!content) {
+                failures.push(heading + " is blank");
+              }
+            }
+
+            if (failures.length > 0) {
+
+              core.setFailed(
+                "Required Visual Assistive Tool information is incomplete:\n\n- " +
+                failures.join("\n- ")
+              );
+
+            } else {
+
+              core.info("All required sections are completed.");
+
+            }
