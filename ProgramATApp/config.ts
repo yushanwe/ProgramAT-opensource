@@ -53,8 +53,9 @@ export const Config = {
   APP_MODE: 'development' as AppMode, // Change to 'production' for production deployment
   
   // Default WebSocket server URL
-  // This can be overridden by entering a secret code in Settings
-  WEBSOCKET_SERVER_URL: 'ws://34.144.178.116:8080',
+  // Set at runtime from AsyncStorage (entered by user in Settings).
+  // Empty string means no server configured yet.
+  WEBSOCKET_SERVER_URL: '',
   
   // GitHub branch configuration
   // In production mode, tools are fetched from this branch only
