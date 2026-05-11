@@ -1,0 +1,50 @@
+name: Check if codebase contributions have approved issue link
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check-approved-issue-link:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate approved issue link
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const body = context.payload.pull_request.body || "";
+
+            const coreCodeCheckbox =
+              /-\s*\[[xX]\]\s*This contribution is new upstream code for the server or the app/.test(body);
+
+            if (!coreCodeCheckbox) {
+              core.info("Core code checkbox is not checked; passing.");
+              return;
+            }
+
+            const sectionMatch = body.match(
+              /####\s*Link to approved issue\s*([\s\S]*?)(?=\n#{1,6}\s|\n##\s|$)/
+            );
+
+            if (!sectionMatch) {
+              core.setFailed('The "Link to approved issue" section was not found.');
+              return;
+            }
+
+            const approvedIssueSection = sectionMatch[1];
+
+            const githubIssueLink =
+              /https:\/\/github\.com\/[^/\s)]+\/[^/\s)]+\/issues\/\d+/i.test(approvedIssueSection);
+
+            if (!githubIssueLink) {
+              core.setFailed(
+                'Because "This contribution is new upstream code for the server or the app" is checked, "Link to approved issue" must contain a GitHub issue link like https://github.com/OWNER/REPO/issues/123.'
+              );
+              return;
+            }
+
+            core.info("Approved issue link found; passing.");
