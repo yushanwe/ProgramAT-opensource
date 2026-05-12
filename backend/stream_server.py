@@ -229,16 +229,67 @@ def _fetch_github_token() -> str:
         if token:
             return token
 
-    logger.info("GITHUB_TOKEN not found in env or Secret Manager; continuing without token.")
+    logger.warning("GITHUB_TOKEN not found in env or Secret Manager.")
     return ""
 
+
+def _validate_config() -> dict:
+    """
+    Validate required configuration and compute server capability set.
+    Blocks server startup if hard-required vars are missing.
+    Returns a capability dict for reporting to connected clients.
+    """
+    errors = []
+    warnings = []
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    github_repo = os.environ.get("GITHUB_REPO", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    gcp_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    auth_token = os.environ.get("AUTH_TOKEN", "")
+
+    if not github_token:
+        errors.append("GITHUB_TOKEN is not set. Set it in your .env file.")
+    if not github_repo:
+        errors.append("GITHUB_REPO is not set. Set it to your tools repo (e.g. username/my-tools) in your .env file.")
+    if not gemini_key:
+        errors.append("GEMINI_API_KEY is not set. Obtain one at https://aistudio.google.com/app/apikey")
+
+    if not gcp_creds:
+        warnings.append("GOOGLE_APPLICATION_CREDENTIALS is not set. OCR-based tools will be disabled.")
+    elif not Path(gcp_creds).exists():
+        warnings.append(f"GOOGLE_APPLICATION_CREDENTIALS path does not exist: {gcp_creds}. OCR-based tools will be disabled.")
+
+    for w in warnings:
+        logger.warning(f"[CONFIG] {w}")
+
+    if errors:
+        logger.error("=" * 60)
+        logger.error("SERVER STARTUP FAILED — missing required configuration:")
+        for e in errors:
+            logger.error(f"  ✗ {e}")
+        logger.error("Copy backend/.env.example to backend/.env and fill in the required values.")
+        logger.error("=" * 60)
+        raise SystemExit(1)
+
+    logger.info("[CONFIG] All required configuration present.")
+    return {
+        "github": bool(github_token and github_repo),
+        "gemini": bool(gemini_key),
+        "vision_ocr": bool(gcp_creds and Path(gcp_creds).exists()),
+        "auth_required": bool(auth_token),
+    }
+
+
+SERVER_CAPABILITIES = _validate_config()
+
 GITHUB_TOKEN = _fetch_github_token()
-GITHUB_REPO = os.environ.get('GITHUB_REPO', 'program-at/ProgramAT')  # Format: owner/repo
+GITHUB_REPO = os.environ.get('GITHUB_REPO', '')  # Format: owner/repo
 PAUSE_DURATION = float(os.environ.get('PAUSE_DURATION', '5.0'))  # seconds to wait before creating issue
 
 # Gemini Configuration
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash-lite')  # Default to gemini-2.5-flash-lite
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview')
 
 # Configure Gemini if API key is available
 if GEMINI_API_KEY:
@@ -3656,6 +3707,13 @@ async def handle_client(websocket):
             'server_time': datetime.now().isoformat()
         }))
         session_log.log_message("send", "connection", "Welcome message sent")
+
+        # Send server capabilities so the app can show/hide features accordingly
+        await websocket.send(json.dumps({
+            'type': 'server_capabilities',
+            'capabilities': SERVER_CAPABILITIES
+        }))
+        session_log.log_message("send", "server_capabilities", json.dumps(SERVER_CAPABILITIES))
         
         async for message in websocket:
             try:

@@ -16,11 +16,11 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Config, { AppMode, SERVER_CONFIGS } from './config';
+import Config, { AppMode } from './config';
 import WebSocketService from './WebSocketService';
 import { useTheme } from './ThemeContext';
 
-const CUSTOM_SERVER_KEY = '@custom_server_code';
+const SERVER_URL_KEY = '@server_url';
 
 interface SettingsProps {
   appMode: AppMode;
@@ -31,32 +31,14 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
   const { theme, themeMode, toggleTheme } = useTheme();
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [secretCode, setSecretCode] = useState('');
-  const [activeServerName, setActiveServerName] = useState('Default Server');
+  const [serverUrl, setServerUrl] = useState('');
   const [currentServerUrl, setCurrentServerUrl] = useState(Config.WEBSOCKET_SERVER_URL);
 
-  // Helper to get server name from URL
-  const getServerNameFromUrl = (url: string): string => {
-    for (const [code, config] of Object.entries(SERVER_CONFIGS)) {
-      if (config.url === url) {
-        return config.name;
-      }
-    }
-    return 'Default Server';
-  };
-
-  // Actual connected server name (derived from current URL)
-  const actualServerName = getServerNameFromUrl(currentServerUrl);
-
   useEffect(() => {
-    // Check connection status on mount
     setIsConnected(WebSocketService.isConnected());
     setCurrentServerUrl(WebSocketService.getServerUrl());
+    loadSavedServerUrl();
 
-    // Load saved secret code
-    loadSavedServerCode();
-
-    // Listen for connection changes
     const checkConnection = setInterval(() => {
       setIsConnected(WebSocketService.isConnected());
       setCurrentServerUrl(WebSocketService.getServerUrl());
@@ -65,113 +47,54 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     return () => clearInterval(checkConnection);
   }, []);
 
-  const loadSavedServerCode = async () => {
+  const loadSavedServerUrl = async () => {
     try {
-      const savedCode = await AsyncStorage.getItem(CUSTOM_SERVER_KEY);
-      if (savedCode) {
-        setSecretCode(savedCode);
-        const serverConfig = SERVER_CONFIGS[savedCode];
-        if (serverConfig) {
-          setActiveServerName(serverConfig.name);
-          
-          // Check if current connection matches saved preference
-          const currentUrl = WebSocketService.getServerUrl();
-          if (currentUrl !== serverConfig.url) {
-            console.log('[Settings] Server mismatch detected!');
-            console.log('[Settings]   Saved server:', serverConfig.name, serverConfig.url);
-            console.log('[Settings]   Current URL:', currentUrl);
-            console.log('[Settings] Auto-reconnecting to saved server...');
-            
-            // Auto-reconnect to the saved server
-            WebSocketService.setServerUrl(serverConfig.url, true);
-          } else {
-            console.log('[Settings] Server matches saved preference:', serverConfig.name);
-          }
-        } else {
-          // Invalid saved code, clear it
-          console.log('[Settings] Invalid saved code, clearing:', savedCode);
-          await AsyncStorage.removeItem(CUSTOM_SERVER_KEY);
-          setActiveServerName('Default Server');
+      const saved = await AsyncStorage.getItem(SERVER_URL_KEY);
+      if (saved) {
+        setServerUrl(saved);
+        const currentUrl = WebSocketService.getServerUrl();
+        if (currentUrl !== saved) {
+          WebSocketService.setServerUrl(saved, true);
         }
       }
     } catch (error) {
-      console.error('[Settings] Error loading saved server code:', error);
+      console.error('[Settings] Error loading saved server URL:', error);
     }
   };
 
-  const handleApplySecretCode = async () => {
-    const trimmedCode = secretCode.trim();
-    
-    // Check if code exists in config
-    const serverConfig = SERVER_CONFIGS[trimmedCode] || SERVER_CONFIGS['default'];
-    
-    if (trimmedCode && !SERVER_CONFIGS[trimmedCode]) {
-      Alert.alert(
-        'Invalid Code',
-        'The secret code entered is not recognized. Using default server.',
-        [{ text: 'OK' }]
-      );
-      setSecretCode('');
-      await AsyncStorage.removeItem(CUSTOM_SERVER_KEY);
-      setActiveServerName('Default Server');
-      
-      // Switch to default server
-      WebSocketService.setServerUrl(SERVER_CONFIGS['default'].url, true);
+  const handleSaveServerUrl = async () => {
+    const trimmed = serverUrl.trim();
+    if (!trimmed) {
+      Alert.alert('No URL Entered', 'Please enter your server WebSocket URL.');
       return;
     }
-    
-    // Save the code
-    if (trimmedCode) {
-      await AsyncStorage.setItem(CUSTOM_SERVER_KEY, trimmedCode);
-    } else {
-      await AsyncStorage.removeItem(CUSTOM_SERVER_KEY);
+    if (!trimmed.startsWith('ws://') && !trimmed.startsWith('wss://')) {
+      Alert.alert('Invalid URL', 'Server URL must start with ws:// or wss://');
+      return;
     }
-    
-    setActiveServerName(serverConfig.name);
-    
-    Alert.alert(
-      'Server Changed',
-      `Connecting to ${serverConfig.name}...`,
-      [{ text: 'OK' }]
-    );
-    
-    // Disconnect and reconnect with new URL
-    WebSocketService.setServerUrl(serverConfig.url, true);
+    await AsyncStorage.setItem(SERVER_URL_KEY, trimmed);
+    Alert.alert('Server Saved', `Connecting to ${trimmed}...`, [{ text: 'OK' }]);
+    WebSocketService.setServerUrl(trimmed, true);
   };
 
-  const handleClearSecretCode = async () => {
+  const handleClearServerUrl = async () => {
     Alert.alert(
-      'Clear Server Code?',
-      'This will reset to the default server.',
+      'Clear Server URL?',
+      'This will disconnect and remove the saved server address.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Clear',
           style: 'destructive',
           onPress: async () => {
-            setSecretCode('');
-            await AsyncStorage.removeItem(CUSTOM_SERVER_KEY);
-            setActiveServerName('Default Server');
-            
-            // Switch to default server
-            WebSocketService.setServerUrl(SERVER_CONFIGS['default'].url, true);
+            setServerUrl('');
+            await AsyncStorage.removeItem(SERVER_URL_KEY);
+            WebSocketService.disconnect();
           }
         }
       ]
     );
   };
-
-  useEffect(() => {
-    // Check connection status on mount
-    setIsConnected(WebSocketService.isConnected());
-
-    // Listen for connection changes
-    const checkConnection = setInterval(() => {
-      setIsConnected(WebSocketService.isConnected());
-    }, 1000);
-
-    return () => clearInterval(checkConnection);
-  }, []);
 
   const handleModeSwitch = () => {
     const newMode: AppMode = appMode === 'development' ? 'production' : 'development';
@@ -364,23 +287,14 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
                 {isConnecting ? 'Connecting...' : isConnected ? 'Disconnect' : 'Connect'}
               </Text>
             </TouchableOpacity>
-            
-            {activeServerName !== 'Default Server' && (
-              <View 
-                style={[styles.customServerBadge, { backgroundColor: theme.warning + '30' }]}
-                accessible={true}
-                accessibilityRole="text"
-                accessibilityLabel={`Using custom server: ${actualServerName}`}>
-                <Text style={[styles.customServerBadgeText, { color: theme.warning }]}>
-                  Custom: {actualServerName}
-                </Text>
-              </View>
-            )}
           </View>
 
-          {/* Secret Code Input */}
+          {/* Server URL Input */}
           <View style={[styles.secretCodeSection, { backgroundColor: theme.card, borderColor: theme.border }]}>
-            <Text style={[styles.secretCodeLabel, { color: theme.text }]}>Server Code</Text>
+            <Text style={[styles.secretCodeLabel, { color: theme.text }]}>Server URL</Text>
+            <Text style={[styles.settingDescription, { color: theme.textSecondary, marginBottom: 8 }]}>
+              Enter the WebSocket address of your self-hosted server (e.g. ws://192.168.1.10:8080)
+            </Text>
             <View style={styles.secretCodeInputRow}>
               <TextInput
                 style={[styles.secretCodeInput, { 
@@ -388,57 +302,55 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
                   borderColor: theme.inputBorder, 
                   color: theme.text 
                 }]}
-                value={secretCode}
-                onChangeText={setSecretCode}
-                placeholder="Enter server code"
+                value={serverUrl}
+                onChangeText={setServerUrl}
+                placeholder="ws://your-server-ip:8080"
                 placeholderTextColor={theme.inputPlaceholder}
                 autoCapitalize="none"
                 autoCorrect={false}
-                secureTextEntry={true}
+                keyboardType="url"
                 accessible={true}
-                accessibilityLabel="Server code input"
-                accessibilityHint="Enter a secret code to connect to an alternative server"
+                accessibilityLabel="Server URL input"
+                accessibilityHint="Enter the WebSocket URL of your self-hosted ProgramAT server"
               />
               <TouchableOpacity
                 style={[
                   styles.secretCodeButton,
                   { backgroundColor: theme.primary },
-                  !secretCode.trim() && styles.secretCodeButtonDisabled
+                  !serverUrl.trim() && styles.secretCodeButtonDisabled
                 ]}
-                onPress={handleApplySecretCode}
-                disabled={!secretCode.trim()}
+                onPress={handleSaveServerUrl}
+                disabled={!serverUrl.trim()}
                 accessible={true}
                 accessibilityRole="button"
-                accessibilityLabel="Apply server code"
-                accessibilityHint="Double tap to apply the secret code and switch servers">
-                <Text style={styles.secretCodeButtonText}>
-                  Apply
-                </Text>
+                accessibilityLabel="Save server URL"
+                accessibilityHint="Double tap to save and connect to this server">
+                <Text style={styles.secretCodeButtonText}>Save</Text>
               </TouchableOpacity>
             </View>
-            {activeServerName !== 'Default Server' && (
+            {serverUrl.trim() && (
               <TouchableOpacity
                 style={[styles.resetServerButton, { backgroundColor: theme.error }]}
-                onPress={handleClearSecretCode}
+                onPress={handleClearServerUrl}
                 accessible={true}
                 accessibilityRole="button"
-                accessibilityLabel="Reset to default server"
-                accessibilityHint="Double tap to switch back to the default server">
-                <Text style={styles.resetServerButtonText}>Reset to Default Server</Text>
+                accessibilityLabel="Clear server URL"
+                accessibilityHint="Double tap to clear the saved server address and disconnect">
+                <Text style={styles.resetServerButtonText}>Clear Server</Text>
               </TouchableOpacity>
             )}
           </View>
 
           <View style={[styles.serverInfo, { backgroundColor: theme.backgroundSecondary }]}>
-            <Text style={[styles.serverInfoLabel, { color: theme.textSecondary }]} accessible={false}>Server URL:</Text>
+            <Text style={[styles.serverInfoLabel, { color: theme.textSecondary }]} accessible={false}>Active URL:</Text>
             <Text 
               style={[styles.serverInfoValue, { color: theme.text }]}
               selectable={true}
               accessible={true}
               accessibilityRole="text"
-              accessibilityLabel={`Server URL: ${currentServerUrl}`}
+              accessibilityLabel={`Active server URL: ${currentServerUrl || 'None'}`}
               accessibilityHint="Long press to copy URL">
-              {currentServerUrl}
+              {currentServerUrl || 'Not configured'}
             </Text>
           </View>
         </View>

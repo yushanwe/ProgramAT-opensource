@@ -16,11 +16,10 @@ import TabNavigator from './TabNavigator';
 import WebSocketService from './WebSocketService';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
-import { SERVER_CONFIGS } from './config';
 import { ThemeProvider, useTheme } from './ThemeContext';
 
-// Storage key for custom server code (must match Settings.tsx)
-const CUSTOM_SERVER_KEY = '@custom_server_code';
+// Storage key for user-configured server URL (must match Settings.tsx)
+const SERVER_URL_KEY = '@server_url';
 
 // Suppress Fast Refresh hook warnings that don't actually affect the app
 LogBox.ignoreLogs([
@@ -75,6 +74,7 @@ function AppContent() {
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(true);
   const [connectionError, setConnectionError] = useState('');
+  const [serverConfigured, setServerConfigured] = useState<boolean | null>(null); // null = not yet checked
   const [showIssueSelector, setShowIssueSelector] = useState(false);
   const [selectedPR, setSelectedPR] = useState<{number: number; title: string} | null>(null);
   const [prList, setPRList] = useState<any[]>([]);
@@ -277,19 +277,18 @@ function AppContent() {
       
       // Load saved server code BEFORE connecting
       try {
-        const savedCode = await AsyncStorage.getItem(CUSTOM_SERVER_KEY);
-        console.log('[App] AsyncStorage returned savedCode:', savedCode);
-        console.log('[App] SERVER_CONFIGS keys:', Object.keys(SERVER_CONFIGS));
-        console.log('[App] Is savedCode in SERVER_CONFIGS?', savedCode ? !!SERVER_CONFIGS[savedCode] : 'no savedCode');
+        const savedCode = await AsyncStorage.getItem(SERVER_URL_KEY);
+        console.log('[App] AsyncStorage returned server URL:', savedCode);
         
-        if (savedCode && SERVER_CONFIGS[savedCode]) {
-          console.log('[App] Found saved server code:', savedCode);
-          console.log('[App] Server config:', JSON.stringify(SERVER_CONFIGS[savedCode]));
-          console.log('[App] Setting server URL to:', SERVER_CONFIGS[savedCode].url);
-          WebSocketService.setServerUrl(SERVER_CONFIGS[savedCode].url, false);
+        if (savedCode && savedCode.trim()) {
+          console.log('[App] Found saved server URL:', savedCode);
+          WebSocketService.setServerUrl(savedCode.trim(), false);
+          setServerConfigured(true);
         } else {
-          console.log('[App] No valid saved server code, using default');
-          console.log('[App] savedCode was:', savedCode);
+          console.log('[App] No server URL configured — skipping connect');
+          setServerConfigured(false);
+          setIsConnecting(false);
+          return;
         }
       } catch (storageError) {
         console.error('[App] Error loading saved server code:', storageError);
@@ -340,6 +339,20 @@ function AppContent() {
     <View 
       style={[styles.container, { paddingTop: safeAreaInsets.top, backgroundColor: theme.background }]}
       accessible={false}>
+
+      {/* Setup gate — shown on first launch until server URL is configured */}
+      {serverConfigured === false && (
+        <View style={[styles.setupGate, { backgroundColor: theme.background }]}>
+          <Text style={[styles.setupTitle, { color: theme.text }]}
+            accessible={true} accessibilityRole="header">
+            Welcome to ProgramAT
+          </Text>
+          <Text style={[styles.setupBody, { color: theme.textSecondary }]}
+            accessible={true} accessibilityRole="text">
+            To get started, go to Settings and enter the WebSocket URL of your self-hosted server (e.g. ws://192.168.1.10:8080).
+          </Text>
+        </View>
+      )}
       
       {/* PR Mode Indicator */}
       {selectedPR && (
@@ -419,6 +432,23 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 12,
     fontWeight: '600',
+  },
+  setupGate: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 32,
+  },
+  setupTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  setupBody: {
+    fontSize: 16,
+    lineHeight: 24,
+    textAlign: 'center',
   },
 });
 
