@@ -47,46 +47,137 @@ This is a React Native app that facilitates AT creation, iteration, and testing 
    cd ..
    ```
 
-4. **Install backend dependencies**
+4. **Set up the backend**
    ```bash
    cd ../backend
+   python3 -m venv .venv
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-### Environment Variables
+5. **Create the backend `.env` file**
+   ```bash
+   cp .env.example .env
+   ```
 
-The backend uses environment variables for API keys and configuration:
+6. **Fill in the values in `backend/.env`**
+   - `GEMINI_API_KEY`
+   - `GITHUB_TOKEN`
+   - `GITHUB_REPO`
+   - `GOOGLE_APPLICATION_CREDENTIALS` if you use OCR tools
+
+### API Keys
+
+The backend reads configuration from `backend/.env` automatically when it starts, or from environment variables if you set them directly.
+
+Use the table below as a quick reference for what each value does.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GEMINI_API_KEY` | Yes (for VLM tools) | Google Gemini API key — used by scene description, clothing recognition, AI parsing, and Gemini Live |
-| `GOOGLE_APPLICATION_CREDENTIALS` | For OCR tools | Google Cloud Vision API credentials (used by Live OCR) |
+| `GEMINI_API_KEY` | Yes (for VLM tools) | Google Gemini API key used by scene description, clothing recognition, AI parsing, and Gemini Live |
+| `GOOGLE_APPLICATION_CREDENTIALS` | For OCR tools | Google Cloud Vision API credentials used by Live OCR |
 | `GITHUB_TOKEN` | For GitHub features | GitHub personal access token with `repo` scope |
-| `GITHUB_REPO` | Yes (to be able to access your own tools) | Target repo in `owner/repo` format |
+| `GITHUB_REPO` | Yes (to access your own tools) | Target repo in `owner/repo` format |
 | `HOST` / `PORT` | Optional | Server bind address (default `0.0.0.0:8080`) |
 
-### Running the Application (instructions to be updated)
+#### Alternative: Set environment variables directly
 
-1. **Start the backend server**
+Instead of using `backend/.env`, you can export the variables in your shell before starting the backend:
+
+**Linux / macOS:**
+```bash
+export GEMINI_API_KEY="your_key_here"
+export GITHUB_TOKEN="your_token_here"
+export GITHUB_REPO="username/your-programat-fork"
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/credentials.json"
+```
+
+**Windows PowerShell:**
+```powershell
+$env:GEMINI_API_KEY = "your_key_here"
+$env:GITHUB_TOKEN = "your_token_here"
+$env:GITHUB_REPO = "username/your-programat-fork"
+$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\credentials.json"
+```
+
+### How to Get the Keys
+
+#### GitHub Token
+
+1. Go to any GitHub page: <https://github.com/>. Click your profile picture (top right) and open **Settings**.
+2. Go to **Developer settings** -> **Personal access tokens** -> **Tokens (classic)**.
+3. Click **Generate new token**.
+4. Add a note, choose an expiration, and select scopes to be **repo**.
+5. Click **Generate token**, copy it and save it properly. You won't be able to see it again.
+6. Paste the token into `backend/.env` as `GITHUB_TOKEN`.
+
+#### Gemini API Key
+
+1. Go to Google AI Studio: <https://aistudio.google.com>
+2. Sign in with your Google account.
+3. In the left sidebar, click **Get API key** -> **Create API key**.
+4. Select an existing Google Cloud project or create a new one, then click **Create API key**.
+5. Copy the generated key.
+6. Paste the key into `backend/.env` as `GEMINI_API_KEY`.
+
+Billing:
+
+- If you want to increase the rate limit, click **Set up billing** in Google AI Studio and choose other plans for your API key.
+
+#### Google Application Credentials
+
+This project uses Google Cloud Vision for higher-quality OCR in `tools/live_ocr.py`. If you want Cloud Vision for better OCR, create a service account and download a JSON key, then set `GOOGLE_APPLICATION_CREDENTIALS` to that file path. If you prefer not to use Cloud Vision, the tool will fall back to local Tesseract if installed (no Google credentials required).
+
+Steps:
+
+1. Go to Google Cloud Console: <https://console.cloud.google.com>
+2. Create or select a project and enable the **Cloud Vision API** in **Menu** -> **API & Services** -> **Enabled APIs & services**.
+3. Create a service account: **Menu** -> **IAM & Admin** -> **Service Accounts** -> **Create service account**. Fill name/ID and click **Continue**.
+4. Create a key: for this service account, select **Actions** -> **Manage Keys** -> **Add key** -> **Create new key** -> choose **JSON** -> **Create**. A JSON file `credentials.json` will be downloaded. Save it securely into your workspace.
+5. Set `GOOGLE_APPLICATION_CREDENTIALS` to the JSON file path.
+
+Security notes:
+
+- Do not commit the JSON key to version control. Add `credentials.json` to `.gitignore`.
+- Restrict the service account to only the Vision API and grant the minimal needed permissions.
+
+### Running the Application
+
+#### Run the server
+
+If you have already completed the Installation section above:
+
+1. **Activate the virtual environment and start the backend server**
    ```bash
    cd backend
-   export GEMINI_API_KEY="your_key_here"
+   source .venv/bin/activate
    python stream_server.py
    ```
-   The server starts on port 8080.
 
-2. **Start the React Native app**. Skip if you are running the app from the TestFlight link.
+   The server listens on `0.0.0.0:8080` by default.
+
+#### If you want to run the app locally for development
+
+1. **Install React Native dependencies**
    ```bash
    cd ProgramATApp
+   npm install
+   ```
+
+2. **Start Metro**
+   ```bash
    npm start
    ```
 
-3. **Run on your device**. Skip if you are running the app via TestFlight.
+3. **Run the app on a device or emulator**
+   - Android: `npm run android`
+   - iOS: `npm run ios` on macOS only
 
-   For iOS:
-   ```bash
-   npm run ios
-   ```
+#### WSL networking notes
+
+- If you run the app on an Android emulator, point the WebSocket server URL to `ws://10.0.2.2:8080`.
+- If you run the app on a physical phone, use the IP address of the machine or WSL2 instance that can be reached from the phone.
+- If you want to use the built-in server presets, update `ProgramATApp/config.ts` with a local server entry or change the default WebSocket URL.
 
 ### Configuration (will be updated closer to event)
 

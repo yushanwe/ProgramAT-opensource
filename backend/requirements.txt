@@ -9,3 +9,4 @@ pytesseract>=0.3.0
 scipy
 scikit-learn
 ultralytics>=8.0.0
+google-cloud-secret-manager
