@@ -11,7 +11,12 @@
  * @format
  */
 
-export type AppMode = 'development' | 'production';
+export type AppMode = 'development' | 'production' | 'review';
+
+// The main community development server used in review mode.
+// Review mode connects here regardless of the user's own server URL.
+// Update this when the canonical review server address changes.
+export const MAIN_DEV_SERVER_URL = 'ws://34.144.178.116:8080';
 
 // Server configuration mapping - secret codes to server URLs
 // Add new servers here as needed
@@ -20,26 +25,6 @@ export const SERVER_CONFIGS: Record<string, { url: string; name: string }> = {
   'default': {
     url: 'ws://34.144.178.116:8080',
     name: 'Default Server'
-  },
-  'Gene-register-3': {
-    url: 'ws://34.186.238.245:8080',
-    name: 'Gene server'
-  },
-  'Aziz-immune-9': {
-    url: 'ws://34.152.118.99:8080',
-    name: 'Aziz server'
-  },
-  'P3-mosaic-0': {
-    url: 'ws://136.109.165.238:8080',
-    name: 'P3 server'
-  },
-  'Ather-diagram-2': {
-    url: 'ws://34.162.249.166:8080',
-    name: 'Ather server'
-  },
-  'Kun-habit-6': {
-    url: 'ws://34.26.169.255:8080',
-    name: 'Kun server'
   }
 
   // Add additional servers with secret codes
@@ -85,8 +70,14 @@ export const Config = {
   get ENABLE_BRANCH_SELECTION() {
     return this.APP_MODE === 'development';
   },
+  get ENABLE_TOOL_EDITING() {
+    return this.APP_MODE === 'development';
+  },
+  get ENABLE_REVIEW_PANE() {
+    return this.APP_MODE === 'review';
+  },
   get ENABLE_MODE_SWITCHER() {
-    return true; // Allow switching between modes in app
+    return true;
   },
 };
 
