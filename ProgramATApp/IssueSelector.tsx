@@ -46,11 +46,12 @@ interface IssueSelectorProps {
   onCreateNew?: () => void; // New prop for switching to create mode
   onNavigateToTools?: () => void; // Callback to navigate to Tools tab
   onViewLogs?: (pr: {number: number; title: string}) => void; // Callback to view logs for a PR
+  onReviewPR?: (pr: {number: number; title: string}) => void; // Callback to open review pane for a PR
   issues?: Issue[]; // Optional - not used in PR-only mode
   prs?: PR[];
   embedded?: boolean;
   selectedIssue?: {number: number; title: string} | null; // Currently selected PR
-  reviewMode?: boolean; // Hides create/update/logs options, only shows Open Tools
+  reviewMode?: boolean; // Shows review-specific action sheet, hides create/logs options
 }
 
 export default function IssueSelector({ 
@@ -61,6 +62,7 @@ export default function IssueSelector({
   onCreateNew,
   onNavigateToTools,
   onViewLogs,
+  onReviewPR,
   issues = [], // Default to empty array
   prs = [],
   embedded = false,
@@ -184,13 +186,33 @@ export default function IssueSelector({
       if (onNavigateToTools) onNavigateToTools();
     };
 
-    // In review mode: immediately open tools without showing the action sheet
     if (reviewMode) {
-      openTools();
+      // Review mode: simplified sheet — Open Tools or Review PR
+      Alert.alert(
+        `PR #${pr.number}: ${pr.title}\n\nWhat would you like to do?`,
+        '',
+        [
+          {
+            text: 'Open Tools',
+            onPress: openTools
+          },
+          {
+            text: 'Review PR',
+            onPress: () => {
+              console.log('[IssueSelector] Opening review pane for PR:', pr.number);
+              if (onReviewPR) {
+                onReviewPR({ number: pr.number, title: pr.title });
+              }
+              onClose();
+            }
+          },
+          { text: 'Cancel', style: 'cancel' }
+        ]
+      );
       return;
     }
 
-    // Show native alert dialog for better accessibility
+    // Standard action sheet
     Alert.alert(
       `PR #${pr.number}: ${pr.title}\n\nWhat would you like to do?`,
       '',
@@ -207,11 +229,9 @@ export default function IssueSelector({
           onPress: () => {
             console.log('[IssueSelector] Opening update mode for PR:', pr.number);
             
-            // Send mode selection to backend
             WebSocketService.sendIssueSelection('update', pr.number, pr.title);
             WebSocketService.requestPRTools(pr.number);
             
-            // Convert PR to Issue format
             const prAsIssue: Issue = {
               number: pr.number,
               title: pr.title,
@@ -220,10 +240,7 @@ export default function IssueSelector({
               updated_at: pr.updated_at
             };
             
-            // Call the parent callback
             onIssueSelect(prAsIssue);
-            
-            // Close selector
             onClose();
           }
         },
@@ -231,8 +248,6 @@ export default function IssueSelector({
           text: 'View Logs',
           onPress: () => {
             console.log('[IssueSelector] Viewing logs for PR:', pr.number);
-            
-            // Call parent callback to show ViewLogsScreen
             if (onViewLogs) {
               onViewLogs({ number: pr.number, title: pr.title });
             }

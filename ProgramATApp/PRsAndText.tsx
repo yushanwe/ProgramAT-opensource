@@ -27,7 +27,7 @@ interface PRsAndTextProps {
   appMode?: AppMode;
 }
 
-type ViewMode = 'text-input' | 'pr-list' | 'view-logs';
+type ViewMode = 'text-input' | 'pr-list' | 'view-logs' | 'review';
 
 export default function PRsAndText({ 
   serverFeedback, 
@@ -60,10 +60,7 @@ export default function PRsAndText({
 
   const handleIssueSelect = (issue: {number: number; title: string}) => {
     onIssueSelect(issue);
-    if (appMode === 'review') {
-      // In review mode, IssueSelector already navigates to tools directly
-      // Nothing more to do here
-    } else {
+    if (appMode !== 'review') {
       setViewMode('text-input'); // Navigate to text input after selecting PR
     }
   };
@@ -71,6 +68,11 @@ export default function PRsAndText({
   const handleCreateNew = () => {
     onNewIssue();
     setViewMode('text-input'); // Navigate to text input for new issue
+  };
+
+  const handleReviewPR = (pr: {number: number; title: string}) => {
+    setViewLogsPR(pr); // reuse this state to track the target PR
+    setViewMode('review');
   };
 
   const handleViewPRs = () => {
@@ -103,6 +105,7 @@ export default function PRsAndText({
           onCreateNew={handleCreateNew}
           onNavigateToTools={onNavigateToTools}
           onViewLogs={handleViewLogs}
+          onReviewPR={handleReviewPR}
           prs={prList}
           embedded={true}
           selectedIssue={selectedIssue}
@@ -118,6 +121,9 @@ export default function PRsAndText({
           logs={copilotLogs}
           onClearData={onClearCopilotData}
         />
+      ) : viewMode === 'review' && viewLogsPR ? (
+        // Phase 3.3: review pane — placeholder until ReviewPane component is built
+        null
       ) : appMode !== 'review' ? (
         <TextInput 
           serverFeedback={serverFeedback}
