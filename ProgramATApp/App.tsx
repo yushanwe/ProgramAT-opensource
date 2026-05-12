@@ -121,9 +121,10 @@ function AppContent() {
     WebSocketService.onConnectionChange((connected) => {
       console.log('[App] onConnectionChange callback fired, connected:', connected);
       setIsConnected(connected);
-      setIsConnecting(false); // Stop connecting state when connection status changes
+      setIsConnecting(false);
       if (connected) {
         setConnectionError('');
+        setServerConfigured(true); // URL clearly works — dismiss setup banner
       }
     });
 
@@ -340,16 +341,12 @@ function AppContent() {
       style={[styles.container, { paddingTop: safeAreaInsets.top, backgroundColor: theme.background }]}
       accessible={false}>
 
-      {/* Setup gate — shown on first launch until server URL is configured */}
+      {/* Setup banner — shown only until server URL is configured */}
       {serverConfigured === false && (
-        <View style={[styles.setupGate, { backgroundColor: theme.background }]}>
-          <Text style={[styles.setupTitle, { color: theme.text }]}
-            accessible={true} accessibilityRole="header">
-            Welcome to ProgramAT
-          </Text>
-          <Text style={[styles.setupBody, { color: theme.textSecondary }]}
+        <View style={[styles.setupBanner, { backgroundColor: theme.warning + '22', borderBottomColor: theme.warning }]}>
+          <Text style={[styles.setupBannerText, { color: theme.text }]}
             accessible={true} accessibilityRole="text">
-            To get started, go to Settings and enter the WebSocket URL of your self-hosted server (e.g. ws://192.168.1.10:8080).
+            ⚙️ Go to Settings to enter your server URL to get started.
           </Text>
         </View>
       )}
@@ -433,21 +430,13 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
-  setupGate: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 32,
+  setupBanner: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
   },
-  setupTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 16,
-    textAlign: 'center',
-  },
-  setupBody: {
-    fontSize: 16,
-    lineHeight: 24,
+  setupBannerText: {
+    fontSize: 13,
     textAlign: 'center',
   },
 });
