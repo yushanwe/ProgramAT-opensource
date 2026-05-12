@@ -5102,7 +5102,7 @@ async def main():
         ping_timeout=10    # Wait 10 seconds for pong response
     ):
         logger.info("Server started successfully")
-        logger.info(f"Clients can connect to: ws://34.144.178.116:{PORT}")
+        logger.info(f"Clients can connect to: ws://<your-server-ip>:{PORT}")
         logger.info(f"Max message size: 20MB")
         
         # Start background tasks independently for resilience

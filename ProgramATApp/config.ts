@@ -14,35 +14,11 @@
 export type AppMode = 'development' | 'production';
 
 // Server configuration mapping - secret codes to server URLs
-// Add new servers here as needed
+// For self-hosting: add entries mapping secret codes to your server URLs.
+// Example: 'mysecret123': { url: 'ws://10.0.0.1:8080', name: 'My Server' }
+// Users must enter a server URL manually in Settings if no matching code is found.
 export const SERVER_CONFIGS: Record<string, { url: string; name: string }> = {
-  // Default server (no code needed)
-  'default': {
-    url: 'ws://34.144.178.116:8080',
-    name: 'Default Server'
-  },
-  'Gene-register-3': {
-    url: 'ws://34.186.238.245:8080',
-    name: 'Gene server'
-  },
-  'Aziz-immune-9': {
-    url: 'ws://34.152.118.99:8080',
-    name: 'Aziz server'
-  },
-  'P3-mosaic-0': {
-    url: 'ws://136.109.165.238:8080',
-    name: 'P3 server'
-  },
-  'Ather-diagram-2': {
-    url: 'ws://34.162.249.166:8080',
-    name: 'Ather server'
-  },
-  'Kun-habit-6': {
-    url: 'ws://34.26.169.255:8080',
-    name: 'Kun server'
-  }
-
-  // Add additional servers with secret codes
+  // Add servers with secret codes for self-hosting
   // Example: 'mysecret123': { url: 'ws://10.0.0.1:8080', name: 'Dev Server' },
 };
 
