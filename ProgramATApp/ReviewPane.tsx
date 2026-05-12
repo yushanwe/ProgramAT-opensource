@@ -45,15 +45,17 @@ export default function ReviewPane({ prNumber, prTitle, onBack }: ReviewPaneProp
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Submit',
-          onPress: () => {
+          onPress: async () => {
             setSubmitting(true);
-            const success = WebSocketService.submitToolReview(prNumber, verdict === 'approve', comment.trim());
-            if (success) {
+            const result = await WebSocketService.submitToolReview(prNumber, verdict === 'approve', comment.trim());
+            setSubmitting(false);
+            if (result.success) {
               setSubmitted(true);
-              setSubmitting(false);
             } else {
-              setSubmitting(false);
-              Alert.alert('Not Connected', 'Could not submit review. Please check your server connection.');
+              Alert.alert(
+                'Submission Failed',
+                result.error || 'Could not submit review. Please check your connection and try again.'
+              );
             }
           }
         }

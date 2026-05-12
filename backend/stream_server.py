@@ -3980,10 +3980,43 @@ async def handle_client(websocket):
                         }))
                     continue
 
+                # Handle submit_tool_review message type
+                if msg_type == 'submit_tool_review':
+                    pr_number = data.get('pr_number')
+                    approved = data.get('approved', False)
+                    comment = data.get('comment', '').strip()
+                    if not pr_number:
+                        await websocket.send(json.dumps({
+                            'type': 'error',
+                            'message': 'pr_number is required for submit_tool_review',
+                            'timestamp': datetime.now().isoformat()
+                        }))
+                        continue
+                    try:
+                        repo = g.get_repo(GITHUB_REPO)
+                        pr = repo.get_pull(int(pr_number))
+                        github_event = 'APPROVE' if approved else 'REQUEST_CHANGES'
+                        review_body = comment if comment else ('Looks good!' if approved else 'Please address the noted issues.')
+                        pr.create_review(body=review_body, event=github_event)
+                        logger.info(f"Client {client_id} submitted {github_event} review for PR #{pr_number}")
+                        await websocket.send(json.dumps({
+                            'type': 'review_submitted',
+                            'pr_number': pr_number,
+                            'approved': approved,
+                            'timestamp': datetime.now().isoformat()
+                        }))
+                    except Exception as e:
+                        logger.error(f"Failed to submit review for PR #{pr_number}: {e}")
+                        await websocket.send(json.dumps({
+                            'type': 'error',
+                            'message': f'Failed to submit review: {str(e)}',
+                            'timestamp': datetime.now().isoformat()
+                        }))
+                    continue
+
                 # Handle request_production_tools message type
                 if msg_type == 'request_production_tools':
                     branch = data.get('branch', 'main')
-                    logger.info(f"Client {client_id} requested production tools from branch: {branch}")
                     tools = fetch_branch_tools(branch)
                     await websocket.send(json.dumps({
                         'type': 'production_tools',
