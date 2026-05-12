@@ -16,7 +16,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Config, { AppMode } from './config';
+import Config, { AppMode, MAIN_DEV_SERVER_URL } from './config';
 import WebSocketService from './WebSocketService';
 import { useTheme } from './ThemeContext';
 
@@ -115,7 +115,26 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Switch',
-          onPress: () => {
+          onPress: async () => {
+            // Handle server URL swap
+            if (targetMode === 'review') {
+              // Save current server URL so we can restore it later
+              const current = await AsyncStorage.getItem(SERVER_URL_KEY);
+              if (current) {
+                await AsyncStorage.setItem('@saved_server_url', current);
+              }
+              await AsyncStorage.setItem(SERVER_URL_KEY, MAIN_DEV_SERVER_URL);
+              WebSocketService.setServerUrl(MAIN_DEV_SERVER_URL, true);
+            } else if (appMode === 'review') {
+              // Leaving review — restore individual server URL
+              const saved = await AsyncStorage.getItem('@saved_server_url');
+              if (saved) {
+                await AsyncStorage.setItem(SERVER_URL_KEY, saved);
+                await AsyncStorage.removeItem('@saved_server_url');
+                WebSocketService.setServerUrl(saved, true);
+              }
+            }
+
             onModeChange(targetMode);
             Alert.alert('Mode Changed', `Now running in ${modeLabels[targetMode]} mode`, [{ text: 'OK' }]);
           }
