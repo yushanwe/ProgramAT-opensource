@@ -21,6 +21,17 @@ except ImportError:
 
 WEATHER_LABELS = ['sunny', 'cloudy', 'rainy', 'snowy', 'foggy', 'stormy', 'unclear']
 
+# Heuristic fallback thresholds for HSV-based weather estimation.
+# These values are tuned for simple, low-cost classification when Gemini is unavailable.
+FOG_BRIGHTNESS_THRESHOLD = 190
+FOG_SATURATION_THRESHOLD = 35
+CLOUDY_BRIGHTNESS_HIGH_THRESHOLD = 180
+CLOUDY_SATURATION_HIGH_THRESHOLD = 60
+SUNNY_BRIGHTNESS_THRESHOLD = 145
+SUNNY_SATURATION_THRESHOLD = 60
+RAINY_BRIGHTNESS_THRESHOLD = 70
+CLOUDY_BRIGHTNESS_LOW_THRESHOLD = 95
+
 
 def resize_image_if_needed(image: np.ndarray, max_size: tuple = (1024, 1024)) -> np.ndarray:
     """Resize image while preserving aspect ratio."""
@@ -66,19 +77,22 @@ def estimate_weather_from_pixels(image: np.ndarray) -> str:
     saturation = float(np.mean(hsv[:, :, 1]))
 
     # Very bright and low saturation often indicates overcast/fog/snow scenes.
-    if brightness > 190 and saturation < 35:
+    if brightness > FOG_BRIGHTNESS_THRESHOLD and saturation < FOG_SATURATION_THRESHOLD:
         return 'foggy'
-    if brightness > 180 and saturation < 60:
+    if (
+        brightness > CLOUDY_BRIGHTNESS_HIGH_THRESHOLD
+        and saturation < CLOUDY_SATURATION_HIGH_THRESHOLD
+    ):
         return 'cloudy'
 
     # Bright with moderate saturation is often sunny daytime.
-    if brightness > 145 and saturation > 60:
+    if brightness > SUNNY_BRIGHTNESS_THRESHOLD and saturation > SUNNY_SATURATION_THRESHOLD:
         return 'sunny'
 
     # Dark scenes are usually cloudy/rainy/stormy. Prefer rainy for umbrella guidance.
-    if brightness < 70:
+    if brightness < RAINY_BRIGHTNESS_THRESHOLD:
         return 'rainy'
-    if brightness < 95:
+    if brightness < CLOUDY_BRIGHTNESS_LOW_THRESHOLD:
         return 'cloudy'
 
     return 'unclear'

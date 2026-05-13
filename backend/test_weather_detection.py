@@ -19,6 +19,8 @@ from weather_detection import (
     main,
 )
 
+MAX_STREAMING_WORDS = 15
+
 
 def create_bright_test_image():
     """Create a bright outdoor-like synthetic image."""
@@ -42,7 +44,7 @@ def test_pixel_fallback_label():
 
 def test_streaming_audio_length():
     text = format_weather_for_audio('rainy', streaming=True)
-    assert len(text.split()) <= 15
+    assert len(text.split()) <= MAX_STREAMING_WORDS
     assert 'umbrella' in text.lower()
 
 
@@ -59,7 +61,7 @@ def test_main_without_api_key_uses_fallback():
         result = main(image, {'stream_mode': True})
         assert isinstance(result, str)
         assert len(result.strip()) > 0
-        assert len(result.split()) <= 15
+        assert len(result.split()) <= MAX_STREAMING_WORDS
     finally:
         if old_key:
             os.environ['GEMINI_API_KEY'] = old_key
