@@ -4000,24 +4000,11 @@ async def handle_client(websocket):
                         g = Github(GITHUB_TOKEN)
                         repo = g.get_repo(target_repo_name)
                         pr = repo.get_pull(int(pr_number))
-                        if posting_to_external_repo:
-                            # Use a PR comment rather than a formal review — formal reviews
-                            # require collaborator write access which reviewers won't have
-                            # on the general repo. PR comments work for any authenticated user
-                            # on public repos.
-                            verdict_label = '✅ APPROVED' if approved else '❌ CHANGES REQUESTED'
-                            comment_body = f'**[ProgramAT Review] {verdict_label}**'
-                            if comment:
-                                comment_body += f'\n\n{comment}'
-                            elif approved:
-                                comment_body += '\n\nLooks good!'
-                            else:
-                                comment_body += '\n\nPlease address the noted issues.'
-                            pr.create_issue_comment(comment_body)
-                        else:
-                            github_event = 'APPROVE' if approved else 'REQUEST_CHANGES'
-                            review_body = comment if comment else ('Looks good!' if approved else 'Please address the noted issues.')
-                            pr.create_review(body=review_body, event=github_event)
+                        github_event = 'APPROVE' if approved else 'REQUEST_CHANGES'
+                        verdict_label = '✅ APPROVED' if approved else '❌ CHANGES REQUESTED'
+                        default_body = 'Looks good!' if approved else 'Please address the noted issues.'
+                        review_body = f'**[ProgramAT Review] {verdict_label}**\n\n{comment}' if comment else f'**[ProgramAT Review] {verdict_label}**\n\n{default_body}'
+                        pr.create_review(body=review_body, event=github_event)
                         logger.info(f"Client {client_id} submitted {'approval' if approved else 'rejection'} for PR #{pr_number} on {target_repo_name}")
                         await websocket.send(json.dumps({
                             'type': 'review_submitted',
