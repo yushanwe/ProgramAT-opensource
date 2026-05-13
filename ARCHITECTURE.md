@@ -307,6 +307,7 @@ Each tool is a standalone Python file with:
 | `empty_seat_detection.py` | Find empty seats | YOLO11 |
 | `clothing_recognition.py` | Identify clothing items | YOLOWorld |
 | `camera_aiming.py` | Guide camera alignment (clock-face directions) | YOLO11 |
+| `weather_detection.py` | Classify outdoor weather and umbrella guidance | Gemini Vision |
 
 ### Processing Flows
 

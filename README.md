@@ -238,6 +238,7 @@ Creation instructions coming soon.
 | **Door Detection** | Detects doors/doorways with clock-face navigation cues | YOLOWorld |
 | **Empty Seat Detection** | Finds unoccupied chairs and gives directional guidance | YOLOv11 |
 | **Clothing Recognition** | Identifies the most prominent clothing item and its features | Google Gemini Vision |
+| **Weather Detection** | Estimates outdoor weather and gives umbrella guidance | Google Gemini Vision |
 
 New tools can be added by placing a Python file in the `tools/` directory. Each tool exposes a `main(image, input_data)` function and returns an audio-friendly string or dict.
 
@@ -274,7 +275,8 @@ ProgramAT-opensource/
     ├── camera_aiming.py
     ├── door_detection.py
     ├── empty_seat_detection.py
-    └── clothing_recognition.py
+    ├── clothing_recognition.py
+    └── weather_detection.py
 ```
 
 
