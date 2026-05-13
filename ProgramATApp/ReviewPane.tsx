@@ -21,12 +21,13 @@ import Config from './config';
 interface ReviewPaneProps {
   prNumber: number;
   prTitle: string;
+  prBody?: string;
   onBack: () => void;
 }
 
 type ReviewVerdict = 'approve' | 'reject' | null;
 
-export default function ReviewPane({ prNumber, prTitle, onBack }: ReviewPaneProps) {
+export default function ReviewPane({ prNumber, prTitle, prBody, onBack }: ReviewPaneProps) {
   const { theme } = useTheme();
   const [verdict, setVerdict] = useState<ReviewVerdict>(null);
   const [comment, setComment] = useState('');
@@ -108,6 +109,14 @@ export default function ReviewPane({ prNumber, prTitle, onBack }: ReviewPaneProp
           <Text style={[styles.prTitleLabel, { color: theme.textSecondary }]}>Pull Request</Text>
           <Text style={[styles.prTitleText, { color: theme.text }]}>{prTitle}</Text>
         </View>
+
+        {/* PR description */}
+        {!!prBody && (
+          <View style={[styles.prTitleCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text style={[styles.prTitleLabel, { color: theme.textSecondary }]}>Description</Text>
+            <Text style={[styles.prBodyText, { color: theme.text }]}>{prBody}</Text>
+          </View>
+        )}
 
         {submitted ? (
           /* Success state */
@@ -241,6 +250,7 @@ const styles = StyleSheet.create({
   },
   prTitleLabel: { fontSize: 12, fontWeight: '500', marginBottom: 4 },
   prTitleText: { fontSize: 15, fontWeight: '600' },
+  prBodyText: { fontSize: 14, lineHeight: 20 },
   sectionLabel: { fontSize: 13, fontWeight: '500', marginTop: 8, marginBottom: 6 },
   verdictRow: { flexDirection: 'row', gap: 12, marginBottom: 8 },
   verdictButton: {

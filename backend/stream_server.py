@@ -1837,6 +1837,7 @@ def fetch_open_prs():
             pr_list.append({
                 'number': pr.number,
                 'title': pr.title,
+                'body': pr.body or '',
                 'branch': pr.head.ref,
                 'state': pr.state,
                 'mentioned_issues': mentioned_issues,

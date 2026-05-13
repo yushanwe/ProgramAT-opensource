@@ -31,6 +31,7 @@ interface Issue {
 interface PR {
   number: number;
   title: string;
+  body?: string;
   branch: string;
   state: string;
   mentioned_issues: string[];
@@ -46,7 +47,7 @@ interface IssueSelectorProps {
   onCreateNew?: () => void; // New prop for switching to create mode
   onNavigateToTools?: () => void; // Callback to navigate to Tools tab
   onViewLogs?: (pr: {number: number; title: string}) => void; // Callback to view logs for a PR
-  onReviewPR?: (pr: {number: number; title: string}) => void; // Callback to open review pane for a PR
+  onReviewPR?: (pr: {number: number; title: string; body?: string}) => void; // Callback to open review pane for a PR
   issues?: Issue[]; // Optional - not used in PR-only mode
   prs?: PR[];
   embedded?: boolean;
@@ -204,7 +205,7 @@ export default function IssueSelector({
             onPress: () => {
               console.log('[IssueSelector] Opening review pane for PR:', pr.number);
               if (onReviewPR) {
-                onReviewPR({ number: pr.number, title: pr.title });
+                onReviewPR({ number: pr.number, title: pr.title, body: pr.body });
               }
               onClose();
             }
