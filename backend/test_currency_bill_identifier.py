@@ -43,16 +43,16 @@ def test_main_with_mocked_ocr():
     print("Testing main() with mocked OCR...")
 
     original_detect = tool.detect_text_google_vision
-    image = create_test_image()
+    test_image = create_test_image()
 
     try:
-        tool.detect_text_google_vision = lambda **kwargs: [
+        tool.detect_text_google_vision = lambda image, credentials_hint=None, language_hints=None: [
             {'text': 'UNITED STATES OF AMERICA TWENTY DOLLARS'}
         ]
-        result = tool.main(image, {})
+        result = tool.main(test_image, {})
         print(f"  One-shot result: {result}")
 
-        streaming_result = tool.main(image, {'is_streaming': True})
+        streaming_result = tool.main(test_image, {'is_streaming': True})
         print(f"  Streaming result: {streaming_result}")
     finally:
         tool.detect_text_google_vision = original_detect
@@ -65,12 +65,12 @@ def test_main_error_and_invalid_image():
     print(f"  Invalid image result: {invalid_result}")
 
     original_detect = tool.detect_text_google_vision
-    image = create_test_image()
+    test_image = create_test_image()
     try:
-        tool.detect_text_google_vision = lambda **kwargs: [
+        tool.detect_text_google_vision = lambda image, credentials_hint=None, language_hints=None: [
             {'error': 'mock OCR failure'}
         ]
-        error_result = tool.main(image, {})
+        error_result = tool.main(test_image, {})
         print(f"  OCR error result: {error_result}")
     finally:
         tool.detect_text_google_vision = original_detect
