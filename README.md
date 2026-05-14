@@ -238,6 +238,7 @@ Creation instructions coming soon.
 | **Door Detection** | Detects doors/doorways with clock-face navigation cues | YOLOWorld |
 | **Empty Seat Detection** | Finds unoccupied chairs and gives directional guidance | YOLOv11 |
 | **Clothing Recognition** | Identifies the most prominent clothing item and its features | Google Gemini Vision |
+| **Expiration Date Reader** | Reads package expiration dates aloud | Google Cloud Vision API |
 
 New tools can be added by placing a Python file in the `tools/` directory. Each tool exposes a `main(image, input_data)` function and returns an audio-friendly string or dict.
 
@@ -270,6 +271,7 @@ ProgramAT-opensource/
 └── tools/                     # Pluggable vision/AI tools (Python)
     ├── object_recognition.py
     ├── live_ocr.py
+    ├── expiration_date_reader.py
     ├── scene_description.py
     ├── camera_aiming.py
     ├── door_detection.py
