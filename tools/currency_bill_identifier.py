@@ -27,7 +27,13 @@ except ImportError:
 # Cache Vision client for performance in streaming mode
 _vision_client = None
 _vision_client_key = None
+PATTERN_TEXT_WEIGHT = 5
+PATTERN_NUMERIC_WEIGHT = 2
+LABEL_MATCH_BONUS = 4
 MIN_DENOMINATION_SCORE = 4
+# Scores without explicit currency context are capped below MIN_DENOMINATION_SCORE
+# to avoid false positives from years/serial numbers.
+MAX_SCORE_WITHOUT_CONTEXT = 3
 
 # U.S. denomination labels and OCR patterns
 USD_DENOMINATIONS = {
@@ -244,16 +250,16 @@ def identify_us_bill_denomination(ocr_texts: List[str]) -> Tuple[Optional[int], 
         for idx, pattern in enumerate(data['patterns']):
             if re.search(pattern, normalized):
                 # Heavier weight for text phrases, lighter for bare numeric matches
-                score += 5 if idx <= 1 else 2
+                score += PATTERN_TEXT_WEIGHT if idx <= 1 else PATTERN_NUMERIC_WEIGHT
 
         # Extra weight if denomination includes explicit "X dollars" phrase
         word_label = data['label'].upper()
         if re.search(re.escape(word_label), normalized):
-            score += 4
+            score += LABEL_MATCH_BONUS
 
         # Bare numeric matches are weak evidence when currency context is absent
         if not currency_context:
-            score = min(score, 3)
+            score = min(score, MAX_SCORE_WITHOUT_CONTEXT)
 
         if score > best_score:
             best_score = score
