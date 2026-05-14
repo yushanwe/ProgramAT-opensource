@@ -26,6 +26,7 @@ import os
 from dotenv import load_dotenv
 try:
     import litellm
+    litellm._turn_on_debug()
     LITELLM_AVAILABLE = True
 except ImportError:
     litellm = None

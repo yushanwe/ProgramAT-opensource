@@ -188,6 +188,12 @@ def _resolve_api_key(model_name: str, explicit_api_key: Optional[str] = None) ->
         return os.environ.get('GEMINI_API_KEY', '')
     if normalized.startswith('claude'):
         return os.environ.get('ANTHROPIC_API_KEY', '')
+    # Support OpenRouter model identifiers like `openrouter/...`
+    if normalized.startswith('openrouter') or 'openrouter' in normalized:
+        return os.environ.get('OPENROUTER_API_KEY', '') or os.environ.get('OPENAI_API_KEY', '')
+    if normalized.startswith('openai'):
+        return os.environ.get('OPENAI_API_KEY', '')
+
     return os.environ.get('OPENAI_API_KEY', '') or os.environ.get('GEMINI_API_KEY', '')
 
 
