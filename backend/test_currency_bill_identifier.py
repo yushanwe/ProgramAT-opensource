@@ -36,6 +36,7 @@ def test_denomination_matching():
         (["TWENTY DOLLARS", "FEDERAL RESERVE NOTE"], 20),
         (["ONE HUNDRED DOLLARS", "THE UNITED STATES OF AMERICA"], 100),
         (["FIVE DOLLARS"], 5),
+        (["FEDERAL RESERVE NOTE", "UNITED STATES"], None),
         (["HELLO WORLD"], None),
     ]
 

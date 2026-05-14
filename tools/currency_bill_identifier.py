@@ -247,18 +247,22 @@ def identify_us_bill_denomination(ocr_texts: List[str]) -> Tuple[Optional[int], 
 
     for value, data in USD_DENOMINATIONS.items():
         score = 0
+        has_text_pattern_match = False
         for idx, pattern in enumerate(data['patterns']):
             if re.search(pattern, normalized):
                 # Heavier weight for text phrases, lighter for bare numeric matches
                 score += PATTERN_TEXT_WEIGHT if idx <= 1 else PATTERN_NUMERIC_WEIGHT
+                if idx <= 1:
+                    has_text_pattern_match = True
 
         # Extra weight if denomination includes explicit "X dollars" phrase
         word_label = data['label'].upper()
         if re.search(re.escape(word_label), normalized):
             score += LABEL_MATCH_BONUS
 
-        # Bare numeric matches are weak evidence when currency context is absent
-        if not currency_context:
+        # Bare numeric matches are weak evidence when currency context is absent.
+        # Keep strong text-pattern matches (e.g., TWENTY) uncapped.
+        if not currency_context and not has_text_pattern_match:
             score = min(score, MAX_SCORE_WITHOUT_CONTEXT)
 
         if score > best_score:
