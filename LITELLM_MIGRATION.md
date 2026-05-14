@@ -216,4 +216,3 @@ These are small implementation details that support the three steps above:
 Implementation note:
 
 - Backend helper logic is now centralized in [backend/litellm_utils.py](backend/litellm_utils.py#L1), and imported by [backend/gemini_summarizer.py](backend/gemini_summarizer.py#L1) and [backend/stream_server.py](backend/stream_server.py#L1).
-- The tool files still keep local helper functions in [tools/scene_description.py](tools/scene_description.py#L1) and [tools/clothing_recognition.py](tools/clothing_recognition.py#L1) so each tool remains independently runnable in the tool execution context.

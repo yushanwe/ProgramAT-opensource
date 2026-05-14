@@ -34,6 +34,13 @@ except ImportError:
     LITELLM_AVAILABLE = False
     print("⚠️  litellm not installed. Install with: pip install litellm")
 
+from backend.litellm_utils import (
+    resolve_model_name,
+    resolve_api_key,
+    extract_text,
+    pil_image_to_data_uri,
+)
+
 # Constants
 GEMINI_CONFIDENCE_SCORE = 0.9
 
@@ -141,7 +148,6 @@ def resize_image_if_needed(image: np.ndarray, max_size: tuple = (1024, 1024)) ->
     
     return resized
 
-
 def convert_cv2_to_pil(image: np.ndarray) -> Image.Image:
     """
     Convert OpenCV BGR image to PIL RGB format.
@@ -159,54 +165,6 @@ def convert_cv2_to_pil(image: np.ndarray) -> Image.Image:
     pil_image = Image.fromarray(image_rgb)
     
     return pil_image
-
-
-def _image_to_data_uri(pil_image: Image.Image) -> str:
-    """Convert a PIL image to a base64 data URI for LiteLLM vision calls."""
-    buffer = io.BytesIO()
-    pil_image.save(buffer, format='JPEG', quality=85)
-    image_base64 = base64.b64encode(buffer.getvalue()).decode('ascii')
-    return f'data:image/jpeg;base64,{image_base64}'
-
-
-def _resolve_model_name(model_name: str) -> str:
-    if not model_name:
-        return 'gemini/gemini-3-flash-preview'
-    if '/' in model_name:
-        return model_name
-    if model_name.startswith('gemini'):
-        return f'gemini/{model_name}'
-    return model_name
-
-
-def _resolve_api_key(model_name: str, explicit_api_key: Optional[str] = None) -> str:
-    if explicit_api_key:
-        return explicit_api_key
-
-    normalized = (model_name or '').lower()
-    if normalized.startswith('gemini'):
-        return os.environ.get('GEMINI_API_KEY', '')
-    if normalized.startswith('claude'):
-        return os.environ.get('ANTHROPIC_API_KEY', '')
-    return os.environ.get('OPENAI_API_KEY', '') or os.environ.get('GEMINI_API_KEY', '')
-
-
-def _extract_text(response) -> str:
-    content = response.choices[0].message.content
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict):
-                parts.append(part.get('text', ''))
-            elif hasattr(part, 'text'):
-                parts.append(getattr(part, 'text', '') or '')
-        return ''.join(parts).strip()
-    return str(content).strip()
-
 
 def build_scene_prompt(
     detail_level: str = 'standard',
@@ -349,7 +307,7 @@ def analyze_scene(
         }
     
     # Get API key
-    api_key = _resolve_api_key(model_name, api_key)
+    api_key = resolve_api_key(model_name, api_key)
     
     if not api_key:
         return {
@@ -369,12 +327,12 @@ def analyze_scene(
         
         # Convert to PIL format
         pil_image = convert_cv2_to_pil(processed_image)
-        image_data_uri = _image_to_data_uri(pil_image)
+        image_data_uri = pil_image_to_data_uri(pil_image)
         
         # Build prompt
         prompt = build_scene_prompt(detail_level, focus, context)
 
-        model_name = _resolve_model_name(model_name)
+        model_name = resolve_model_name(model_name)
 
         print(f"🤖 Using LiteLLM model: {model_name}")
         print(f"📋 Detail level: {detail_level}, Focus: {focus}")
@@ -394,7 +352,7 @@ def analyze_scene(
         )
         
         # Extract description
-        description = _extract_text(response)
+        description = extract_text(response)
         
         print(f"\n📋 Scene Description:\n{description}\n")
         
