@@ -6,7 +6,7 @@ labels: enhancement
 assignees: ''
 
 ---
-<!-- Template: VAT -->
+Template: VAT
 <!-- ORIGINAL_PROMPTS
 -->
 
