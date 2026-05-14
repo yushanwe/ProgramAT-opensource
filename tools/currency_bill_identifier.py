@@ -137,7 +137,15 @@ def limit_words(text: str, max_words: int = STREAMING_WORD_LIMIT) -> str:
     words = text.split()
     if len(words) <= max_words:
         return text
-    return ' '.join(words[:max_words]).rstrip('.,;:') + '.'
+    truncated = ' '.join(words[:max_words]).rstrip()
+    if truncated.endswith(('.', '!', '?')):
+        return truncated
+    return truncated.rstrip('.,;:') + '.'
+
+
+def apply_streaming_limit(text: str, is_streaming: bool) -> str:
+    """Apply streaming word limit only when streaming mode is enabled."""
+    return limit_words(text) if is_streaming else text
 
 
 def build_response_text(denomination: int, currency_name: str = "dollars") -> str:
@@ -177,17 +185,17 @@ def main(image: np.ndarray, input_data: Any = None) -> Any:
 
     if not detections:
         message = "I couldn't read a bill denomination. Please hold the bill steady."
-        return limit_words(message) if is_streaming else message
+        return apply_streaming_limit(message, is_streaming)
 
     full_text = detections[0].get('text', '')
     denomination = identify_usd_denomination(full_text)
 
     if denomination is None:
         message = "I couldn't determine the bill value. Try better lighting or a closer view."
-        return limit_words(message) if is_streaming else message
+        return apply_streaming_limit(message, is_streaming)
 
     response_text = build_response_text(denomination)
-    return limit_words(response_text) if is_streaming else response_text
+    return apply_streaming_limit(response_text, is_streaming)
 
 
 __all__ = [
@@ -197,5 +205,6 @@ __all__ = [
     'normalize_ocr_text',
     'identify_usd_denomination',
     'limit_words',
+    'apply_streaming_limit',
     'build_response_text',
 ]

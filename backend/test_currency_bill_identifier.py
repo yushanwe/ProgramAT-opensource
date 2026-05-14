@@ -46,7 +46,7 @@ def test_main_with_mocked_ocr():
     image = create_test_image()
 
     try:
-        tool.detect_text_google_vision = lambda image, credentials_hint=None, language_hints=None: [
+        tool.detect_text_google_vision = lambda **kwargs: [
             {'text': 'UNITED STATES OF AMERICA TWENTY DOLLARS'}
         ]
         result = tool.main(image, {})
@@ -67,7 +67,7 @@ def test_main_error_and_invalid_image():
     original_detect = tool.detect_text_google_vision
     image = create_test_image()
     try:
-        tool.detect_text_google_vision = lambda image, credentials_hint=None, language_hints=None: [
+        tool.detect_text_google_vision = lambda **kwargs: [
             {'error': 'mock OCR failure'}
         ]
         error_result = tool.main(image, {})
