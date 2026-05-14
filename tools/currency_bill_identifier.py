@@ -27,13 +27,13 @@ except ImportError:
 # Cache Vision client for performance in streaming mode
 _vision_client = None
 _vision_client_key = None
-PATTERN_TEXT_WEIGHT = 5
-PATTERN_NUMERIC_WEIGHT = 2
-LABEL_MATCH_BONUS = 4
-MIN_DENOMINATION_SCORE = 4
-# Scores without explicit currency context are capped below MIN_DENOMINATION_SCORE
+SCORE_PATTERN_TEXT_WEIGHT = 5
+SCORE_PATTERN_NUMERIC_WEIGHT = 2
+SCORE_LABEL_MATCH_BONUS = 4
+SCORE_MIN_DENOMINATION_THRESHOLD = 4
+# Scores without explicit currency context are capped below SCORE_MIN_DENOMINATION_THRESHOLD
 # to avoid false positives from years/serial numbers.
-MAX_SCORE_WITHOUT_CONTEXT = 3
+SCORE_MAX_WITHOUT_CONTEXT = 3
 
 # U.S. denomination labels and OCR patterns
 USD_DENOMINATIONS = {
@@ -144,7 +144,7 @@ def _looks_like_service_account_json(raw_json: str) -> bool:
         return False
 
 
-def get_vision_client(api_key: Optional[str] = None):
+def get_vision_client(api_key: Optional[str] = None) -> Optional[Any]:
     """Create or reuse a Google Cloud Vision client."""
     global _vision_client, _vision_client_key
 
@@ -160,7 +160,7 @@ def get_vision_client(api_key: Optional[str] = None):
     if api_key and os.path.isfile(api_key):
         credentials = service_account.Credentials.from_service_account_file(api_key)
         client = vision.ImageAnnotatorClient(credentials=credentials)
-    elif api_key and api_key.startswith('{') and _looks_like_service_account_json(api_key):
+    elif api_key and _looks_like_service_account_json(api_key):
         import json
         creds = json.loads(api_key)
         credentials = service_account.Credentials.from_service_account_info(creds)
@@ -251,19 +251,19 @@ def identify_us_bill_denomination(ocr_texts: List[str]) -> Tuple[Optional[int], 
         for idx, pattern in enumerate(data['patterns']):
             if re.search(pattern, normalized):
                 # Heavier weight for text phrases, lighter for bare numeric matches
-                score += PATTERN_TEXT_WEIGHT if idx <= 1 else PATTERN_NUMERIC_WEIGHT
+                score += SCORE_PATTERN_TEXT_WEIGHT if idx <= 1 else SCORE_PATTERN_NUMERIC_WEIGHT
                 if idx <= 1:
                     has_text_pattern_match = True
 
         # Extra weight if denomination includes explicit "X dollars" phrase
         word_label = data['label'].upper()
         if re.search(re.escape(word_label), normalized):
-            score += LABEL_MATCH_BONUS
+            score += SCORE_LABEL_MATCH_BONUS
 
         # Bare numeric matches are weak evidence when currency context is absent.
         # Keep strong text-pattern matches (e.g., TWENTY) uncapped.
         if not currency_context and not has_text_pattern_match:
-            score = min(score, MAX_SCORE_WITHOUT_CONTEXT)
+            score = min(score, SCORE_MAX_WITHOUT_CONTEXT)
 
         if score > best_score:
             best_score = score
@@ -271,7 +271,7 @@ def identify_us_bill_denomination(ocr_texts: List[str]) -> Tuple[Optional[int], 
             best_label = data['label']
 
     # Require minimum confidence to avoid random number misreads
-    if best_score < MIN_DENOMINATION_SCORE:
+    if best_score < SCORE_MIN_DENOMINATION_THRESHOLD:
         return None, None, best_score
 
     return best_value, best_label, best_score
