@@ -6,6 +6,7 @@ on:
 
 jobs:
   assign-to-copilot:
+    if: contains(github.event.issue.body, 'Template: VAT')
     runs-on: ubuntu-latest
     permissions:
       issues: write
