@@ -48,6 +48,8 @@ _KEYWORD_PATTERNS = [
     r'\bSELL BY\b',
     r'\bBBE\b',
 ]
+RECENT_DATE_SCORE_BOOST = 2
+MAX_STREAMING_WORDS = 15
 
 
 def detect_text_google_vision(
@@ -212,7 +214,7 @@ def extract_expiration_date(ocr_text: str) -> Optional[date]:
         for parsed, _raw in line_dates:
             score = 10 if has_keyword else 0
             if parsed.year >= date.today().year - 1:
-                score += 2
+                score += RECENT_DATE_SCORE_BOOST
             all_candidates.append((score, parsed))
 
     if not all_candidates:
@@ -304,8 +306,8 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
 
     if _is_streaming_mode(config):
         words = response.split()
-        if len(words) > 15:
-            response = ' '.join(words[:15])
+        if len(words) > MAX_STREAMING_WORDS:
+            response = ' '.join(words[:MAX_STREAMING_WORDS])
 
     return response
 
