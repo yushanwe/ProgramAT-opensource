@@ -28,93 +28,179 @@ This is a React Native app that facilitates AT creation, iteration, and testing 
 
 ### Installation
 
-1. **Clone the repository**
+1. **Fork this repository**
+   This is easiest to do from the Github website. 
+   First, select the button that says Fork.
+   Once you have done so, it will take you to an interface where you can select the owner and name of the fork. By default, this is your username for owner, and `ProgramAT-opensource` for the repository name. We recommend leaving these defaults intact, but you can change them if you would like.
+   Then, click the button that says Create Fork.
+   After a few seconds, a copy of the repository will be made in your Github account.
+
+2. **Clone the repository**
    ```bash
-   git clone https://github.com/program-at/ProgramAT-opensource.git
+   git clone https://github.com/your-username/ProgramAT-opensource.git
    cd ProgramAT-opensource
    ```
 
-2. Optional (required if you are building the app): **Install React Native dependencies**
+3. Optional (required if you are building the app): **Install React Native dependencies**
    ```bash
    cd ProgramATApp
    npm install
    ```
 
-3. Optional (required if you are building the app): **Install iOS dependencies (iOS only)**
+4. Optional (required if you are building the app): **Install iOS dependencies (iOS only)**
    ```bash
    cd ios
    pod install
    cd ..
    ```
 
-4. **Install backend dependencies**
+5. **Set up the backend**
    ```bash
    cd ../backend
+   python3 -m venv .venv
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-### Environment Variables
+6. **Create the backend `.env` file**
+   ```bash
+   cp .env.example .env
+   ```
 
-The backend uses environment variables for API keys and configuration:
+7. **Fill in the values in `backend/.env`**
+   - `GEMINI_API_KEY`
+   - `GITHUB_TOKEN`
+   - `GITHUB_REPO`
+   - `GOOGLE_APPLICATION_CREDENTIALS` if you use OCR tools
+
+### API Keys
+
+The backend reads configuration from `backend/.env` automatically when it starts, or from environment variables if you set them directly.
+
+Use the table below as a quick reference for what each value does.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GEMINI_API_KEY` | Yes (for VLM tools) | Google Gemini API key — used by scene description, clothing recognition, AI parsing, and Gemini Live |
-| `GOOGLE_APPLICATION_CREDENTIALS` | For OCR tools | Google Cloud Vision API credentials (used by Live OCR) |
+| `GEMINI_API_KEY` | Yes (for VLM tools) | Google Gemini API key used by scene description, clothing recognition, AI parsing, and Gemini Live |
+| `GOOGLE_APPLICATION_CREDENTIALS` | For OCR tools | Google Cloud Vision API credentials used by Live OCR |
 | `GITHUB_TOKEN` | For GitHub features | GitHub personal access token with `repo` scope |
-| `GITHUB_REPO` | Yes (to be able to access your own tools) | Target repo in `owner/repo` format |
+| `GITHUB_REPO` | Yes (to access your own tools) | Target repo in `owner/repo` format |
 | `HOST` / `PORT` | Optional | Server bind address (default `0.0.0.0:8080`) |
 
-### Running the Application (instructions to be updated)
+#### Alternative: Set environment variables directly
 
-1. **Start the backend server**
-   ```bash
-   cd backend
-   export GEMINI_API_KEY="your_key_here"
-   python stream_server.py
-   ```
-   The server starts on port 8080.
+Instead of using `backend/.env`, you can export the variables in your shell before starting the backend:
 
-2. **Start the React Native app**. Skip if you are running the app from the TestFlight link.
-   ```bash
-   cd ProgramATApp
-   npm start
-   ```
-
-3. **Run on your device**. Skip if you are running the app via TestFlight.
-
-   For iOS:
-   ```bash
-   npm run ios
-   ```
-
-### Configuration (will be updated closer to event)
-
-Server URLs are managed in `ProgramATApp/config.ts`. The app supports multiple named servers selectable via a secret code in Settings:
-
-```typescript
-export const SERVER_CONFIGS: Record<string, { url: string; name: string }> = {
-  'default': { url: 'ws://YOUR_SERVER_IP:8080', name: 'Default Server' },
-};
+**Linux / macOS:**
+```bash
+export GEMINI_API_KEY="your_key_here"
+export GITHUB_TOKEN="your_token_here"
+export GITHUB_REPO="username/your-programat-fork"
+export GOOGLE_APPLICATION_CREDENTIALS="/home/username/path/to/credentials.json"
 ```
 
-Switch between **Development** and **Production** modes in the Settings tab.
+**Windows PowerShell:**
+```powershell
+$env:GEMINI_API_KEY = "your_key_here"
+$env:GITHUB_TOKEN = "your_token_here"
+$env:GITHUB_REPO = "username/your-programat-fork"
+$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\credentials.json"
+```
+
+### How to Get the Keys
+
+#### GitHub Token
+
+1. Go to any GitHub page: <https://github.com/>. Click your profile picture (top right) and open **Settings**.
+2. Go to **Developer settings** -> **Personal access tokens** -> **Tokens (classic)**.
+3. Click **Generate new token**.
+4. Add a note, choose an expiration, and select scopes to be **repo**.
+5. Click **Generate token**, copy it and save it properly. You won't be able to see it again.
+6. Paste the token into `backend/.env` as `GITHUB_TOKEN`.
+
+#### Gemini API Key
+
+1. Go to Google AI Studio: <https://aistudio.google.com>
+2. Sign in with your Google account.
+3. In the left sidebar, click **Get API key** -> **Create API key**.
+4. Select an existing Google Cloud project or create a new one, then click **Create API key**.
+5. Copy the generated key.
+6. Paste the key into `backend/.env` as `GEMINI_API_KEY`.
+
+Billing:
+
+- If you want to increase the rate limit, click **Set up billing** in Google AI Studio and choose other plans for your API key.
+
+#### Google Application Credentials
+
+This project uses Google Cloud Vision for higher-quality OCR in `tools/live_ocr.py`. If you want Cloud Vision for better OCR, create a service account and download a JSON key, then set `GOOGLE_APPLICATION_CREDENTIALS` to that file path. If you prefer not to use Cloud Vision, the tool will fall back to local Tesseract if installed (no Google credentials required).
+
+Steps:
+
+1. Go to Google Cloud Console: <https://console.cloud.google.com>
+2. Create or select a project and enable the **Cloud Vision API** in **Menu** -> **API & Services** -> **Enabled APIs & services**.
+3. Create a service account: **Menu** -> **IAM & Admin** -> **Service Accounts** -> **Create service account**. Fill name/ID and click **Continue**.
+4. Create a key: for this service account, select **Actions** -> **Manage Keys** -> **Add key** -> **Create new key** -> choose **JSON** -> **Create**. A JSON file `credentials.json` will be downloaded. Save it securely into your workspace.
+5. Set `GOOGLE_APPLICATION_CREDENTIALS` to the JSON file path.
+
+Security notes:
+
+- Do not commit the JSON key to version control. Add `credentials.json` to `.gitignore`.
+- Restrict the service account to only the Vision API and grant the minimal needed permissions.
+
+### Running the Application
+You can host the server from your personal machine for free, or use a hosting service like a GCP virtual machine or AWS virtual machine, which may have associated costs. 
+
+The difference between these two options, aside from cost, is that when running from your personal machine, your server will shut off whenever your machine does. This is potentially avoidable by using a paid hosting service.
+
+We provide instructions here for hosting from your personal machine. If you would prefer to use a paid hosting service, follow the instructions there for setup.
+
+You can skip to step 3 if ngrok is already installed and configured, or if you are using a paid hosting service.
+
+1. **Install ngrok**
+   Download ngrok for your system from <https://ngrok.com/download> and make sure `ngrok version` works in your terminal.
+
+2. **Connect ngrok to your account**
+   Follow the instructions on the downloading page to sign up for an account and get your authtoken in the ngrok dashboard. Configure it in your terminal.
+
+   ```bash
+   ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
+   ```
+
+3. **Activate the virtual environment and start the backend server**
+
+   ```bash
+   cd backend
+   source .venv/bin/activate
+   python stream_server.py
+   ```
+
+   The server listens on `0.0.0.0:8080` by default.
+
+4. **Start the ngrok tunnel (only if hosting from your personal machine)**
+   ```bash
+   ngrok http 8080
+   ```
+
+5. **Copy your forwarding address**
+   If you are using ngrok, keep the terminal created in step 4 open. ngrok will print a forwarding address, which is the public address your app should connect to. Copy this address.
+
+   If you are using a paid hosting service, your VM should list a public IP address, copy this IP address
+
+5. **Paste the forwarding address into the app**
+   Change the prefix of the forwarding address from **https** to **wss** because we are using a websocket. Open ProgramAT app on your mobile device, go to the server address field in Settings, paste the ngrok forwarding address, and tap **Connect**.
 
 ## Usage
 
-1. **Connect** — The app auto-connects to the configured server on launch. Connection status is shown in the UI; a loading sound plays while connecting.
+1. **Select a Tool** — Navigate to the **Tools** tab, browse the available tools, and tap one to select it.
 
-2. **Select a Tool** — Navigate to the **Tools** tab, browse the available tools, and tap one to select it.
+2. **Run** — The Tool Runner opens with a live camera preview. Tap **Run** to execute the tool on single frames, or **Stream** to process frames continuously. Results are spoken aloud via TTS.
 
-3. **Run** — The Tool Runner opens with a live camera preview. Tap **Run** to execute the tool on single frames, or **Stream** to process frames continuously. Results are spoken aloud via TTS.
+3. **Chat** — After a tool run, tap **Chat** to ask follow-up questions about the result (powered by Gemini).
 
-4. **Chat** — After a tool run, tap **Chat** to ask follow-up questions about the result (powered by Gemini).
-
-5. **Development mode** — Use the **PRs** tab to browse open pull requests, select one to load its tools, and send text updates to GitHub issues.
+4. **Development mode** — Use the **PRs** tab to browse open pull requests, select one to load its tools, and send text updates to GitHub issues.
 
 Creation instructions coming soon.
-
-
  
 ## Supported Input Modes
 

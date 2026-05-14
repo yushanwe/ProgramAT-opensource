@@ -13,9 +13,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout signatures branch
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: coc-signatures
+          fetch-depth: 0
+
+      - name: Ensure signatures file exists
+        run: |
+          mkdir -p .github
+
+          if [ ! -f ".github/code-of-conduct-signatures.yml" ]; then
+            echo "signed: []" > .github/code-of-conduct-signatures.yml
+          fi
 
       - name: Check existing signature
         id: existing
@@ -23,7 +33,7 @@ jobs:
           USER="${{ github.event.pull_request.user.login }}"
           FILE=".github/code-of-conduct-signatures.yml"
 
-          if [ -f "$FILE" ] && yq '.signed[]' "$FILE" | grep -Fxq "$USER"; then
+          if yq '.signed[]' "$FILE" | grep -Fxq "$USER"; then
             echo "signed=true" >> "$GITHUB_OUTPUT"
           else
             echo "signed=false" >> "$GITHUB_OUTPUT"
@@ -35,7 +45,7 @@ jobs:
         run: |
           BODY=$(jq -r .pull_request.body "$GITHUB_EVENT_PATH")
 
-          if echo "$BODY" | grep -qi -- '- \[x\] I have read and agree to follow the project'"'"'s Code of Conduct'; then
+          if echo "$BODY" | grep -qi -- "- \[x\] I have read and agree to follow the project's Code of Conduct"; then
             echo "checked=true" >> "$GITHUB_OUTPUT"
           else
             echo "checked=false" >> "$GITHUB_OUTPUT"
@@ -47,24 +57,21 @@ jobs:
           USER="${{ github.event.pull_request.user.login }}"
           FILE=".github/code-of-conduct-signatures.yml"
 
-          mkdir -p .github
-
-          if [ ! -f "$FILE" ]; then
-            echo "signed: []" > "$FILE"
-          fi
-
           yq -i '.signed += ["'"$USER"'"] | .signed |= unique | .signed |= sort' "$FILE"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add "$FILE"
 
           if git diff --cached --quiet; then
             echo "No signature changes"
-          else
-            git commit -m "Record Code of Conduct signature for $USER"
-            git push
+            exit 0
           fi
+
+          git commit -m "Record Code of Conduct signature for $USER"
+
+          git push origin HEAD:coc-signatures
 
       - name: Fail if not signed
         if: steps.existing.outputs.signed != 'true' && steps.checkbox.outputs.checked != 'true'
