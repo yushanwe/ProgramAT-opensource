@@ -48,9 +48,11 @@ def convert_image_to_jpeg_bytes(image: np.ndarray) -> bytes:
     if len(image.shape) == 2:
         pil_image = Image.fromarray(image).convert("L")
     elif len(image.shape) == 3 and image.shape[2] == 3:
+        # OpenCV frames are BGR; PIL expects RGB.
         rgb_image = image[:, :, ::-1]
         pil_image = Image.fromarray(rgb_image).convert("RGB")
     elif len(image.shape) == 3 and image.shape[2] == 4:
+        # Drop alpha and convert BGR to RGB.
         pil_image = Image.fromarray(image[:, :, :3][:, :, ::-1]).convert("RGB")
     else:
         return b""
@@ -126,7 +128,8 @@ def identify_usd_denomination(text: str) -> Optional[int]:
     if not scores:
         return None
 
-    best_denomination, best_score = max(scores.items(), key=lambda item: (item[1], item[0]))
+    # Choose highest match score; if tied, prefer higher denomination.
+    best_denomination, best_score = max(scores.items(), key=lambda score_item: (score_item[1], score_item[0]))
     if has_usd_context or best_score >= 2:
         return best_denomination
     return None
@@ -140,7 +143,9 @@ def limit_words(text: str, max_words: int = STREAMING_WORD_LIMIT) -> str:
     truncated = ' '.join(words[:max_words]).rstrip()
     if truncated.endswith(('.', '!', '?')):
         return truncated
-    return truncated.rstrip('.,;:') + '.'
+    if truncated and truncated[-1].isalnum():
+        return truncated + '.'
+    return truncated
 
 
 def apply_streaming_limit(text: str, is_streaming: bool) -> str:

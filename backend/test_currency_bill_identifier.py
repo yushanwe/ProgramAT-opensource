@@ -5,6 +5,7 @@ Test script for currency_bill_identifier.py
 import os
 import sys
 import numpy as np
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 
@@ -41,21 +42,16 @@ def test_streaming_limit():
 
 def test_main_with_mocked_ocr():
     print("Testing main() with mocked OCR...")
-
-    original_detect = tool.detect_text_google_vision
     test_image = create_test_image()
-
-    try:
-        tool.detect_text_google_vision = lambda image, credentials_hint=None, language_hints=None: [
-            {'text': 'UNITED STATES OF AMERICA TWENTY DOLLARS'}
-        ]
+    mock_detect = lambda image, credentials_hint=None, language_hints=None: [
+        {'text': 'UNITED STATES OF AMERICA TWENTY DOLLARS'}
+    ]
+    with patch.object(tool, 'detect_text_google_vision', new=mock_detect):
         result = tool.main(test_image, {})
         print(f"  One-shot result: {result}")
 
         streaming_result = tool.main(test_image, {'is_streaming': True})
         print(f"  Streaming result: {streaming_result}")
-    finally:
-        tool.detect_text_google_vision = original_detect
     print()
 
 
@@ -64,16 +60,13 @@ def test_main_error_and_invalid_image():
     invalid_result = tool.main(None, {})
     print(f"  Invalid image result: {invalid_result}")
 
-    original_detect = tool.detect_text_google_vision
     test_image = create_test_image()
-    try:
-        tool.detect_text_google_vision = lambda image, credentials_hint=None, language_hints=None: [
-            {'error': 'mock OCR failure'}
-        ]
+    mock_detect = lambda image, credentials_hint=None, language_hints=None: [
+        {'error': 'mock OCR failure'}
+    ]
+    with patch.object(tool, 'detect_text_google_vision', new=mock_detect):
         error_result = tool.main(test_image, {})
         print(f"  OCR error result: {error_result}")
-    finally:
-        tool.detect_text_google_vision = original_detect
     print()
 
 
