@@ -23,7 +23,7 @@ This is a React Native app that facilitates AT creation, iteration, and testing 
 - Python 3.11+ (for the backend server)
 - Node.js >= 20
 - Optional: React Native CLI development environment ([setup guide](https://reactnative.dev/docs/set-up-your-environment)). This is required if you want to run and install the app. You can skip this requirement if you are installing the app using our TestFlight link.
-- Optional: For iOS: Xcode and CocoaPods. You can skip if you are building and running the app.
+- Optional: For iOS: Xcode and CocoaPods. You can skip if you are not building and running the app itself locally.
 
 
 ### Installation
