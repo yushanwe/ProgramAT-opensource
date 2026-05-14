@@ -5,6 +5,7 @@ Test script for currency_bill_identifier.py
 import sys
 import os
 import numpy as np
+from unittest.mock import patch
 
 # Add tools directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
@@ -52,28 +53,22 @@ def test_main_with_mocked_ocr():
     print("Testing main() with mocked OCR...")
     image = create_test_image()
 
-    original = tool.detect_text_google_vision
-    original_vision_available = tool.VISION_API_AVAILABLE
-    try:
-        tool.VISION_API_AVAILABLE = True
-        tool.detect_text_google_vision = lambda img, api_key=None: ["TEN DOLLARS", "FEDERAL RESERVE NOTE"]
-        result = tool.main(image, {})
-        print(f"  Result: {result}")
-        assert isinstance(result, str)
-        assert "10 dollars" in result.lower()
+    with patch.object(tool, 'VISION_API_AVAILABLE', True):
+        with patch.object(tool, 'detect_text_google_vision', return_value=["TEN DOLLARS", "FEDERAL RESERVE NOTE"]):
+            result = tool.main(image, {})
+            print(f"  Result: {result}")
+            assert isinstance(result, str)
+            assert "10 dollars" in result.lower()
 
-        tool.detect_text_google_vision = lambda img, api_key=None: ["RANDOM TEXT ONLY"]
-        result_unknown = tool.main(image, {})
-        print(f"  Unknown result: {result_unknown}")
-        assert "could not identify" in result_unknown.lower()
+        with patch.object(tool, 'detect_text_google_vision', return_value=["RANDOM TEXT ONLY"]):
+            result_unknown = tool.main(image, {})
+            print(f"  Unknown result: {result_unknown}")
+            assert "could not identify" in result_unknown.lower()
 
-        tool.detect_text_google_vision = lambda img, api_key=None: []
-        result_no_text = tool.main(image, {})
-        print(f"  No-text result: {result_no_text}")
-        assert "no bill text" in result_no_text.lower()
-    finally:
-        tool.detect_text_google_vision = original
-        tool.VISION_API_AVAILABLE = original_vision_available
+        with patch.object(tool, 'detect_text_google_vision', return_value=[]):
+            result_no_text = tool.main(image, {})
+            print(f"  No-text result: {result_no_text}")
+            assert "no bill text" in result_no_text.lower()
 
     print("  ✓ main() behavior works with mocked OCR")
     print()

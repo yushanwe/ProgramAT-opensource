@@ -27,6 +27,7 @@ except ImportError:
 # Cache Vision client for performance in streaming mode
 _vision_client = None
 _vision_client_key = None
+MIN_DENOMINATION_SCORE = 4
 
 # U.S. denomination labels and OCR patterns
 USD_DENOMINATIONS = {
@@ -126,6 +127,17 @@ def preprocess_image_for_ocr(image: np.ndarray, max_size: Tuple[int, int] = (128
 
 # Building block: Vision client creation
 
+def _looks_like_service_account_json(raw_json: str) -> bool:
+    """Light validation for service-account style JSON credentials."""
+    try:
+        import json
+        parsed = json.loads(raw_json)
+        required_keys = {'type', 'client_email', 'private_key'}
+        return isinstance(parsed, dict) and required_keys.issubset(parsed.keys())
+    except Exception:
+        return False
+
+
 def get_vision_client(api_key: Optional[str] = None):
     """Create or reuse a Google Cloud Vision client."""
     global _vision_client, _vision_client_key
@@ -142,7 +154,7 @@ def get_vision_client(api_key: Optional[str] = None):
     if api_key and os.path.isfile(api_key):
         credentials = service_account.Credentials.from_service_account_file(api_key)
         client = vision.ImageAnnotatorClient(credentials=credentials)
-    elif api_key and api_key.startswith('{'):
+    elif api_key and api_key.startswith('{') and _looks_like_service_account_json(api_key):
         import json
         creds = json.loads(api_key)
         credentials = service_account.Credentials.from_service_account_info(creds)
@@ -249,7 +261,7 @@ def identify_us_bill_denomination(ocr_texts: List[str]) -> Tuple[Optional[int], 
             best_label = data['label']
 
     # Require minimum confidence to avoid random number misreads
-    if best_score < 4:
+    if best_score < MIN_DENOMINATION_SCORE:
         return None, None, best_score
 
     return best_value, best_label, best_score
