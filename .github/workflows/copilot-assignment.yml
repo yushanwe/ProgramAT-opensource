@@ -6,12 +6,12 @@ on:
 
 jobs:
   assign-to-copilot:
-    if: contains(github.event.issue.body, 'Template: VAT')
     runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
       - name: Append text to issue body
+        if: "contains(github.event.issue.body, 'Template: VAT')"
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -27,6 +27,7 @@ jobs:
             });
             
       - name: Assign issue creator
+        if: "contains(github.event.issue.body, 'Template: VAT')"
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -41,6 +42,7 @@ jobs:
             });
 
       - name: Assign issue to Copilot
+        if: "contains(github.event.issue.body, 'Template: VAT')"
         uses: otto-de/assign_issue_toCopilot_action@v1.0.1
         with:
           issue_number: ${{ github.event.issue.number }}
