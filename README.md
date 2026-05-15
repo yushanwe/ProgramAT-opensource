@@ -361,6 +361,5 @@ See [LICENSE](LICENSE).
 - [Yushan Wei](https://github.com/yushanwe) (Undergraduate Student at University of Michigan)
 - [Venkatesh Potluri](https://venkateshpotluri.me/) (Assistant Professor, University of Michigan. Principal Investigator of the [Intelligent Developer Experiences for Accessibility Lab](https://idea11y.dev/))
 - [Anhong Guo](https://guoanhong.com/) (Assistant Professor, University of Michigan and principal investigator of the [Human AI Lab](https://guoanhong.com/))
-- Yushan Wei (Undergraduate student at University of Michigan)
 
 Found a problem? Please file an issue!
