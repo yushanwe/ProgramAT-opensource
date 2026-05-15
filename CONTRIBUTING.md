@@ -105,4 +105,11 @@ You do not, however, start from scratch in terms of number of prior approvals af
 Once you have achieved three approvals, without any unresolved requested changes from maintainers, your documentation contribution is eligible to be merged upstream.
 
 
+## A Note on Maintainer Availability
+While maintainer involvement is necessary for several types of contributions, outside of dedicated open source events, we cannot make any promises about the timeline under which maintainers' will respond to new feature requests.
 
+We will, however, make every effort to respond to requests to be granted org membership in a timely fashion so contributors beyond the maintainer team can begin laying the groundwork for addressing requests from the community (i.e. raising and voting on issues, reviewing PRs, etc.). Further, we will keep a regular eye on community raised issues to prevent ideas that are both compatible with the broader ProgramAT vision and highly valued by the community from being unduly blocked by needing a maintainer's go ahead to raise a PR.
+
+With this in mind, if there is a feature you are passionate about including in ProgramAT, we encourage, if you are able, trying an implementation on your fork, raising an issue here, and when that issue has satisfied the criteria, submitting an upstream PR. It is much more likely that the maintainer team will be able to find time to review a variety of new features than implement them all ourselves! This also will give you, as a contributor, the ability to have and use valuable features you are excited about on a timeline you are satisfied with, even if it takes some time for the community at large to have access to them.
+
+Further, we are open to inviting particularly constructive contributors to eventually join the maintainer team! As a newer project, we do not yet have a firm policy for how this decision will get made, but as one develops, check back here for updates.
