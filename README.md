@@ -247,6 +247,13 @@ Creation instructions coming soon.
 - Tools are pulled from the `main` branch only
 - The PR browser tab is hidden; users go straight to the tool list
 
+### Review mode
+- Tools are pulled from the main repository server (as opposed to your self-hosted server), specifically PRs people have put up for review
+- You can test tools as you would in development mode, but cannot directly create or edit tools.
+   - If you would like a tool of yours to be visible in review mode, create it locally, then submit a PR!
+- You can review tools (approve if they work as intended, request changes otherwise)
+   - Note that for this mode to work properly, you should first [become a contributor](https://github.com/program-at/ProgramAT-opensource/issues/44). These permissions are needed to leave reviews.
+
 ## Built-In Tools
 
 | Tool | Description | Model |
