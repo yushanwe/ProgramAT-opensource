@@ -38,6 +38,7 @@ def test_basic_execution():
     
     assert isinstance(result, str), "Result should be a string"
     assert len(result) > 0, "Result should not be empty"
+    assert "in frame" in result.lower(), "Result should describe objects as being in frame"
     
     print(f"  ✓ Result: '{result}'")
     print()
@@ -70,6 +71,7 @@ def test_streaming_mode():
     
     # First frame with tracking enabled
     result1 = main(frame, {'track_mode': True})
+    assert len(result1.split()) <= 15, "Streaming response should be concise (15 words max)"
     print(f"  ✓ First frame: '{result1}'")
     
     # Second frame (same objects, should return empty)

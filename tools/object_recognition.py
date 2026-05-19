@@ -298,9 +298,13 @@ def create_audio_description(
     
     # Start description
     if total == 1:
-        desc_parts = ["I see 1 object"]
+        desc_parts = ["I found 1 object in frame"]
     else:
-        desc_parts = [f"I see {total} objects" if total <= max_objects else f"I see {total} objects, describing {max_objects}"]
+        desc_parts = [
+            f"I found {total} objects in frame"
+            if total <= max_objects
+            else f"I found {total} objects in frame, describing {max_objects}"
+        ]
     
     # Group by class for cleaner output
     object_descriptions = []
