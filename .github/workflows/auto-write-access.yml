@@ -1,0 +1,235 @@
+name: Auto Grant Write Access
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  grant-access:
+    if: >
+      ${{
+        github.event.issue.number == 44 &&
+        !github.event.issue.pull_request &&
+        contains(github.event.comment.body, '/request-contributor-status')
+      }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # -----------------------------
+      # Parse event payload
+      # -----------------------------
+      - name: Parse event
+        id: event
+        run: |
+          echo "::notice title=Event::Parsing GitHub event payload"
+
+          echo "comment=$(jq -r .comment.body "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "user=$(jq -r .comment.user.login "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "issue=$(jq -r .issue.number "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "type=$(jq -r .comment.user.type "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+
+          echo "::notice title=Event Parsed::User=${{ steps.event.outputs.user }} Issue=${{ steps.event.outputs.issue }}"
+
+      # -----------------------------
+      # Filter bots/apps
+      # -----------------------------
+      - name: Filter bots
+        id: botcheck
+        run: |
+          TYPE="${{ steps.event.outputs.type }}"
+
+          echo "::notice title=User Type::$TYPE"
+
+          if [ "$TYPE" != "User" ]; then
+            echo "::warning title=Ignored::Non-user account detected ($TYPE)"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Exit if bot
+        if: steps.botcheck.outputs.skip == 'true'
+        run: exit 0
+
+      # -----------------------------
+      # Validate request
+      # -----------------------------
+      - name: Validate request
+        id: validate
+        run: |
+          ISSUE="44"
+          COMMENT="${{ steps.event.outputs.comment }}"
+
+          echo "::notice title=Validation::Checking issue + command"
+
+          echo "Issue received: ${{ steps.event.outputs.issue }}"
+          echo "Expected issue: $ISSUE"
+          echo "Comment: $COMMENT"
+
+          if [ "${{ steps.event.outputs.issue }}" != "$ISSUE" ]; then
+            echo "match=false" >> $GITHUB_OUTPUT
+            echo "::warning title=Validation Failed::Wrong issue"
+            exit 0
+          fi
+
+          if echo "$COMMENT" | grep -qi "/request-contributor-status"; then
+            echo "match=true" >> $GITHUB_OUTPUT
+            echo "::notice title=Command Match::Request detected"
+          else
+            echo "match=false" >> $GITHUB_OUTPUT
+            echo "::warning title=Validation Failed::No valid command found"
+          fi
+
+      - name: Exit if invalid request
+        if: steps.validate.outputs.match != 'true'
+        run: exit 0
+
+      # -----------------------------
+      # Load denylist (CoC-style)
+      # -----------------------------
+      - name: Checkout signatures branch
+        uses: actions/checkout@v4
+        with:
+          ref: coc-signatures
+          path: signatures
+
+      - name: Load denylist
+        id: denylist
+        run: |
+          FILE="signatures/.github/denylist.yml"
+
+          echo "::notice title=Denylist::Loading from $FILE"
+
+          if [ ! -f "$FILE" ]; then
+            echo "::warning title=Denylist Missing::No denylist file found"
+            echo "banned=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          banned=$(yq '.banned_users[]?' "$FILE" | tr '\n' ' ')
+
+          echo "::notice title=Denylist Loaded::${banned:-none}"
+
+          echo "banned=$banned" >> $GITHUB_OUTPUT
+
+      # -----------------------------
+      # Check denylist
+      # -----------------------------
+      - name: Check denylist
+        id: check
+        run: |
+          USER="${{ steps.event.outputs.user }}"
+          BANNED="${{ steps.denylist.outputs.banned }}"
+
+          echo "::notice title=Denylist Check::Checking $USER"
+
+          if echo "$BANNED" | grep -wiq "$USER"; then
+            echo "allowed=false" >> $GITHUB_OUTPUT
+            echo "::error title=DENIED::User is on denylist: $USER"
+          else
+            echo "allowed=true" >> $GITHUB_OUTPUT
+            echo "::notice title=ALLOWED::User passed denylist"
+          fi
+
+      # -----------------------------
+      # Reject denylisted users
+      # -----------------------------
+      - name: Reject denylisted users
+        if: steps.check.outputs.allowed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+        run: |
+          USER="${{ steps.event.outputs.user }}"
+
+          gh issue comment "${{ github.event.issue.number }}" \
+            --body "@$USER cannot be granted contributor access (denylisted)."
+
+          echo "::error title=Access Denied::Workflow terminated for $USER"
+
+          exit 1
+
+      # -----------------------------
+      # Check membership
+      # -----------------------------
+      - name: Check existing membership
+        id: membership
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+        run: |
+          USER="${{ steps.event.outputs.user }}"
+          ORG="${{ github.repository_owner }}"
+          TEAM="contributors"
+
+          echo "::notice title=Membership Check::Checking if $USER is already a member"
+
+          if gh api \
+            /orgs/$ORG/teams/$TEAM/memberships/$USER \
+            >/dev/null 2>&1; then
+
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "::notice title=Already Member::$USER is already in team"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "::notice title=Not Member::$USER not found in team"
+          fi
+
+      # -----------------------------
+      # Skip if already member
+      # -----------------------------
+      - name: Skip existing members
+        if: steps.membership.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+        run: |
+          echo "::notice title=Skipped::User already had access"
+          exit 0
+
+      # -----------------------------
+      # Grant access
+      # -----------------------------
+      - name: Grant write access
+        if: steps.membership.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+        run: |
+          USER="${{ steps.event.outputs.user }}"
+          ORG="${{ github.repository_owner }}"
+          TEAM="contributors"
+
+          echo "::notice title=Granting Access::Adding $USER to $TEAM"
+
+          gh api \
+            -X PUT \
+            /orgs/$ORG/teams/$TEAM/memberships/$USER \
+            -f role=member
+
+          echo "::notice title=Success::Access granted to $USER"
+          gh issue comment "${{ github.event.issue.number }}" \
+          --body "@${{ steps.event.outputs.user }} has been granted contributor access."
+
+      # -----------------------------
+      # Final audit summary
+      # -----------------------------
+      - name: Audit summary
+        if: always()
+        run: |
+          echo "===================================="
+          echo "WRITE ACCESS WORKFLOW SUMMARY"
+          echo "===================================="
+          echo "User: ${{ steps.event.outputs.user }}"
+          echo "Issue: ${{ steps.event.outputs.issue }}"
+          echo "Command: /request-contributor-status"
+          echo "Denied: ${{ steps.check.outputs.allowed != 'true' }}"
+          echo "Already member: ${{ steps.membership.outputs.exists }}"
+          echo "Result: complete"
+          echo "===================================="
+
+          echo "::notice title=Audit Complete::See logs for full decision trace"
