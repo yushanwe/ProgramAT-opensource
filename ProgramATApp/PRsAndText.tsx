@@ -3,14 +3,12 @@
  * Shows PR list by default, with navigation to text input for selected PRs
  */
 
-import React, { useState, useEffect, useRef } from 'react';
-import { View, StyleSheet } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { View, StyleSheet, Linking, Alert } from 'react-native';
 import { useTheme } from './ThemeContext';
 import IssueSelector from './IssueSelector';
 import TextInput from './TextInput';
-import ViewLogsScreen from './ViewLogsScreen';
-import BeepService from './BeepService';
-import { AppMode } from './config';
+import Config, { AppMode } from './config';
 import ReviewPane from './ReviewPane';
 
 interface PRsAndTextProps {
@@ -47,10 +45,8 @@ export default function PRsAndText({
   const { theme } = useTheme();
   // Start with PR list view
   const [viewMode, setViewMode] = useState<ViewMode>('pr-list');
-  const [viewLogsPR, setViewLogsPR] = useState<{number: number; title: string} | null>(null);
+  const [viewLogsPR, setViewLogsPR] = useState<{number: number; title: string; body?: string} | null>(null);
   
-  // Track the last PR we viewed logs for
-  const lastViewedPRRef = useRef<number | null>(null);
 
   // Reset to PR list view whenever the tab becomes active
   useEffect(() => {
@@ -71,7 +67,7 @@ export default function PRsAndText({
     setViewMode('text-input'); // Navigate to text input for new issue
   };
 
-  const handleReviewPR = (pr: {number: number; title: string}) => {
+  const handleReviewPR = (pr: {number: number; title: string; body?: string}) => {
     setViewLogsPR(pr); // reuse this state to track the target PR
     setViewMode('review');
   };
@@ -85,15 +81,10 @@ export default function PRsAndText({
   };
 
   const handleViewLogs = (pr: {number: number; title: string}) => {
-    // If viewing a different PR than last time, clear old data and play loading beep
-    if (lastViewedPRRef.current !== pr.number) {
-      console.log(`[PRsAndText] Viewing logs for new PR #${pr.number}, clearing old data`);
-      onClearCopilotData();
-      BeepService.playLoadingSound();
-      lastViewedPRRef.current = pr.number;
-    }
-    setViewLogsPR(pr);
-    setViewMode('view-logs');
+    const url = `https://github.com/${Config.REVIEW_GITHUB_REPO}/pull/${pr.number}`;
+    Linking.openURL(url).catch(() =>
+      Alert.alert('Could not open GitHub', `Open this URL manually:\n${url}`)
+    );
   };
 
   return (
@@ -112,20 +103,11 @@ export default function PRsAndText({
           selectedIssue={selectedIssue}
           reviewMode={appMode === 'review'}
         />
-      ) : viewMode === 'view-logs' && viewLogsPR && appMode !== 'review' ? (
-        <ViewLogsScreen
-          prNumber={viewLogsPR.number}
-          prTitle={viewLogsPR.title}
-          onBack={handleBackToPRs}
-          sessions={copilotSessions}
-          summaries={copilotSummaries}
-          logs={copilotLogs}
-          onClearData={onClearCopilotData}
-        />
       ) : viewMode === 'review' && viewLogsPR ? (
         <ReviewPane
           prNumber={viewLogsPR.number}
           prTitle={viewLogsPR.title}
+          prBody={viewLogsPR.body}
           onBack={handleBackToPRs}
         />
       ) : appMode !== 'review' ? (

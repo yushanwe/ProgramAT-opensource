@@ -13,6 +13,7 @@ import asyncio
 import websockets
 import json
 import base64
+import io
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,13 @@ from google.cloud import secretmanager
 from github import Github
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
+try:
+    import litellm
+    LITELLM_AVAILABLE = True
+except ImportError:
+    litellm = None
+    LITELLM_AVAILABLE = False
+from litellm_utils import resolve_model_name, resolve_api_key, extract_text, pil_image_to_data_uri
 from module_manager import get_module_manager
 import copilot_db
 from gemini_summarizer import summarize_entries_sync
@@ -41,6 +48,52 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _normalize_custom_gpt_value(value) -> str:
+    """Normalize custom_gpt answers into 'yes', 'no', or ''."""
+    if isinstance(value, bool):
+        return 'yes' if value else 'no'
+
+    if value is None:
+        return ''
+
+    text = str(value).strip().lower()
+    if not text:
+        return ''
+
+    if re.search(r'\b(yes|yeah|yep|yup|true|affirmative)\b', text):
+        return 'yes'
+    if re.search(r'\b(no|nope|nah|false|negative)\b', text):
+        return 'no'
+
+    affirmative_phrases = (
+        'custom gpt',
+        'gemini live',
+        'reask',
+        'ask again',
+        'every frame',
+        'each frame',
+        'keep asking',
+        'keep reasking',
+        'work like a custom gpt',
+    )
+    negative_phrases = (
+        "don't want",
+        'do not want',
+        'without custom gpt',
+        'no custom gpt',
+        'not custom gpt',
+        'do not reask',
+        "don't reask",
+    )
+
+    if any(phrase in text for phrase in affirmative_phrases):
+        return 'yes'
+    if any(phrase in text for phrase in negative_phrases):
+        return 'no'
+
+    return ''
 
 # Configuration
 HOST = '0.0.0.0'  # Listen on all interfaces
@@ -287,13 +340,10 @@ GITHUB_TOKEN = _fetch_github_token()
 GITHUB_REPO = os.environ.get('GITHUB_REPO', '')  # Format: owner/repo
 PAUSE_DURATION = float(os.environ.get('PAUSE_DURATION', '5.0'))  # seconds to wait before creating issue
 
-# Gemini Configuration
+# LiteLLM / Gemini Configuration
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview')
-
-# Configure Gemini if API key is available
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+LLM_MODEL = os.environ.get('LLM_MODEL', os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview'))
+GEMINI_MODEL = LLM_MODEL
 
 # Gemini Live manager for custom-GPT streaming mode
 gemini_live_manager = GeminiLiveManager(GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -1826,29 +1876,33 @@ def fetch_open_prs():
         
         # Fetch open PRs (limit to 30 most recent)
         pulls = repo.get_pulls(state='open', sort='updated', direction='desc')
-        
+
         pr_list = []
-        for pr in pulls[:30]:  # Limit to 30 PRs
+        import re
+        # Iterate safely over the PaginatedList instead of slicing it
+        for i, pr in enumerate(pulls):
+            if i >= 30:
+                break
             # Extract mentioned issue numbers from PR text
-            import re
             pr_text = f"{pr.title} {pr.body or ''}"
             mentioned_issues = re.findall(r'#(\d+)', pr_text)
-            
+
             pr_list.append({
                 'number': pr.number,
                 'title': pr.title,
+                'body': pr.body or '',
                 'branch': pr.head.ref,
                 'state': pr.state,
                 'mentioned_issues': mentioned_issues,
-                'created_at': pr.created_at.isoformat(),
-                'updated_at': pr.updated_at.isoformat()
+                'created_at': pr.created_at.isoformat() if getattr(pr, 'created_at', None) else None,
+                'updated_at': pr.updated_at.isoformat() if getattr(pr, 'updated_at', None) else None
             })
         
         logger.info(f"Fetched {len(pr_list)} open PRs from GitHub")
         return pr_list
         
     except Exception as e:
-        logger.error(f"Failed to fetch PRs: {e}")
+        logger.exception("Failed to fetch PRs")
         return []
 
 
@@ -2046,7 +2100,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
             
             cgpt_match = re.search(r'\*\*Custom GPT\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', linked_body, re.IGNORECASE | re.DOTALL)
             if cgpt_match:
-                pr_custom_gpt = cgpt_match.group(1).strip().lower() in ('yes', 'true', '1')
+                pr_custom_gpt = _normalize_custom_gpt_value(cgpt_match.group(1)) == 'yes'
             
             gq_match = re.search(r'\*\*GPT Query\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', linked_body, re.IGNORECASE | re.DOTALL)
             pr_gpt_query = gq_match.group(1).strip() if gq_match else ''
@@ -2406,8 +2460,7 @@ def fetch_issue_tools(issue_number: int) -> list:
         custom_gpt_match = re.search(r'\*\*Custom GPT\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', issue_body, re.IGNORECASE | re.DOTALL)
         issue_custom_gpt = False
         if custom_gpt_match:
-            custom_gpt_value = custom_gpt_match.group(1).strip().lower()
-            issue_custom_gpt = custom_gpt_value in ('yes', 'true', '1')
+            issue_custom_gpt = _normalize_custom_gpt_value(custom_gpt_match.group(1)) == 'yes'
         
         gpt_query_match = re.search(r'\*\*GPT Query\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', issue_body, re.IGNORECASE | re.DOTALL)
         issue_gpt_query = gpt_query_match.group(1).strip() if gpt_query_match else ''
@@ -2704,12 +2757,14 @@ def parse_issue_selection(transcript: str, available_issues: list) -> dict:
     Returns:
         Dictionary with 'mode' ('create' or 'update'), 'issue_number', and 'issue_title'
     """
-    if not GEMINI_API_KEY or not available_issues:
+    if not available_issues:
+        return {'mode': 'create', 'issue_number': None, 'issue_title': None}
+
+    if not LITELLM_AVAILABLE:
+        logger.warning("LiteLLM not available, using simple issue selection fallback")
         return {'mode': 'create', 'issue_number': None, 'issue_title': None}
     
     try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        
         # Build list of available issues for the prompt
         issue_list_str = "\n".join([f"- Issue #{issue['number']}: {issue['title']}" 
                                      for issue in available_issues])
@@ -2743,8 +2798,12 @@ Return ONLY a valid JSON object:
   "confidence": <0.0 to 1.0>
 }}"""
 
-        response = model.generate_content(prompt)
-        ai_response = response.text.strip()
+        response = litellm.completion(
+            model=resolve_model_name(LLM_MODEL),
+            messages=[{'role': 'user', 'content': prompt}],
+            api_key=resolve_api_key(LLM_MODEL),
+        )
+        ai_response = extract_text(response)
         
         # Remove markdown code blocks if present
         if ai_response.startswith('```json'):
@@ -2917,8 +2976,8 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
     Returns:
         Dictionary with parsed fields including 'missing_fields' list
     """
-    if not GEMINI_API_KEY:
-        logger.warning("Gemini API key not configured, using simple parsing")
+    if not LITELLM_AVAILABLE:
+        logger.warning("LiteLLM not available, using simple parsing")
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         return {
@@ -2938,8 +2997,6 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
         }
     
     try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        
         # Build context from existing data if this is a follow-up
         context_info = ""
         if existing_data:
@@ -3012,10 +3069,14 @@ Return format:
   "missing_fields": ["field1", "field2"]  // Only truly missing/empty important fields. Use [] if all important fields have content.
 }}"""
 
-        response = model.generate_content(prompt)
+        response = litellm.completion(
+            model=resolve_model_name(LLM_MODEL),
+            messages=[{'role': 'user', 'content': prompt}],
+            api_key=resolve_api_key(LLM_MODEL),
+        )
         
         # Parse the AI response
-        ai_response = response.text.strip()
+        ai_response = extract_text(response)
         
         # Remove markdown code blocks if present
         if ai_response.startswith('```json'):
@@ -3027,6 +3088,22 @@ Return format:
         ai_response = ai_response.strip()
         
         parsed_data = json.loads(ai_response)
+
+        parsed_custom_gpt = _normalize_custom_gpt_value(parsed_data.get('custom_gpt', ''))
+        if not parsed_custom_gpt:
+            parsed_custom_gpt = _normalize_custom_gpt_value(transcript)
+        parsed_data['custom_gpt'] = parsed_custom_gpt
+
+        missing_fields = parsed_data.get('missing_fields', [])
+        if parsed_custom_gpt:
+            missing_fields = [field for field in missing_fields if field != 'custom_gpt']
+            if parsed_custom_gpt == 'no':
+                missing_fields = [field for field in missing_fields if field != 'gpt_query']
+            elif parsed_custom_gpt == 'yes' and not parsed_data.get('gpt_query'):
+                if 'gpt_query' not in missing_fields:
+                    missing_fields.append('gpt_query')
+
+        parsed_data['missing_fields'] = missing_fields
         
         # Ensure missing_fields exists
         if 'missing_fields' not in parsed_data:
@@ -3045,6 +3122,12 @@ Return format:
         # Fallback to simple parsing
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        fallback_custom_gpt = _normalize_custom_gpt_value(transcript)
+        fallback_missing_fields = []
+        if not fallback_custom_gpt:
+            fallback_missing_fields = ['custom_gpt']
+        elif fallback_custom_gpt == 'yes' and not (existing_data or {}).get('gpt_query'):
+            fallback_missing_fields = ['gpt_query']
         return {
             'type': 'visual AT',
             'title': transcript[:100],
@@ -3053,11 +3136,11 @@ Return format:
             'solution': '',
             'implementation_details': '',
             'example_usage': '',
-            'custom_gpt': '',
+            'custom_gpt': fallback_custom_gpt,
             'gpt_query': '',
             'alternatives': '',
             'additional': '',
-            'missing_fields': ['custom_gpt'],
+            'missing_fields': fallback_missing_fields,
             'original_prompts': existing_prompts + [f"[{timestamp}] {transcript}"]
         }
 
@@ -3939,7 +4022,32 @@ async def handle_client(websocket):
                 # Handle request_pr_list message type
                 if msg_type == 'request_pr_list':
                     logger.info(f"Client {client_id} requested PR list")
-                    available_prs = fetch_open_prs()
+                    target_repo_for_list = data.get('target_repo') or GITHUB_REPO
+                    if target_repo_for_list == GITHUB_REPO:
+                        available_prs = fetch_open_prs()
+                    else:
+                        try:
+                            import re as _re
+                            _g = Github(GITHUB_TOKEN)
+                            _repo = _g.get_repo(target_repo_for_list)
+                            _pulls = _repo.get_pulls(state='open', sort='updated', direction='desc')
+                            available_prs = []
+                            for _pr in _pulls[:30]:
+                                _pr_text = f"{_pr.title} {_pr.body or ''}"
+                                _issues = _re.findall(r'#(\d+)', _pr_text)
+                                available_prs.append({
+                                    'number': _pr.number,
+                                    'title': _pr.title,
+                                    'body': _pr.body or '',
+                                    'branch': _pr.head.ref,
+                                    'state': _pr.state,
+                                    'mentioned_issues': _issues,
+                                    'created_at': _pr.created_at.isoformat(),
+                                    'updated_at': _pr.updated_at.isoformat(),
+                                })
+                        except Exception as _e:
+                            logger.error(f"Failed to fetch PRs from {target_repo_for_list}: {_e}")
+                            available_prs = []
                     if available_prs:
                         await websocket.send(json.dumps({
                             'type': 'pr_list',
@@ -3985,6 +4093,10 @@ async def handle_client(websocket):
                     pr_number = data.get('pr_number')
                     approved = data.get('approved', False)
                     comment = data.get('comment', '').strip()
+                    # In review mode the app passes target_repo so the user's server
+                    # posts to the general repo's PR using the user's own GITHUB_TOKEN.
+                    target_repo_name = data.get('target_repo') or GITHUB_REPO
+                    posting_to_external_repo = target_repo_name != GITHUB_REPO
                     if not pr_number:
                         await websocket.send(json.dumps({
                             'type': 'error',
@@ -3993,12 +4105,15 @@ async def handle_client(websocket):
                         }))
                         continue
                     try:
-                        repo = g.get_repo(GITHUB_REPO)
+                        g = Github(GITHUB_TOKEN)
+                        repo = g.get_repo(target_repo_name)
                         pr = repo.get_pull(int(pr_number))
                         github_event = 'APPROVE' if approved else 'REQUEST_CHANGES'
-                        review_body = comment if comment else ('Looks good!' if approved else 'Please address the noted issues.')
+                        verdict_label = '✅ APPROVED' if approved else '❌ CHANGES REQUESTED'
+                        default_body = 'Looks good!' if approved else 'Please address the noted issues.'
+                        review_body = f'**[ProgramAT Review] {verdict_label}**\n\n{comment}' if comment else f'**[ProgramAT Review] {verdict_label}**\n\n{default_body}'
                         pr.create_review(body=review_body, event=github_event)
-                        logger.info(f"Client {client_id} submitted {github_event} review for PR #{pr_number}")
+                        logger.info(f"Client {client_id} submitted {'approval' if approved else 'rejection'} for PR #{pr_number} on {target_repo_name}")
                         await websocket.send(json.dumps({
                             'type': 'review_submitted',
                             'pr_number': pr_number,
@@ -4814,14 +4929,25 @@ async def handle_client(websocket):
                             # Create prompt for follow-up question
                             prompt = f"You are analyzing this image. The user is asking a follow-up question: {question}\n\nPlease provide a helpful and concise answer based on what you can see in the image."
                             
-                            # Send to Gemini using gemini-2.5-flash
+                            # Send the follow-up through LiteLLM using the configured Gemini model
                             try:
-                                model = genai.GenerativeModel('gemini-2.5-flash')
-                                response = model.generate_content([prompt, pil_image])
-                                answer = response.text.strip()
+                                response = litellm.completion(
+                                    model=resolve_model_name(LLM_MODEL),
+                                    messages=[
+                                        {
+                                            'role': 'user',
+                                            'content': [
+                                                {'type': 'text', 'text': prompt},
+                                                {'type': 'image_url', 'image_url': {'url': pil_image_to_data_uri(pil_image)}},
+                                            ],
+                                        }
+                                    ],
+                                    api_key=resolve_api_key(LLM_MODEL),
+                                )
+                                answer = extract_text(response)
                                 
                                 logger.info(f"FOLLOW-UP: Generated answer length: {len(answer)}")
-                                logger.info(f"FOLLOW-UP: Successfully used gemini-2.5-flash for image+text")
+                                logger.info(f"FOLLOW-UP: Successfully used LiteLLM with {LLM_MODEL} for image+text")
                                 
                                 await websocket.send(json.dumps({
                                     'type': 'follow_up_response',
@@ -4831,7 +4957,7 @@ async def handle_client(websocket):
                                 }))
                                 
                             except Exception as e:
-                                logger.error(f"Error getting Gemini response for follow-up: {e}")
+                                logger.error(f"Error getting LiteLLM response for follow-up: {e}")
                                 await websocket.send(json.dumps({
                                     'type': 'follow_up_response',
                                     'status': 'error',
@@ -5135,7 +5261,7 @@ async def main():
         ping_timeout=10    # Wait 10 seconds for pong response
     ):
         logger.info("Server started successfully")
-        logger.info(f"Clients can connect to: ws://<your-server-ip>:{PORT}")
+        logger.info(f"Clients can connect to: wss://your-ngrok-link")
         logger.info(f"Max message size: 20MB")
         
         # Start background tasks independently for resilience
