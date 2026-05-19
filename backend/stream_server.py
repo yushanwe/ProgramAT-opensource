@@ -1891,7 +1891,8 @@ def fetch_open_prs():
             pr_list.append({
                 'number': pr.number,
                 'title': pr.title,
-                'branch': getattr(pr.head, 'ref', '') or '',
+                'body': pr.body or '',
+                'branch': pr.head.ref,
                 'state': pr.state,
                 'mentioned_issues': mentioned_issues,
                 'created_at': pr.created_at.isoformat() if getattr(pr, 'created_at', None) else None,
@@ -2799,9 +2800,9 @@ Return ONLY a valid JSON object:
 }}"""
 
         response = litellm.completion(
-            model=resolve_model_name(GEMINI_MODEL, default_model='gemini-3-flash-preview'),
+            model=resolve_model_name(LLM_MODEL),
             messages=[{'role': 'user', 'content': prompt}],
-            api_key=resolve_api_key(GEMINI_MODEL, GEMINI_API_KEY),
+            api_key=resolve_api_key(LLM_MODEL),
         )
         ai_response = extract_text(response)
         
@@ -3070,9 +3071,9 @@ Return format:
 }}"""
 
         response = litellm.completion(
-            model=resolve_model_name(GEMINI_MODEL, default_model='gemini-3-flash-preview'),
+            model=resolve_model_name(LLM_MODEL),
             messages=[{'role': 'user', 'content': prompt}],
-            api_key=resolve_api_key(GEMINI_MODEL, GEMINI_API_KEY),
+            api_key=resolve_api_key(LLM_MODEL),
         )
         
         # Parse the AI response
@@ -4022,7 +4023,32 @@ async def handle_client(websocket):
                 # Handle request_pr_list message type
                 if msg_type == 'request_pr_list':
                     logger.info(f"Client {client_id} requested PR list")
-                    available_prs = fetch_open_prs()
+                    target_repo_for_list = data.get('target_repo') or GITHUB_REPO
+                    if target_repo_for_list == GITHUB_REPO:
+                        available_prs = fetch_open_prs()
+                    else:
+                        try:
+                            import re as _re
+                            _g = Github(GITHUB_TOKEN)
+                            _repo = _g.get_repo(target_repo_for_list)
+                            _pulls = _repo.get_pulls(state='open', sort='updated', direction='desc')
+                            available_prs = []
+                            for _pr in _pulls[:30]:
+                                _pr_text = f"{_pr.title} {_pr.body or ''}"
+                                _issues = _re.findall(r'#(\d+)', _pr_text)
+                                available_prs.append({
+                                    'number': _pr.number,
+                                    'title': _pr.title,
+                                    'body': _pr.body or '',
+                                    'branch': _pr.head.ref,
+                                    'state': _pr.state,
+                                    'mentioned_issues': _issues,
+                                    'created_at': _pr.created_at.isoformat(),
+                                    'updated_at': _pr.updated_at.isoformat(),
+                                })
+                        except Exception as _e:
+                            logger.error(f"Failed to fetch PRs from {target_repo_for_list}: {_e}")
+                            available_prs = []
                     if available_prs:
                         await websocket.send(json.dumps({
                             'type': 'pr_list',
@@ -4068,6 +4094,10 @@ async def handle_client(websocket):
                     pr_number = data.get('pr_number')
                     approved = data.get('approved', False)
                     comment = data.get('comment', '').strip()
+                    # In review mode the app passes target_repo so the user's server
+                    # posts to the general repo's PR using the user's own GITHUB_TOKEN.
+                    target_repo_name = data.get('target_repo') or GITHUB_REPO
+                    posting_to_external_repo = target_repo_name != GITHUB_REPO
                     if not pr_number:
                         await websocket.send(json.dumps({
                             'type': 'error',
@@ -4076,12 +4106,15 @@ async def handle_client(websocket):
                         }))
                         continue
                     try:
-                        repo = g.get_repo(GITHUB_REPO)
+                        g = Github(GITHUB_TOKEN)
+                        repo = g.get_repo(target_repo_name)
                         pr = repo.get_pull(int(pr_number))
                         github_event = 'APPROVE' if approved else 'REQUEST_CHANGES'
-                        review_body = comment if comment else ('Looks good!' if approved else 'Please address the noted issues.')
+                        verdict_label = '✅ APPROVED' if approved else '❌ CHANGES REQUESTED'
+                        default_body = 'Looks good!' if approved else 'Please address the noted issues.'
+                        review_body = f'**[ProgramAT Review] {verdict_label}**\n\n{comment}' if comment else f'**[ProgramAT Review] {verdict_label}**\n\n{default_body}'
                         pr.create_review(body=review_body, event=github_event)
-                        logger.info(f"Client {client_id} submitted {github_event} review for PR #{pr_number}")
+                        logger.info(f"Client {client_id} submitted {'approval' if approved else 'rejection'} for PR #{pr_number} on {target_repo_name}")
                         await websocket.send(json.dumps({
                             'type': 'review_submitted',
                             'pr_number': pr_number,
@@ -4900,7 +4933,7 @@ async def handle_client(websocket):
                             # Send the follow-up through LiteLLM using the configured Gemini model
                             try:
                                 response = litellm.completion(
-                                    model=resolve_model_name('gemini-2.5-flash', default_model='gemini-2.5-flash'),
+                                    model=resolve_model_name(LLM_MODEL),
                                     messages=[
                                         {
                                             'role': 'user',
@@ -4910,12 +4943,12 @@ async def handle_client(websocket):
                                             ],
                                         }
                                     ],
-                                    api_key=resolve_api_key('gemini-2.5-flash', GEMINI_API_KEY),
+                                    api_key=resolve_api_key(LLM_MODEL),
                                 )
                                 answer = extract_text(response)
                                 
                                 logger.info(f"FOLLOW-UP: Generated answer length: {len(answer)}")
-                                logger.info(f"FOLLOW-UP: Successfully used LiteLLM with gemini-2.5-flash for image+text")
+                                logger.info(f"FOLLOW-UP: Successfully used LiteLLM with {LLM_MODEL} for image+text")
                                 
                                 await websocket.send(json.dumps({
                                     'type': 'follow_up_response',
@@ -5229,7 +5262,7 @@ async def main():
         ping_timeout=10    # Wait 10 seconds for pong response
     ):
         logger.info("Server started successfully")
-        logger.info(f"Clients can connect to: ws://<your-server-ip>:{PORT}")
+        logger.info(f"Clients can connect to: wss://your-ngrok-link")
         logger.info(f"Max message size: 20MB")
         
         # Start background tasks independently for resilience

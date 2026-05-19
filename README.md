@@ -1,11 +1,9 @@
 # ProgramAT
 
 This repository contains code for an AI-powered assistive technology platform, ProgramAT. ProgramAT equips blind or low-vision (BLV) users to create custom camera-based assistive technologies via natural language instructions. BLV users can test their camera-based ATs with input from their iPhone's camera. The system has 3 major components:
-- a mobile app, installable via TestFlight. Link will be provided closer to the event.
-- a server that runs the computation for the camera-based AT you build using the app. This interfaces with a GitHub repository, and runs the AI models necessary for your task. Instructions to set a server up will be updated shortly.
-- ProgramAT GitHub repository. This is where your tools will live. It will be a fork of this repository for each individual user. We recommend forking closer to the event date.
-
-> Notice: Setup instructions and TestFlight link will be updated closer to the event.
+- a mobile app, [installable via TestFlight](https://testflight.apple.com/join/ahpWstQr).
+- a server that runs the computation for the camera-based AT you build using the app. This interfaces with a GitHub repository, and runs the AI models necessary for your task. 
+- ProgramAT GitHub repository. This is where your tools will live. It will be a fork of this repository for each individual user. We recommend forking closer to the event date, or keeping an eye on when your fork is behind the parent repository in order to sync.
 
 
 ## What is the ProgramAT Mobile App?
@@ -17,61 +15,79 @@ This is a React Native app that facilitates AT creation, iteration, and testing 
 ### Prerequisites
 
 - A [GitHub account](https://github.com/). Refer to [screen reader friendly instructions by Jeff Bishop](https://community-access.org/git-going-with-github/docs/00-pre-workshop-setup.html).
-- A computer with decent compute capacity, or ability to host a VM with decent compute capacity. Exact specifications coming soon. A GPU is not required.
+- A [Copilot subscription](https://github.com/features/copilot/plans).
+- Github mobile, installed and logged in
+- Testflight, installed from Apple's app store
+- A computer with decent compute capacity, or ability to host a VM with decent compute capacity. For best performance, we recommend around 20G of available disk space wherever you plan to host. A GPU is not required.
 - A screen reader and an accessible web browser.
 - iPhone 12 or higher running iOS 26. Apple Intelligence or AI-specific features for processors are not required.
 - Python 3.11+ (for the backend server)
 - Node.js >= 20
 - Optional: React Native CLI development environment ([setup guide](https://reactnative.dev/docs/set-up-your-environment)). This is required if you want to run and install the app. You can skip this requirement if you are installing the app using our TestFlight link.
-- Optional: For iOS: Xcode and CocoaPods. You can skip if you are building and running the app.
-
+- Optional: For iOS: Xcode and CocoaPods. You can skip if you are not building and running the app itself locally.
 
 ### Installation
 
 1. **Fork this repository**
-   This is easiest to do from the Github website. 
+   This is easiest to do from the Github website.
    First, select the button that says Fork.
    Once you have done so, it will take you to an interface where you can select the owner and name of the fork. By default, this is your username for owner, and `ProgramAT-opensource` for the repository name. We recommend leaving these defaults intact, but you can change them if you would like.
    Then, click the button that says Create Fork.
    After a few seconds, a copy of the repository will be made in your Github account.
 
 2. **Clone the repository**
+
    ```bash
    git clone https://github.com/your-username/ProgramAT-opensource.git
    cd ProgramAT-opensource
    ```
 
-3. Optional (required if you are building the app): **Install React Native dependencies**
+3. **Get the API keys**
+   See the API keys section for a detailed description.
+
+### Running the Mobile App Locally (Optional)
+
+You only need this section if you want to make changes to the frontend and run the React Native app yourself. If you are using the TestFlight version of the app, you can skip this section.
+
+This section requires an iPhone and XCode on Mac system.
+
+1. **Install React Native dependencies**
+
    ```bash
    cd ProgramATApp
    npm install
    ```
 
-4. Optional (required if you are building the app): **Install iOS dependencies (iOS only)**
+2. **Install iOS dependencies (iOS only)**
+
    ```bash
    cd ios
    pod install
    cd ..
    ```
 
-5. **Set up the backend**
+3. **Start the React Native development server**
+
    ```bash
-   cd ../backend
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
+   cd ProgramATApp
+   npx react-native start
    ```
 
-6. **Create the backend `.env` file**
-   ```bash
-   cp .env.example .env
-   ```
+   This starts the React Native Metro development server.
 
-7. **Fill in the values in `backend/.env`**
-   - `GEMINI_API_KEY`
-   - `GITHUB_TOKEN`
-   - `GITHUB_REPO`
-   - `GOOGLE_APPLICATION_CREDENTIALS` if you use OCR tools
+4. **Connect your phone**
+   Plug your iPhone into your computer while running the development server.
+
+   Depending on your setup, you may also need to:
+   - Trust the computer on your iPhone.
+   - Turn on Developer Mode on your iPhone.
+   - Open the app through Xcode or the React Native development workflow.
+
+Notes:
+
+- If you are using the TestFlight version of the app, you do not need to run the React Native development server.
+- The backend server and the React Native development server are separate processes and must be started in different terminals or windows.
+- The backend handles tool execution and AI processing. The React Native development server only serves the mobile app frontend during local development.
 
 ### API Keys
 
@@ -81,48 +97,30 @@ Use the table below as a quick reference for what each value does.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GEMINI_API_KEY` | Yes (for VLM tools) | Google Gemini API key used by scene description, clothing recognition, AI parsing, and Gemini Live |
+| `LLM_MODEL` | Optional | Model name used by LiteLLM. Update this in `backend/.env` to change which provider/model is active (falls back to `GEMINI_MODEL` if present). |
+| `GEMINI_API_KEY` | Optional | Provider API key for Google Gemini. Keep provider keys in `.env` as needed: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | For OCR tools | Google Cloud Vision API credentials used by Live OCR |
 | `GITHUB_TOKEN` | For GitHub features | GitHub personal access token with `repo` scope |
 | `GITHUB_REPO` | Yes (to access your own tools) | Target repo in `owner/repo` format |
 | `HOST` / `PORT` | Optional | Server bind address (default `0.0.0.0:8080`) |
 
-#### Alternative: Set environment variables directly
-
-Instead of using `backend/.env`, you can export the variables in your shell before starting the backend:
-
-**Linux / macOS:**
-```bash
-export GEMINI_API_KEY="your_key_here"
-export GITHUB_TOKEN="your_token_here"
-export GITHUB_REPO="username/your-programat-fork"
-export GOOGLE_APPLICATION_CREDENTIALS="/home/username/path/to/credentials.json"
-```
-
-**Windows PowerShell:**
-```powershell
-$env:GEMINI_API_KEY = "your_key_here"
-$env:GITHUB_TOKEN = "your_token_here"
-$env:GITHUB_REPO = "username/your-programat-fork"
-$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\credentials.json"
-```
-
 ### How to Get the Keys
+
+The following keys are required for the application to run, but you can add the key of other providers and use the corresponding model for text parsing and image analysis.
 
 #### GitHub Token
 
-1. Go to any GitHub page: <https://github.com/>. Click your profile picture (top right) and open **Settings**.
-2. Go to **Developer settings** -> **Personal access tokens** -> **Tokens (classic)**.
-3. Click **Generate new token**.
-4. Add a note, choose an expiration, and select scopes to be **repo** and **workflow**.
-5. Click **Generate token**, copy it and save it properly. You won't be able to see it again.
-6. Paste the token into `backend/.env` as `GITHUB_TOKEN`.
+1. Go to any GitHub page: <https://github.com/settings/tokens>.
+2. Click **Tokens(classic)** and click **Generate new token**.
+3. Add a note, choose an expiration, and select scopes to be **repo** and **workflow**.
+4. Click **Generate token**, copy it and save it properly. You won't be able to see it again.
+5. Paste the token into `backend/.env` as `GITHUB_TOKEN`.
 
 #### Gemini API Key
 
-1. Go to Google AI Studio: <https://aistudio.google.com>
-2. Sign in with your Google account.
-3. In the left sidebar, click **Get API key** -> **Create API key**.
+1. Go to Google AI Studio: <https://aistudio.google.com/app/apikey>
+2. Sign in with your personal Google account.
+3. Click **Create API key**.
 4. Select an existing Google Cloud project or create a new one, then click **Create API key**.
 5. Copy the generated key.
 6. Paste the key into `backend/.env` as `GEMINI_API_KEY`.
@@ -140,8 +138,9 @@ Steps:
 1. Go to Google Cloud Console: <https://console.cloud.google.com>
 2. Create or select a project and enable the **Cloud Vision API** in **Menu** -> **API & Services** -> **Enabled APIs & services**.
 3. Create a service account: **Menu** -> **IAM & Admin** -> **Service Accounts** -> **Create service account**. Fill name/ID and click **Continue**.
-4. Create a key: for this service account, select **Actions** -> **Manage Keys** -> **Add key** -> **Create new key** -> choose **JSON** -> **Create**. A JSON file `credentials.json` will be downloaded. Save it securely into your workspace.
-5. Set `GOOGLE_APPLICATION_CREDENTIALS` to the JSON file path.
+4. Create a key: for this service account, select **Actions** -> **Manage Keys** -> **Add key** -> **Create new key** -> choose **JSON** -> **Create**. 
+5. A JSON file will be downloaded. Copy the JSON file from the Downloads folder to the backend folder in the codespace. Rename the file to be `credentials.json`.
+6. Set `GOOGLE_APPLICATION_CREDENTIALS` to the JSON file path.
 
 Security notes:
 
@@ -149,13 +148,14 @@ Security notes:
 - Restrict the service account to only the Vision API and grant the minimal needed permissions.
 
 ### Running the Application
+
 You can host the server from your personal machine for free, or use a hosting service like a GCP virtual machine or AWS virtual machine, which may have associated costs. 
 
 The difference between these two options, aside from cost, is that when running from your personal machine, your server will shut off whenever your machine does. This is potentially avoidable by using a paid hosting service.
 
 We provide instructions here for hosting from your personal machine. If you would prefer to use a paid hosting service, follow the instructions there for setup.
 
-You can skip to step 3 if ngrok is already installed and configured, or if you are using a paid hosting service.
+   > Notice: You can skip steps 1-2 if ngrok is already installed and configured in your terminal, or if you are using a paid hosting service.
 
 1. **Install ngrok**
    Download ngrok for your system from <https://ngrok.com/download> and make sure `ngrok version` works in your terminal.
@@ -167,7 +167,31 @@ You can skip to step 3 if ngrok is already installed and configured, or if you a
    ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
    ```
 
-3. **Activate the virtual environment and start the backend server**
+   > Notice: You can skip steps 3-8 by filling the API keys into the prompt in `COPILOT_SETUP_PROMPT.md` and giving it to Copilot (or your coding agent) and let it set up the server and use ngrok for you. After it gives you the forwarding address, you can go to step 9 and type it in the mobile application.
+
+3. **Create the backend `.env` file**
+
+   ```bash
+   cp .env.example .env
+   ```
+
+4. **Fill in the values in `backend/.env`**
+   - `LLM_MODEL`: model name used by LiteLLM (for example `gemini-3-flash-preview` or `openai/gpt-4o`). Change this to switch provider/model without modifying code.
+   - Provider API keys: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
+   - `GITHUB_TOKEN`
+   - `GITHUB_REPO`
+   - `GOOGLE_APPLICATION_CREDENTIALS`
+
+5. **Set up the backend**
+
+   ```bash
+   cd ../backend
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+6. **Activate the virtual environment and start the backend server**
 
    ```bash
    cd backend
@@ -177,20 +201,31 @@ You can skip to step 3 if ngrok is already installed and configured, or if you a
 
    The server listens on `0.0.0.0:8080` by default.
 
-4. **Start the ngrok tunnel (only if hosting from your personal machine)**
+7. **Open up another terminal or window and start the ngrok tunnel**
+
    ```bash
    ngrok http 8080
    ```
 
-5. **Copy your forwarding address**
+8. **Copy your forwarding address**
    If you are using ngrok, keep the terminal created in step 4 open. ngrok will print a forwarding address, which is the public address your app should connect to. Copy this address.
 
-   If you are using a paid hosting service, your VM should list a public IP address, copy this IP address
+   If you are using a paid hosting service, your VM should list a public IP address, copy this IP address.
 
-5. **Paste the forwarding address into the app**
+9. **Paste the forwarding address into the app**
    Change the prefix of the forwarding address from **https** to **wss** because we are using a websocket. Open ProgramAT app on your mobile device, go to the server address field in Settings, paste the ngrok forwarding address, and tap **Connect**.
 
 ## Troubleshooting
+
+### Installing Dependencies
+
+1. If you are using Windows Powershell and encounter the problem "This error might have occurred since this system does not have Windows Long Path support enabled" when installing LiteLLM, you need to bypass the path length limit. Open PowerShell as Administrator and run:
+
+```bash
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+```
+
+Then install the dependencies again.
 
 ### Forked Repository Settings
 
@@ -201,25 +236,29 @@ Since you are working from a fork of this repository, GitHub-related features ma
 3. Go to **Settings** -> **Secrets and variables** -> **Actions**, click **New repository secret**, create a secret named `COPILOT_PAT`, and set its value to your GitHub personal access token.
 4. If you use `gh auth login`, make sure that token has the required scopes, including `repo`, `workflow`, and `admin:org`.
 
-
 ## Usage
 
-1. **Select a Tool** — Navigate to the **Tools** tab, browse the available tools, and tap one to select it.
+1.  **Select a Tool** — Navigate to the **Tools** tab, browse the available tools, and tap one to select it.
 
 2. **Run** — The Tool Runner opens with a live camera preview. Tap **Run** to execute the tool on single frames, or **Stream** to process frames continuously. Results are spoken aloud via TTS.
 
-3. **Chat** — After a tool run, tap **Chat** to ask follow-up questions about the result (powered by Gemini).
+3. **Chat** — After a tool run, tap **Chat** to ask follow-up questions about the result (powered by LiteLLM; change the active model with `LLM_MODEL` in `backend/.env`).
 
 4. **Development mode** — Use the **PRs** tab to browse open pull requests, select one to load its tools, and send text updates to GitHub issues.
 
-Creation instructions coming soon.
+5. **Tool creation** — To instead create a new tool, from development mode, select the "Create New Issue Instead" button in the PRs tab. Then, type or dictate the tool you would like to make into the text box, then submit. If more information is needed, the app will ask for it: in this case, dictate or type an answer to the request and resubmit, it will be appended to your initial request. Once the request is complete, the app will tell you it has made a new issue successfully. Copilot will automatically be assigned and create a relevant pull request. From there, wait for it to generate, and then run it as described in the earlier usage steps!
+   * If you prefer to do this from desktop, you can also fill out the issue template titled "Visual Assistive Technology" on the Github website
+  
+6. **Tool iteration** — To update or modify a tool, in development mode, click a relevant PR, and instead of choosing open tools as you would to run a tool, select update issue. Then, type or dictate the change you would like to make and submit. Copilot will automatically be assigned and make the desired changes to the relevant tool.
+   * If you would prefer to do this from desktop, you can also simply leave a comment on the relevant pull request from the Github website. In this case, you will be responsible for appending `@copilot` to your comment to assign Copilot.
+
  
 ## Supported Input Modes
 
 - **Streaming mode** — Tools process frames continuously and return real-time audio feedback
 - **Single-frame mode** — Capture one frame and get a detailed result
 - **Real-time camera streaming** at configurable FPS via `react-native-vision-camera`
-- **Conversation mode** — Ask follow-up questions about tool results via a Chat tab
+- **Conversation mode** — Ask follow-up questions about tool results via a Chat tab. This becomes available after a single-frame mode interaction.
 - **Custom GPT-like tools** — Tools flagged as Custom GPT use Gemini Live for streaming multimodal conversations instead of executing code per frame
 
 ## Supported Feedback Modes
@@ -229,15 +268,25 @@ Creation instructions coming soon.
 - **Speech-to-Text input** — voice input for follow-up questions using `@react-native-voice/voice` and OS-level dictation
 
 ## Usage Modes
+
 ### Development Mode (GitHub Integration)
+
 - **PR browser** — List open pull requests, select one, and load its tools
-- **Text input for issues** — Create or update GitHub issues with AI-powered parsing (Gemini)
+- **Text input for issues** — Create or update GitHub issues with AI-powered parsing (LiteLLM)
 - **Multi-turn conversations** — The server asks for missing fields until the issue is complete
 - **Copilot session logs** — View AI coding session summaries per PR
 
 ### Production Mode
+
 - Tools are pulled from the `main` branch only
 - The PR browser tab is hidden; users go straight to the tool list
+
+### Review mode
+- Tools are pulled from the main repository server (as opposed to your self-hosted server), specifically PRs people have put up for review
+- You can test tools as you would in development mode, but cannot directly create or edit tools.
+   - If you would like a tool of yours to be visible in review mode, create it locally, then submit a PR!
+- You can review tools (approve if they work as intended, request changes otherwise)
+   - Note that for this mode to work properly, you should first [become a contributor](https://github.com/program-at/ProgramAT-opensource/issues/44). These permissions are needed to leave reviews.
 
 ## Built-In Tools
 
@@ -245,13 +294,29 @@ Creation instructions coming soon.
 |------|-------------|-------|
 | **Object Recognition** | Detects and announces objects using YOLO11 + COCO | YOLOv11 |
 | **Live OCR** | Reads visible text aloud in real time | Google Cloud Vision API |
-| **Scene Description** | Generates a spoken description of the scene | Google Gemini Vision |
+| **Scene Description** | Generates a spoken description of the scene | LiteLLM Vision |
 | **Camera Aiming** | Guides users to center an object for a well-framed photo | YOLOv11 |
 | **Door Detection** | Detects doors/doorways with clock-face navigation cues | YOLOWorld |
 | **Empty Seat Detection** | Finds unoccupied chairs and gives directional guidance | YOLOv11 |
-| **Clothing Recognition** | Identifies the most prominent clothing item and its features | Google Gemini Vision |
+| **Clothing Recognition** | Identifies the most prominent clothing item and its features | LiteLLM Vision |
 
 New tools can be added by placing a Python file in the `tools/` directory. Each tool exposes a `main(image, input_data)` function and returns an audio-friendly string or dict.
+
+## Example tool ideas!
+You can make a wide variety of tools using ProgramAT! For best performance, we recommend thinking about tools that are camera based, and, for the time being, are stateless (do not need to remember their previous responses/backreference previous frames) and do not require bringing in an outside dataset.
+
+> Want to bring in stateless capabilities? Or ability to use outside datasets? Implement these features and [become a contributor](https://github.com/program-at/ProgramAT-opensource/issues/44) to share them with the community!
+
+To get your imagination started, here are some ideas for tools people have tried before!
+
+- Plug point detector [(see it run!)](https://youtube.com/shorts/AXy-D1c47Bk?feature=share): Help find plug points/outlets in unfamiliar rooms.
+- Playing card reader [(see it run!)](https://youtube.com/shorts/okevY0bmcr8?feature=share): Describe a hand of playing cards, and how they change over the course of a card game
+- Uber finder [(see it run!)](https://youtube.com/shorts/wspprXIsd3Y?feature=share): Help identify an Uber by describing the colors, makes, and models of car in frame.
+- Clothing description: Get a simple description of an article or articles of clothing
+- Mail sorter: Describe what important vs. junk mail means to you and get guidance on whether you should open a particular piece of mail.
+- Makeup checker: Take a photo and analyze if there are any issues with your makeup application.
+- Sock matcher: Determine if two socks out of the laundry match
+
 
 ## Project Structure
 
@@ -289,7 +354,6 @@ ProgramAT-opensource/
     └── clothing_recognition.py
 ```
 
-
 ## Development
 
 ### Running Tests
@@ -310,14 +374,15 @@ See [tools/MODEL_SETUP.md](tools/MODEL_SETUP.md) and the existing tools for exam
 ### Building for Production
 
 For iOS:
+
 1. Open `ProgramATApp/ios/ProgramATApp.xcworkspace` in Xcode
 2. Select your signing team and provisioning profile
 3. Build for Release
 
-
 ## Technology Stack
 
 ### Mobile App
+
 - **React Native 0.82.1** — Bare (non-Expo) for direct native module access
 - **TypeScript**
 - **react-native-vision-camera** — Camera capture and frame streaming
@@ -327,12 +392,21 @@ For iOS:
 - **AsyncStorage** — Local persistence for settings and sessions
 
 ### Backend
+
 - **Python 3.11** with async `websockets`
-- **Google Gemini API** — AI parsing, scene description, clothing recognition, Gemini Live
+- **LiteLLM (configurable providers)** — Model runtime used for AI parsing, scene description, and clothing recognition. LiteLLM can route requests to provider backends such as Google Gemini, OpenAI, or Anthropic; switch the active model via `LLM_MODEL` in `backend/.env`.
 - **Google Cloud Vision API** — OCR
 - **Ultralytics (YOLOv11 / YOLOWorld)** — Object detection
 - **OpenCV / NumPy / Pillow** — Image processing
 - **PyGithub** — GitHub issue and PR integration
+
+## Get involved!!
+
+As an open source project, we welcome community feedback and contributions.
+
+If you are interested in going beyond your fork and contributing to ProgramAT, please start by reading our [Code of Conduct](https://github.com/program-at/ProgramAT-opensource/blob/main/CODE_OF_CONDUCT.md) and [Contribution Guidelines](https://github.com/program-at/ProgramAT-opensource/blob/main/CONTRIBUTING.md).
+
+Once you have done so, you can request the permissions needed to become a contributor by following [these instructions](https://github.com/program-at/ProgramAT-opensource/issues/44)!
 
 ## License
 
@@ -340,8 +414,8 @@ See [LICENSE](LICENSE).
 
 ## Contributions
 
-
 - [Ellie Seehorn](https://seehorne.github.io/) (PhD student at University of Michigan)
+- [Yushan Wei](https://github.com/yushanwe) (Undergraduate Student at University of Michigan)
 - [Venkatesh Potluri](https://venkateshpotluri.me/) (Assistant Professor, University of Michigan. Principal Investigator of the [Intelligent Developer Experiences for Accessibility Lab](https://idea11y.dev/))
 - [Anhong Guo](https://guoanhong.com/) (Assistant Professor, University of Michigan and principal investigator of the [Human AI Lab](https://guoanhong.com/))
 

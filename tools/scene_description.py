@@ -34,6 +34,13 @@ except ImportError:
     LITELLM_AVAILABLE = False
     print("⚠️  litellm not installed. Install with: pip install litellm")
 
+from litellm_utils import (
+    resolve_model_name,
+    resolve_api_key,
+    extract_text,
+    pil_image_to_data_uri,
+)
+
 # Constants
 GEMINI_CONFIDENCE_SCORE = 0.9
 
@@ -140,7 +147,6 @@ def resize_image_if_needed(image: np.ndarray, max_size: tuple = (1024, 1024)) ->
     resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
     
     return resized
-
 
 def convert_cv2_to_pil(image: np.ndarray) -> Image.Image:
     """
@@ -355,7 +361,7 @@ def analyze_scene(
         }
     
     # Get API key
-    api_key = _resolve_api_key(model_name, api_key)
+    api_key = resolve_api_key(model_name, api_key)
     
     if not api_key:
         return {
@@ -375,12 +381,12 @@ def analyze_scene(
         
         # Convert to PIL format
         pil_image = convert_cv2_to_pil(processed_image)
-        image_data_uri = _image_to_data_uri(pil_image)
+        image_data_uri = pil_image_to_data_uri(pil_image)
         
         # Build prompt
         prompt = build_scene_prompt(detail_level, focus, context)
 
-        model_name = _resolve_model_name(model_name)
+        model_name = resolve_model_name(model_name)
 
         print(f"🤖 Using LiteLLM model: {model_name}")
         print(f"📋 Detail level: {detail_level}, Focus: {focus}")
@@ -400,7 +406,7 @@ def analyze_scene(
         )
         
         # Extract description
-        description = _extract_text(response)
+        description = extract_text(response)
         
         print(f"\n📋 Scene Description:\n{description}\n")
         
