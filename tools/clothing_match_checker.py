@@ -177,12 +177,12 @@ def analyze_clothing_match(
             "reason": str(parsed.get("reason", "")).strip(),
             "spoken_feedback": spoken,
         }
-    except Exception:
+    except Exception as exc:
         return {
             "success": False,
             "match": "unknown",
-            "spoken_feedback": "I could not check clothing match right now.",
-            "reason": "analysis error",
+            "spoken_feedback": "Unable to analyze clothing. Please adjust camera angle or try again.",
+            "reason": f"analysis error: {type(exc).__name__}",
         }
 
 
@@ -203,8 +203,8 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None):
 
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return {
-            "audio": {"type": "error", "text": "No camera image available.", "rate": 1.0, "interrupt": False},
-            "text": "No camera image available.",
+            "audio": {"type": "error", "text": "Camera not ready. Please wait a moment and try again.", "rate": 1.0, "interrupt": False},
+            "text": "Camera not ready. Please wait a moment and try again.",
         }
 
     config = input_data or {}
@@ -245,4 +245,3 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None):
         "pants": result.get("pants", ""),
         "reason": result.get("reason", ""),
     }
-
