@@ -19,6 +19,7 @@ BOTTLE_CLASS_ID = 39  # COCO: bottle
 DEFAULT_DETECTION_CONFIDENCE = 0.35
 STREAMING_WORD_LIMIT = 15
 MAX_HISTORY_SIZE = 4
+DOSAGE_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\s?(?:mg|mcg|g|ml|iu)\b", re.IGNORECASE)
 
 # Global state for streaming deduplication
 _recent_signatures = deque(maxlen=MAX_HISTORY_SIZE)
@@ -190,8 +191,6 @@ def extract_medication_name(ocr_text: str) -> str:
         "expires", "exp", "lot", "manufacturer", "generic", "use",
     }
 
-    dosage_pattern = re.compile(r"\b\d+(?:\.\d+)?\s?(?:mg|mcg|g|ml|iu)\b", re.IGNORECASE)
-
     scored_candidates: List[Tuple[int, str]] = []
 
     for line in lines:
@@ -208,7 +207,7 @@ def extract_medication_name(ocr_text: str) -> str:
             continue
 
         score = len(content_words)
-        if dosage_pattern.search(line):
+        if DOSAGE_PATTERN.search(line):
             score += 8
         if any(ch.isalpha() for ch in line):
             score += 2
@@ -278,7 +277,7 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
       - is_streaming: if True, cap spoken responses to 15 words
       - reset: clear tracking memory
       - language: OCR language hint (default en)
-      - api_key: optional credentials override for Vision API
+      - credentials / api_key: optional credentials override for Vision API
     """
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return "No camera image available"
@@ -299,7 +298,11 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
     track_mode = bool(config.get("track_mode", True))
     is_streaming = bool(config.get("is_streaming", False))
     language = config.get("language", "en")
-    credentials_input = config.get("api_key") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    credentials_input = (
+        config.get("credentials")
+        or config.get("api_key")
+        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    )
 
     bottle_detections = detect_bottle_presence(image, confidence_threshold=confidence)
     bottle_detected = len(bottle_detections) > 0
