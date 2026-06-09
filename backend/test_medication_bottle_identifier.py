@@ -8,7 +8,7 @@ import sys
 import numpy as np
 
 # Add tools directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tools')))
 
 import medication_bottle_identifier as tool
 from medication_bottle_identifier import (
@@ -55,10 +55,10 @@ def test_main_match_and_mismatch() -> None:
     original_ocr = tool.extract_text_google_vision
 
     try:
-        tool.detect_bottle_presence = lambda *_args, **_kwargs: [{"class_name": "bottle", "confidence": 0.9}]
+        tool.detect_bottle_presence = lambda *args, **kwargs: [{"class_name": "bottle", "confidence": 0.9}]
 
         # Matching medication
-        tool.extract_text_google_vision = lambda *_args, **_kwargs: ("Metformin 500mg", None)
+        tool.extract_text_google_vision = lambda *args, **kwargs: ("Metformin 500mg", None)
         reset_tracking()
         result_match = main(image, {"expected_medication": "Metformin", "track_mode": False})
         print(f"  Match result: {result_match}")
@@ -66,7 +66,7 @@ def test_main_match_and_mismatch() -> None:
         assert "yes" in result_match.lower()
 
         # Mismatched medication
-        tool.extract_text_google_vision = lambda *_args, **_kwargs: ("Ibuprofen 200mg", None)
+        tool.extract_text_google_vision = lambda *args, **kwargs: ("Ibuprofen 200mg", None)
         result_mismatch = main(image, {"expected_medication": "Metformin", "track_mode": False})
         print(f"  Mismatch result: {result_mismatch}")
         assert isinstance(result_mismatch, dict)
@@ -86,8 +86,8 @@ def test_streaming_limit() -> None:
     original_ocr = tool.extract_text_google_vision
 
     try:
-        tool.detect_bottle_presence = lambda *_args, **_kwargs: [{"class_name": "bottle", "confidence": 0.9}]
-        tool.extract_text_google_vision = lambda *_args, **_kwargs: (
+        tool.detect_bottle_presence = lambda *args, **kwargs: [{"class_name": "bottle", "confidence": 0.9}]
+        tool.extract_text_google_vision = lambda *args, **kwargs: (
             "Acetaminophen Extended Release Extra Strength 650mg Caplets", None
         )
 

@@ -68,7 +68,10 @@ def detect_bottle_presence(
     try:
         from ultralytics import YOLO
 
-        model_cache = globals().get("yolo_model_cache", {})
+        model_cache = globals().get("yolo_model_cache")
+        if not isinstance(model_cache, dict):
+            model_cache = {}
+            globals()["yolo_model_cache"] = model_cache
         cache_key = "medication_bottle_identifier_yolo11n"
 
         if cache_key not in model_cache:
