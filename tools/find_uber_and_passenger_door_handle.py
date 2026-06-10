@@ -15,16 +15,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 
 STREAMING_WORD_LIMIT = 15
+HANDLE_CONFIDENCE_DELTA = 0.05
 VEHICLE_LABEL_HINTS = {"car", "truck", "bus", "vehicle", "van", "suv", "taxi"}
 HANDLE_LABELS = ["car door handle", "vehicle door handle", "door handle"]
 
-_last_state: Optional[Tuple[bool, Optional[int], Optional[int]]] = None
+_stream_state_by_key: Dict[str, Tuple[bool, Optional[int], Optional[int]]] = {}
+_stream_state_lock = threading.Lock()
+_model_cache_lock = threading.Lock()
 
 
 @dataclass
@@ -32,6 +36,7 @@ class ToolConfig:
     confidence: float = 0.35
     is_streaming: bool = False
     uber_clues: str = ""
+    stream_key: str = "default"
     common_model_path: Optional[str] = None
     localization_model_path: Optional[str] = None
 
@@ -100,10 +105,18 @@ def get_clock_position(center_x: int, center_y: int, frame_width: int, frame_hei
         return 12
 
     if h_region == "right":
-        return 1 if v_region == "top" else (2 if v_region == "middle" else 3)
+        if v_region == "top":
+            return 1
+        if v_region == "middle":
+            return 2
+        return 3
 
     if h_region == "left":
-        return 11 if v_region == "top" else (10 if v_region == "middle" else 9)
+        if v_region == "top":
+            return 11
+        if v_region == "middle":
+            return 10
+        return 9
 
     return 12
 
@@ -116,6 +129,7 @@ def _extract_config(input_data: Any) -> ToolConfig:
         confidence=float(input_data.get("confidence", 0.35)),
         is_streaming=bool(input_data.get("is_streaming", False)),
         uber_clues=str(input_data.get("uber_clues", "") or ""),
+        stream_key=str(input_data.get("stream_key") or input_data.get("session_id") or "default"),
         common_model_path=input_data.get("common_model_path"),
         localization_model_path=input_data.get("localization_model_path"),
     )
@@ -259,16 +273,18 @@ class ModelRouter:
             return []
 
         cache_key = f"find_uber::{model_path}"
-        if cache_key not in self._cache:
-            self._cache[cache_key] = {"model": YOLO(model_path), "labels": None}
-
-        model_info = self._cache[cache_key]
+        with _model_cache_lock:
+            if cache_key not in self._cache:
+                self._cache[cache_key] = {"model": YOLO(model_path), "labels": None}
+            model_info = self._cache[cache_key]
         model = model_info["model"]
 
         label_key = tuple(labels)
-        if labels and hasattr(model, "set_classes") and model_info.get("labels") != label_key:
-            model.set_classes(labels)
-            model_info["labels"] = label_key
+        if labels and hasattr(model, "set_classes"):
+            with _model_cache_lock:
+                if model_info.get("labels") != label_key:
+                    model.set_classes(labels)
+                    model_info["labels"] = label_key
 
         try:
             results = model(image, conf=confidence, verbose=False)
@@ -324,7 +340,8 @@ def locate_passenger_handle(
     if not detections:
         return None
 
-    # Passenger-side heuristic: use right-most handle in vehicle crop.
+    # Passenger-side heuristic: use right-most handle in crop.
+    # This works best when camera framing matches right-side passenger entry.
     best = max(detections, key=lambda d: _det_center(d)[0])
     cx, cy = _det_center(best)
     full_cx = vx + cx
@@ -343,6 +360,25 @@ def locate_passenger_handle(
 
 def _stream_state(found_vehicle: bool, vehicle_clock: Optional[int], handle_clock: Optional[int]) -> Tuple[bool, Optional[int], Optional[int]]:
     return (found_vehicle, vehicle_clock, handle_clock)
+
+
+def _get_stream_state(stream_key: str) -> Optional[Tuple[bool, Optional[int], Optional[int]]]:
+    with _stream_state_lock:
+        return _stream_state_by_key.get(stream_key)
+
+
+def _set_stream_state(stream_key: str, state: Tuple[bool, Optional[int], Optional[int]]) -> None:
+    with _stream_state_lock:
+        _stream_state_by_key[stream_key] = state
+
+
+def reset_stream_state(stream_key: Optional[str] = None) -> None:
+    """Reset streaming state for one key or all keys."""
+    with _stream_state_lock:
+        if stream_key:
+            _stream_state_by_key.pop(stream_key, None)
+        else:
+            _stream_state_by_key.clear()
 
 
 def _build_output(
@@ -380,8 +416,6 @@ def _build_output(
 
 def main(image: np.ndarray, input_data: Any = None) -> Any:
     """Entry point for finding Uber vehicle and passenger door handle."""
-    global _last_state
-
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return {
             "audio": {"type": "error", "text": "No camera image available"},
@@ -408,9 +442,9 @@ def main(image: np.ndarray, input_data: Any = None) -> Any:
 
     if not vehicle_detections:
         current_state = _stream_state(False, None, None)
-        if config.is_streaming and _last_state == current_state:
+        if config.is_streaming and _get_stream_state(config.stream_key) == current_state:
             return ""
-        _last_state = current_state
+        _set_stream_state(config.stream_key, current_state)
         msg = "No likely Uber vehicle visible. Pan slowly left and right."
         return _word_limit(msg) if config.is_streaming else msg
 
@@ -434,7 +468,7 @@ def main(image: np.ndarray, input_data: Any = None) -> Any:
             image,
             selected_vehicle.get("bbox", [0, 0, frame_w, frame_h]),
             router,
-            confidence=max(0.2, config.confidence - 0.05),
+            confidence=max(0.2, config.confidence - HANDLE_CONFIDENCE_DELTA),
             model_path=config.localization_model_path,
         )
 
@@ -446,10 +480,10 @@ def main(image: np.ndarray, input_data: Any = None) -> Any:
         handle_clock = get_clock_position(hc[0], hc[1], frame_w, frame_h)
 
     current_state = _stream_state(True, vehicle_clock, handle_clock)
-    if config.is_streaming and _last_state == current_state:
+    if config.is_streaming and _get_stream_state(config.stream_key) == current_state:
         return ""
 
-    _last_state = current_state
+    _set_stream_state(config.stream_key, current_state)
 
     message = _build_output(image, selected_vehicle, handle_detection, config.is_streaming)
 
@@ -467,5 +501,6 @@ __all__ = [
     "get_clock_position",
     "select_uber_candidate",
     "locate_passenger_handle",
+    "reset_stream_state",
     "ModelRouter",
 ]

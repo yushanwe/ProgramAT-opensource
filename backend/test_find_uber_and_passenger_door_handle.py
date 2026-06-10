@@ -9,8 +9,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 
-import find_uber_and_passenger_door_handle as tool
-from find_uber_and_passenger_door_handle import get_clock_position, select_uber_candidate, main
+from find_uber_and_passenger_door_handle import (
+    get_clock_position,
+    select_uber_candidate,
+    reset_stream_state,
+    main,
+)
 
 
 def _create_test_image() -> np.ndarray:
@@ -56,7 +60,7 @@ def test_main_behaviors() -> None:
     print("Testing main() behavior...")
 
     # reset streaming state for deterministic tests
-    tool._last_state = None
+    reset_stream_state()
 
     no_image = main(None, {})
     print(f"  None image response type: {'dict' if isinstance(no_image, dict) else 'str'}")
@@ -90,13 +94,14 @@ def test_main_behaviors() -> None:
     print(f"  One-shot with handle response type: {'dict' if isinstance(one_shot, dict) else 'str'}")
     print(f"  One-shot text: {one_shot.get('text') if isinstance(one_shot, dict) else one_shot}")
 
-    tool._last_state = None
+    reset_stream_state()
     stream_first = main(
         image,
         {
             "mock_vehicle_detections": [vehicle],
             "mock_handle_detections": [handle],
             "is_streaming": True,
+            "stream_key": "test-stream",
         },
     )
     stream_second = main(
@@ -105,6 +110,7 @@ def test_main_behaviors() -> None:
             "mock_vehicle_detections": [vehicle],
             "mock_handle_detections": [handle],
             "is_streaming": True,
+            "stream_key": "test-stream",
         },
     )
 
