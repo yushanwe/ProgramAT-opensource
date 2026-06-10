@@ -8,11 +8,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 
-from clothing_matching_checker import evaluate_match, main
+from clothing_matching_checker import _limit_words, evaluate_match, main
 
 
-def create_test_outfit(top_bgr, bottom_bgr):
+def create_test_outfit(top_bgr: tuple[int, int, int], bottom_bgr: tuple[int, int, int]) -> np.ndarray:
     image = np.ones((480, 360, 3), dtype=np.uint8) * 240
+    # Rectangles align with extraction bands: upper 18%-52%, lower 56%-92%.
     cv2.rectangle(image, (90, 90), (270, 250), top_bgr, -1)
     cv2.rectangle(image, (90, 280), (270, 450), bottom_bgr, -1)
     return image
@@ -36,7 +37,7 @@ def test_evaluate_match_rules():
 
 def test_main_matching_case():
     print('Testing main() with matching outfit...')
-    image = create_test_outfit((255, 0, 0), (0, 0, 0))  # blue top, black pants
+    image = create_test_outfit((255, 0, 0), (0, 0, 0))  # BGR: blue top, black pants
     result = main(image, {'is_streaming': False})
     assert isinstance(result, dict)
     assert 'audio' in result
@@ -51,6 +52,15 @@ def test_main_streaming_word_limit():
     assert isinstance(result, dict)
     assert len(result.get('text', '').split()) <= 15
     print(f"  Streaming output: {result['text']}")
+
+
+def test_limit_words_truncates():
+    print('Testing _limit_words() truncation...')
+    long_text = 'This is a long sentence that should definitely be trimmed for streaming output right now please.'
+    trimmed = _limit_words(long_text, max_words=15)
+    assert trimmed != long_text
+    assert len(trimmed.split()) <= 15
+    print(f'  Trimmed output: {trimmed}')
 
 
 def test_main_no_image():
@@ -68,6 +78,7 @@ def run_all_tests():
     test_evaluate_match_rules()
     test_main_matching_case()
     test_main_streaming_word_limit()
+    test_limit_words_truncates()
     test_main_no_image()
     print('=' * 60)
     print('ALL TESTS COMPLETED')

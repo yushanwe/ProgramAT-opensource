@@ -23,12 +23,30 @@ COMPLEMENTARY_PAIRS = {
     frozenset(("red", "green")),
 }
 
+V_BLACK_THRESHOLD = 40
+S_WHITE_THRESHOLD = 25
+V_WHITE_THRESHOLD = 210
+S_GRAY_THRESHOLD = 35
+H_RED_LOW_MAX = 10
+H_RED_HIGH_MIN = 170
+H_BROWN_MAX = 20
+V_BROWN_MAX = 130
+H_YELLOW_MAX = 33
+H_GREEN_MAX = 78
+H_CYAN_MAX = 95
+H_BLUE_MAX = 130
+S_NAVY_MAX = 80
+H_PURPLE_MAX = 160
+VALID_AUDIO_TYPES = {"success", "warning", "error", "speech"}
+
 
 def _limit_words(text: str, max_words: int = 15) -> str:
     words = text.split()
     if len(words) <= max_words:
         return text
     shortened = " ".join(words[:max_words]).rstrip(".,;:")
+    if shortened.endswith(("!", "?", ".")):
+        return shortened
     return f"{shortened}."
 
 
@@ -44,26 +62,26 @@ def _extract_region(image: np.ndarray, y_start_ratio: float, y_end_ratio: float)
 
 
 def _classify_color_from_hsv(h: float, s: float, v: float) -> str:
-    if v < 40:
+    if v < V_BLACK_THRESHOLD:
         return "black"
-    if s < 25 and v > 210:
+    if s < S_WHITE_THRESHOLD and v > V_WHITE_THRESHOLD:
         return "white"
-    if s < 35:
+    if s < S_GRAY_THRESHOLD:
         return "gray"
 
-    if (h < 10) or (h >= 170):
+    if (h < H_RED_LOW_MAX) or (h >= H_RED_HIGH_MIN):
         return "red"
-    if h < 20:
-        return "brown" if v < 130 else "orange"
-    if h < 33:
+    if h < H_BROWN_MAX:
+        return "brown" if v < V_BROWN_MAX else "orange"
+    if h < H_YELLOW_MAX:
         return "yellow"
-    if h < 78:
+    if h < H_GREEN_MAX:
         return "green"
-    if h < 95:
+    if h < H_CYAN_MAX:
         return "cyan"
-    if h < 130:
-        return "blue" if s > 80 else "navy"
-    if h < 160:
+    if h < H_BLUE_MAX:
+        return "blue" if s > S_NAVY_MAX else "navy"
+    if h < H_PURPLE_MAX:
         return "purple"
     return "pink"
 
@@ -130,7 +148,7 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Dict
     """
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return {
-            "audio": {"type": "error", "text": "No camera image available.", "rate": 1.0, "interrupt": False},
+            "audio": {"type": "error", "text": "No camera image available."},
             "text": "No camera image available.",
         }
 
@@ -140,6 +158,8 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Dict
     is_streaming = bool(input_data.get("is_streaming", False))
 
     try:
+        # Regions assume the person is mostly centered in frame:
+        # upper clothing near torso and lower clothing near legs.
         top_region = _extract_region(image, 0.18, 0.52)
         bottom_region = _extract_region(image, 0.56, 0.92)
 
@@ -153,20 +173,17 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Dict
 
         return {
             "audio": {
-                "type": audio_type if audio_type in {"success", "warning", "error", "speech"} else "speech",
+                "type": audio_type if audio_type in VALID_AUDIO_TYPES else "speech",
                 "text": text,
-                "rate": 1.0,
-                "interrupt": audio_type == "warning",
+                **({"interrupt": True} if audio_type == "warning" else {}),
             },
             "text": text,
         }
-    except Exception:
+    except (cv2.error, ValueError, TypeError):
         return {
             "audio": {
                 "type": "error",
                 "text": "I could not check outfit matching right now.",
-                "rate": 1.0,
-                "interrupt": False,
             },
             "text": "I could not check outfit matching right now.",
         }
