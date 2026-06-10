@@ -23,12 +23,14 @@ import numpy as np
 
 STREAMING_WORD_LIMIT = 15
 HANDLE_CONFIDENCE_DELTA = 0.05
-VEHICLE_LABEL_HINTS = {"car", "truck", "bus", "vehicle", "van", "suv", "taxi"}
+VEHICLE_DETECTION_LABELS = ["car", "truck", "bus", "vehicle", "taxi"]
+VEHICLE_LABEL_HINTS = set(VEHICLE_DETECTION_LABELS) | {"van", "suv"}
 HANDLE_LABELS = ["car door handle", "vehicle door handle", "door handle"]
 
 _stream_state_by_key: Dict[str, Tuple[bool, Optional[int], Optional[int]]] = {}
 _stream_state_lock = threading.Lock()
 _model_cache_lock = threading.Lock()
+_shared_model_cache: Dict[str, Dict[str, Any]] = {}
 
 
 @dataclass
@@ -209,7 +211,7 @@ def _clamp_bbox(bbox: List[int], frame_width: int, frame_height: int) -> List[in
 
 def _discover_model_path(prefer_localization: bool = False) -> Optional[str]:
     current_dir = Path(__file__).resolve().parent
-    candidate_dirs = [current_dir, current_dir.parent / "backend"]
+    candidate_dirs = [current_dir]
 
     all_models: List[Path] = []
     for candidate_dir in candidate_dirs:
@@ -234,8 +236,8 @@ def _discover_model_path(prefer_localization: bool = False) -> Optional[str]:
 class ModelRouter:
     """Simple capability router for model-backed operations."""
 
-    def __init__(self) -> None:
-        self._cache = globals().get("yolo_model_cache", {})
+    def __init__(self, cache: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+        self._cache = cache if cache is not None else _shared_model_cache
 
     def run(
         self,
@@ -434,7 +436,7 @@ def main(image: np.ndarray, input_data: Any = None) -> Any:
     vehicle_detections = mock_vehicle_detections if isinstance(mock_vehicle_detections, list) else router.run(
         "object_detection",
         image,
-        labels=["car", "truck", "bus", "vehicle", "taxi"],
+        labels=VEHICLE_DETECTION_LABELS,
         confidence=config.confidence,
         model_path=config.common_model_path,
     )
