@@ -26,6 +26,7 @@ import numpy as np
 
 STREAMING_WORD_LIMIT = 15  # Keep streaming speech brief and responsive for repeated frame updates.
 HANDLE_CONFIDENCE_DELTA = 0.05  # Slightly lower threshold helps find small handle regions.
+MIN_HANDLE_CONFIDENCE = 0.2  # Lower bound to avoid dropping localization confidence too far.
 VEHICLE_DETECTION_LABELS = ["car", "truck", "bus", "vehicle", "taxi"]
 VEHICLE_LABEL_HINTS = set(VEHICLE_DETECTION_LABELS) | {"van", "suv"}
 HANDLE_LABELS = ["car door handle", "vehicle door handle", "door handle"]
@@ -350,7 +351,7 @@ def locate_passenger_handle(
         return None
 
     # Passenger-side heuristic: use right-most handle in crop.
-    # This works best when camera framing matches right-side passenger entry.
+    # This can be inaccurate with opposing camera angles or left-hand-drive contexts.
     best = max(detections, key=lambda d: _det_center(d)[0])
     cx, cy = _det_center(best)
     full_cx = vx + cx
@@ -480,7 +481,7 @@ def main(image: np.ndarray, input_data: Any = None) -> Any:
             image,
             selected_vehicle.get("bbox", [0, 0, frame_w, frame_h]),
             router,
-            confidence=max(0.2, config.confidence - HANDLE_CONFIDENCE_DELTA),
+            confidence=max(MIN_HANDLE_CONFIDENCE, config.confidence - HANDLE_CONFIDENCE_DELTA),
             model_path=config.localization_model_path,
         )
 
