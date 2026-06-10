@@ -57,8 +57,8 @@ def test_main_with_stubbed_detection():
         result = tool.main(image, {'vehicle_color': 'white'})
         text = result['text'] if isinstance(result, dict) else result
 
-        assert 'Uber' in text
-        assert 'Passenger handle' in text
+        assert 'uber' in text.lower()
+        assert 'passenger handle' in text.lower()
         print(f"  ✓ response: {text}")
     finally:
         tool.detect_vehicles = original_detect

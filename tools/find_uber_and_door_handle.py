@@ -112,6 +112,7 @@ def detect_vehicles(image: np.ndarray, confidence_threshold: float = DEFAULT_CON
 
         if cache_key not in model_cache:
             model_cache[cache_key] = YOLO('yolo11n.pt')
+            globals()['yolo_model_cache'] = model_cache
 
         model = model_cache[cache_key]
         results = model(image, conf=confidence_threshold, verbose=False)
