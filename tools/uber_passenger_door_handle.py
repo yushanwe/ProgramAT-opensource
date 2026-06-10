@@ -98,7 +98,8 @@ def build_analysis_prompt(target_description: str, is_streaming: bool) -> str:
         "Stage 1 (visual_reasoning): decide if the target Uber is visible. "
         "Stage 2 (object_localization): if visible, locate the passenger door handle and give guidance. "
         f"Target Uber details: {target_description}. "
-        "Use only camera-visible directions. Prefer clock-face for vehicle position. "
+        "Use only camera-visible directions. For clock-face, only use 1-3 and 9-12. "
+        "Prefer clock-face for vehicle position. "
         "If handle is not visible, guide user to move camera toward passenger-side door area. "
         f"{word_limit_rule}"
     )
@@ -120,20 +121,23 @@ def call_backend_visual_capability(image_data_uri: str, prompt: str, model_name:
     if not LITELLM_AVAILABLE:
         raise RuntimeError('LiteLLM not available')
 
-    response = litellm.completion(
-        model=resolve_model_name(model_name),
-        messages=[
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': prompt},
-                    {'type': 'image_url', 'image_url': {'url': image_data_uri}},
-                ],
-            }
-        ],
-        api_key=api_key,
-    )
-    return extract_text(response)
+    try:
+        response = litellm.completion(
+            model=resolve_model_name(model_name),
+            messages=[
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': prompt},
+                        {'type': 'image_url', 'image_url': {'url': image_data_uri}},
+                    ],
+                }
+            ],
+            api_key=api_key,
+        )
+        return extract_text(response)
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def parse_analysis_json(raw_text: str) -> Dict[str, Any]:
@@ -235,8 +239,34 @@ def run(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Dict[
             api_key=api_key,
         )
         analysis = parse_analysis_json(raw)
-    except Exception:
-        fallback = 'Unable to analyze the car view. Move closer and try again.'
+    except json.JSONDecodeError:
+        fallback = 'I could not interpret the scene yet. Pan slowly and try again.'
+        if is_streaming:
+            fallback = enforce_word_limit(fallback)
+        return {'audio': {'type': 'warning', 'text': fallback, 'rate': 1.0}, 'text': fallback}
+    except RuntimeError as exc:
+        error_text = str(exc).lower()
+        if 'api key' in error_text or 'auth' in error_text:
+            fallback = 'Vision service authorization failed. Check API key configuration.'
+        elif 'rate' in error_text or 'quota' in error_text:
+            fallback = 'Vision service is busy. Please wait a moment and try again.'
+        else:
+            fallback = 'Vision service is unavailable right now. Please try again in a moment.'
+        if is_streaming:
+            fallback = enforce_word_limit(fallback)
+        return {'audio': {'type': 'warning', 'text': fallback, 'rate': 1.0}, 'text': fallback}
+    except KeyError:
+        fallback = 'Scene analysis was incomplete. Move slightly and try again.'
+        if is_streaming:
+            fallback = enforce_word_limit(fallback)
+        return {'audio': {'type': 'warning', 'text': fallback, 'rate': 1.0}, 'text': fallback}
+    except ValueError:
+        fallback = 'Input settings look invalid. Reset tool settings and try again.'
+        if is_streaming:
+            fallback = enforce_word_limit(fallback)
+        return {'audio': {'type': 'warning', 'text': fallback, 'rate': 1.0}, 'text': fallback}
+    except TypeError:
+        fallback = 'Image processing failed. Reframe the camera and try again.'
         if is_streaming:
             fallback = enforce_word_limit(fallback)
         return {'audio': {'type': 'warning', 'text': fallback, 'rate': 1.0}, 'text': fallback}

@@ -41,6 +41,10 @@ def test_parse_analysis_json():
     assert parsed['target_found'] is True
     assert parsed['handle_visible'] is True
     print(f"  Parsed vehicle clock: {parsed['vehicle_clock']}")
+    wrapped = f"```json\n{raw}\n```"
+    parsed_wrapped = parse_analysis_json(wrapped)
+    assert parsed_wrapped['target_found'] is True
+    print('  ✓ Markdown-wrapped JSON parsing works')
 
 
 def test_word_limit():
@@ -50,6 +54,11 @@ def test_word_limit():
     count = len(limited.split())
     print(f'  Word count after limit: {count}')
     assert count == 15
+    assert enforce_word_limit('') == ''
+    assert enforce_word_limit('hello') == 'hello'
+    exact = 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen'
+    assert enforce_word_limit(exact) == exact
+    print('  ✓ Word-limit edge cases pass')
 
 
 def test_response_creation():
