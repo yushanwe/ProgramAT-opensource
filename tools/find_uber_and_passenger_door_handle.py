@@ -1,6 +1,9 @@
 """
 Find Uber and Passenger Door Handle tool.
 
+Runs on the backend server with camera frames from the app and returns
+audio-friendly guidance for TTS playback.
+
 Task Pipeline (minimal stages):
 1) object_detection: detect vehicles in the scene.
 2) visual_reasoning: pick the most likely Uber candidate using user clues and geometry.
@@ -21,8 +24,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
-STREAMING_WORD_LIMIT = 15
-HANDLE_CONFIDENCE_DELTA = 0.05
+STREAMING_WORD_LIMIT = 15  # Keep streaming speech brief and responsive for repeated frame updates.
+HANDLE_CONFIDENCE_DELTA = 0.05  # Slightly lower threshold helps find small handle regions.
 VEHICLE_DETECTION_LABELS = ["car", "truck", "bus", "vehicle", "taxi"]
 VEHICLE_LABEL_HINTS = set(VEHICLE_DETECTION_LABELS) | {"van", "suv"}
 HANDLE_LABELS = ["car door handle", "vehicle door handle", "door handle"]
@@ -82,7 +85,10 @@ def _color_name_from_crop(crop: np.ndarray) -> str:
 
 
 def get_clock_position(center_x: int, center_y: int, frame_width: int, frame_height: int) -> int:
-    """Map an object center to supported camera-visible clock positions."""
+    """Map an object center to supported camera-visible clock positions.
+
+    Returns only 1-3 and 9-12 because 4-8 would be behind the camera perspective.
+    """
     if frame_width <= 0 or frame_height <= 0:
         return 12
 
@@ -210,6 +216,7 @@ def _clamp_bbox(bbox: List[int], frame_width: int, frame_height: int) -> List[in
 
 
 def _discover_model_path(prefer_localization: bool = False) -> Optional[str]:
+    """Find an available local model file in tools/ and optionally prefer localization models."""
     current_dir = Path(__file__).resolve().parent
     candidate_dirs = [current_dir]
 
@@ -234,7 +241,7 @@ def _discover_model_path(prefer_localization: bool = False) -> Optional[str]:
 
 
 class ModelRouter:
-    """Simple capability router for model-backed operations."""
+    """Capability router for model-backed detection/localization with cached model instances."""
 
     def __init__(self, cache: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
         self._cache = cache if cache is not None else _shared_model_cache
@@ -375,7 +382,10 @@ def _set_stream_state(stream_key: str, state: Tuple[bool, Optional[int], Optiona
 
 
 def reset_stream_state(stream_key: Optional[str] = None) -> None:
-    """Reset streaming state for one key or all keys."""
+    """Reset streaming state for one key or all keys.
+
+    Use this when streaming sessions end, change tools, or need deterministic tests.
+    """
     with _stream_state_lock:
         if stream_key:
             _stream_state_by_key.pop(stream_key, None)

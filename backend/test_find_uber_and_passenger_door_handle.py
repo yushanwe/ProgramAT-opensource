@@ -1,5 +1,8 @@
 """
-Test script for find_uber_and_passenger_door_handle.py
+Focused backend test script for find_uber_and_passenger_door_handle.py.
+
+Uses mock detections to validate core logic and audio-friendly outputs
+without requiring live model inference.
 """
 
 import os
