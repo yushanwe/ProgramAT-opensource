@@ -40,7 +40,7 @@ def test_main_with_stubbed_detectors():
     original_detect_handles = tool.detect_passenger_door_handles
 
     try:
-        def fake_detect_vehicles(_image, _confidence):
+        def fake_detect_vehicles(_image, confidence_threshold):
             return [{
                 'class_name': 'car',
                 'confidence': 0.9,

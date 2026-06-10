@@ -44,6 +44,17 @@ COCO_CLASSES = [
 
 
 _last_message = None
+_local_model_cache: Dict[str, Any] = {}
+
+
+def get_model_cache() -> Dict[str, Any]:
+    """
+    Get shared backend cache when available; otherwise use local module cache.
+    """
+    shared_cache = globals().get('yolo_model_cache')
+    if isinstance(shared_cache, dict):
+        return shared_cache
+    return _local_model_cache
 
 
 def get_clock_position(center_x: int, center_y: int, frame_width: int, frame_height: int) -> int:
@@ -139,7 +150,7 @@ def detect_vehicles(image: np.ndarray, confidence_threshold: float = DEFAULT_CON
     try:
         from ultralytics import YOLO
 
-        model_cache = globals().get('yolo_model_cache', {})
+        model_cache = get_model_cache()
         cache_key = 'uber_vehicle_finder_yolo11n'
         if cache_key not in model_cache:
             model_cache[cache_key] = YOLO('yolo11n.pt')
@@ -230,13 +241,15 @@ def detect_passenger_door_handles(
     try:
         from ultralytics import YOLO
 
-        model_cache = globals().get('yolo_model_cache', {})
+        model_cache = get_model_cache()
         cache_key = 'uber_handle_finder_yolov8s_world'
 
         if cache_key not in model_cache:
+            yolo_model = YOLO('yolov8s-world.pt')
+            yolo_model.set_classes(HANDLE_CLASSES)
             model_cache[cache_key] = {
-                'model': YOLO('yolov8s-world.pt'),
-                'classes': None,
+                'model': yolo_model,
+                'classes': tuple(HANDLE_CLASSES),
             }
 
         model_info = model_cache[cache_key]
