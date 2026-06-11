@@ -61,16 +61,23 @@ def test_main_with_stubbed_reasoning():
 
     original_detect = tool.detect_vehicle_candidates
     original_reason = tool.reason_about_vehicle_and_handle
+    observed = {'called': False, 'confidence': None, 'image_shape': None}
 
     try:
-        tool.detect_vehicle_candidates = lambda image, confidence: [
-            {
-                'bbox': [100, 120, 260, 180],
-                'center': [230, 210],
-                'confidence': 0.9,
-                'frame_size': [640, 480],
-            }
-        ]
+        def _stub_detect(image, confidence):
+            observed['called'] = True
+            observed['confidence'] = confidence
+            observed['image_shape'] = image.shape
+            return [
+                {
+                    'bbox': [100, 120, 260, 180],
+                    'center': [230, 210],
+                    'confidence': 0.9,
+                    'frame_size': [640, 480],
+                }
+            ]
+
+        tool.detect_vehicle_candidates = _stub_detect
 
         tool.reason_about_vehicle_and_handle = lambda image, candidates, target, model, api_key: {
             'selected_index': 0,
@@ -86,6 +93,9 @@ def test_main_with_stubbed_reasoning():
         text = result.get('text') if isinstance(result, dict) else result
         assert "Your Uber is" in text
         assert "Passenger handle" in text
+        assert observed['called'] is True
+        assert observed['image_shape'] == (480, 640, 3)
+        assert observed['confidence'] == tool.DEFAULT_CONFIDENCE
 
         print(f"  ✓ main output: {text}")
     finally:
@@ -97,20 +107,28 @@ def test_main_requests_more_details_when_multiple_vehicles():
     print("Testing multiple-vehicle prompt...")
 
     original_detect = tool.detect_vehicle_candidates
+    original_reason = tool.reason_about_vehicle_and_handle
+    observed = {'reason_called': False}
     try:
         tool.detect_vehicle_candidates = lambda image, confidence: [
             {'bbox': [10, 10, 100, 100], 'center': [60, 60], 'confidence': 0.7, 'frame_size': [640, 480]},
             {'bbox': [200, 20, 120, 110], 'center': [260, 75], 'confidence': 0.72, 'frame_size': [640, 480]},
         ]
+        def _stub_reason(*_args, **_kwargs):
+            observed['reason_called'] = True
+            return {'selected_index': 0, 'handle_x': 60, 'handle_y': 60}
+        tool.reason_about_vehicle_and_handle = _stub_reason
 
         image = np.zeros((480, 640, 3), dtype=np.uint8)
         result = tool.main(image, {'is_streaming': False})
         text = result.get('text') if isinstance(result, dict) else result
         assert "multiple vehicles" in text.lower()
+        assert observed['reason_called'] is False
 
         print("  ✓ multiple-vehicle clarification prompt")
     finally:
         tool.detect_vehicle_candidates = original_detect
+        tool.reason_about_vehicle_and_handle = original_reason
 
 
 if __name__ == '__main__':

@@ -47,6 +47,9 @@ except Exception:
 DEFAULT_CONFIDENCE = 0.35
 STREAMING_WORD_LIMIT = 15
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # car, motorcycle, bus, truck
+HANDLE_X_RATIO = 0.78  # Passenger-side handle is usually right-of-center in visible side profile
+HANDLE_Y_RATIO = 0.56  # Door handle is typically slightly below vehicle mid-height
+NEAR_CENTER_THRESHOLD = 0.08  # Trigger success feedback when handle is close to camera center
 
 
 # Track recent output to avoid repetition in streaming mode
@@ -116,6 +119,7 @@ def detect_vehicle_candidates(image: np.ndarray, confidence_threshold: float) ->
     if model is None:
         model = YOLO('yolo11n.pt')
         model_cache['yolo11n.pt'] = model
+        globals()['yolo_model_cache'] = model_cache
 
     height, width = image.shape[:2]
     detections: List[Dict[str, Any]] = []
@@ -179,8 +183,8 @@ def _estimate_handle_from_bbox(bbox: List[int]) -> Dict[str, int]:
     """Fallback estimate for passenger handle point from a vehicle bbox."""
     x, y, w, h = bbox
     return {
-        'handle_x': int(x + (0.78 * w)),
-        'handle_y': int(y + (0.56 * h)),
+        'handle_x': int(x + (HANDLE_X_RATIO * w)),
+        'handle_y': int(y + (HANDLE_Y_RATIO * h)),
     }
 
 
@@ -203,6 +207,7 @@ def reason_about_vehicle_and_handle(
         return {'selected_index': 0, **estimate, 'confidence': 0.4}
 
     try:
+        # ProgramAT backend provides OpenCV BGR frames; single-channel grayscale is also accepted.
         rgb = image[:, :, ::-1] if len(image.shape) == 3 else image
         pil_image = Image.fromarray(rgb)
         image_data_uri = pil_image_to_data_uri(pil_image)
@@ -347,7 +352,7 @@ def main(image: np.ndarray, input_data: Any = None) -> Any:
 
     _last_stream_output = message
 
-    near_center = abs((int(reasoning.get('handle_x', selected_vehicle['center'][0])) / max(width, 1)) - 0.5) < 0.08
+    near_center = abs((int(reasoning.get('handle_x', selected_vehicle['center'][0])) / max(width, 1)) - 0.5) < NEAR_CENTER_THRESHOLD
     if near_center:
         return {
             'audio': {
