@@ -47,6 +47,7 @@ class ClothingMatchCheckerTests(unittest.TestCase):
             clothing_match_checker.run_visual_understanding = original
 
         self.assertEqual(result.get('audio', {}).get('type'), 'error')
+        self.assertEqual(result.get('audio', {}).get('text'), 'Model services are unavailable right now.')
         self.assertEqual(result.get('text'), 'timeout')
 
 
