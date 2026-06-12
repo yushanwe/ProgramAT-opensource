@@ -38,6 +38,26 @@ def main(image, input_data=None):
   per frame makes streaming unusable. `door_detection.py` shows the pattern.
 - **Streaming etiquette:** when run per frame, return `""` when nothing changed, or
   the user hears the same thing every ~500ms. Streaming output is capped at ~15 words.
+- **Model-backed work:** treat capability categories as declarations, not
+  implementation requirements. Assume each generated tool implements one
+  user-facing task; do not plan subtasks or chain multiple model calls unless
+  the user explicitly asks for that. Use the existing backend model router
+  through the existing tool-facing client. Do
+  not implement routing, create routers, create capability registries, create
+  detector/OCR/LLM wrappers, concrete detector functions, model-backed
+  inference, model loading, or provider calls inside a generated tool.
+  Import `llm_call` from `model_router_client` as the existing backend entrypoint.
+  Supported categories for new tools include
+  `simple_parsing`, `object_detection`, `object_localization`,
+  `visual_understanding`, `visual_reasoning`, `ocr`, `summarization`,
+  `code_generation`, and `general_reasoning`. Include
+  `metadata={"tool_name": "...", "route_text": "..."}` for routing logs. Do not
+  hardcode provider/model names, detector names, provider-specific
+  `DEFAULT_MODEL` constants, `COCO_CLASSES`, direct `litellm.completion()`
+  calls, `YOLO(...)` calls, detector library imports, provider SDK imports,
+  `.pt` file loading, or model-file discovery logic. If the approved API cannot
+  support the needed capability, add support to the centralized backend router
+  instead of implementing it inside the tool.
 - **Imports:** `import litellm_utils` bare (the server makes `tools/` the import
   root). Wrap optional dependencies in `try/except ImportError` — missing pip
   packages are auto-installed by the backend.
@@ -45,9 +65,9 @@ def main(image, input_data=None):
 
 ## Examples to copy from
 
-- `object_recognition.py` — simple YOLO tool returning a plain string.
-- `door_detection.py` — model caching, streaming, clock-face navigation.
-- `scene_description.py`, `clothing_recognition.py` — Gemini vision tools.
+- `object_recognition.py` — simple detection-style tool returning a plain string.
+- `door_detection.py` — streaming, temporal smoothing, clock-face navigation.
+- `scene_description.py`, `clothing_recognition.py` — routed vision-language tools.
 - `appearance_check.py` — the most complete example: two-pass detect→verify,
   robust JSON parsing, fail-closed safety. Study it before writing an LLM tool.
 
@@ -55,7 +75,8 @@ def main(image, input_data=None):
 
 1. Create `tools/your_tool.py` with `main(image, input_data)`.
 2. Write a `backend/test_<tool>.py` script and verify with `python test_<tool>.py`.
-3. Default models: YOLO11 + COCO for common objects, YOLOWorld for novel objects,
-   Google Cloud Vision for OCR, Gemini (`gemini-3-flash-preview`) for general vision.
+3. Default building blocks: express the needed capability and call the matching
+   backend-provided capability entrypoint. The backend decides concrete models,
+   providers, detector backends, OCR engines, and fallback behavior.
 4. `MODEL_SETUP.md` covers model files; `.github/copilot-instructions.md` has the
    full tool-generation spec. `CONTRIBUTING.md` has the PR and review process.
