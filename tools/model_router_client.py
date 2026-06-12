@@ -1,5 +1,5 @@
 """
-Lightweight client for routing tool LLM calls through the backend's shared stack.
+Lightweight client for routing tool LLM calls through the shared model stack.
 """
 
 from __future__ import annotations
@@ -27,7 +27,8 @@ def _select_model_name(input_data: dict[str, Any] | None) -> str:
     if isinstance(input_data, dict):
         requested = str(input_data.get('model_name') or '').strip()
 
-    model_name = requested or os.environ.get('LLM_MODEL') or 'gemini-3-flash-preview'
+    env_model = str(os.environ.get('LLM_MODEL') or '').strip()
+    model_name = requested or env_model or 'gemini-3-flash-preview'
     if model_name == 'gemini-2.0-flash':
         return 'gemini-3-flash-preview'
     return model_name

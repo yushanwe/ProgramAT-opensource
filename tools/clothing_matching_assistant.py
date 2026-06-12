@@ -42,14 +42,17 @@ def clean_response(response_text):
     return '. '.join(sentences[:2]) + '.'
 
 
-def error_result(message):
-    return {
+def error_result(message, debug_details=''):
+    result = {
         'audio': {
             'type': 'error',
             'text': message,
         },
         'text': message,
     }
+    if debug_details:
+        result['debug'] = debug_details
+    return result
 
 
 def main(image, input_data=None):
@@ -70,5 +73,8 @@ def main(image, input_data=None):
             input_data=config,
         )
         return clean_response(response)
-    except Exception:
-        return error_result('I could not check whether your clothing matches right now.')
+    except Exception as exc:
+        return error_result(
+            'I could not check whether your clothing matches right now.',
+            debug_details=str(exc),
+        )

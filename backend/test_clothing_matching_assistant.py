@@ -11,6 +11,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 import clothing_matching_assistant
 
 
+def create_test_image(width=10, height=10):
+    return [[[0, 0, 0] for _ in range(width)] for _ in range(height)]
+
+
 def test_build_prompt():
     print("Testing build_matching_prompt()...")
     prompt = clothing_matching_assistant.build_matching_prompt(
@@ -46,6 +50,7 @@ def test_main_no_image():
 def test_main_success():
     print("Testing main() success path...")
     calls = []
+    fake_image = create_test_image()
 
     def fake_llm_call(**kwargs):
         calls.append(kwargs)
@@ -54,7 +59,7 @@ def test_main_success():
     original = clothing_matching_assistant.llm_call
     clothing_matching_assistant.llm_call = fake_llm_call
     try:
-        result = clothing_matching_assistant.main(object(), {'occasion': 'work'})
+        result = clothing_matching_assistant.main(fake_image, {'occasion': 'work'})
     finally:
         clothing_matching_assistant.llm_call = original
 
@@ -80,6 +85,7 @@ def test_main_failure():
 
     assert result['audio']['type'] == 'error'
     assert 'could not check' in result['text']
+    assert result['debug'] == 'boom'
     print(f"  ✓ Failure response: {result['text']}")
     print()
 
