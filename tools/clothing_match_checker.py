@@ -34,7 +34,7 @@ def main(image: Any, input_data: dict[str, Any] | None = None) -> str | dict[str
             'text': 'No camera image available to check clothing match.',
         }
 
-    result = run_visual_understanding(image=image, prompt=_build_prompt(), input_data=input_data or {})
+    result = run_visual_understanding(image=image, prompt=_build_prompt(), input_data=input_data)
     if not result.get('success'):
         return {
             'audio': {
