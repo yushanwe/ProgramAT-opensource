@@ -34,12 +34,12 @@ def test_successful_match_result():
         captured['kwargs'] = kwargs
         return 'Your shirt and pants match well'
 
-    original = clothing_match_checker.route_visual_reasoning
-    clothing_match_checker.route_visual_reasoning = fake_route
+    original = clothing_match_checker.load_model_router_client
+    clothing_match_checker.load_model_router_client = lambda: (RuntimeError, fake_route)
     try:
         result = clothing_match_checker.main(object(), {'occasion': 'work'})
     finally:
-        clothing_match_checker.route_visual_reasoning = original
+        clothing_match_checker.load_model_router_client = original
 
     assert captured['image'] is not None
     assert 'work' in captured['prompt']
@@ -53,12 +53,12 @@ def test_visibility_warning_result():
     def fake_route(image, prompt, **kwargs):
         return "I can't see enough of your outfit yet. Please show more of your pants"
 
-    original = clothing_match_checker.route_visual_reasoning
-    clothing_match_checker.route_visual_reasoning = fake_route
+    original = clothing_match_checker.load_model_router_client
+    clothing_match_checker.load_model_router_client = lambda: (RuntimeError, fake_route)
     try:
         result = clothing_match_checker.main(object(), {})
     finally:
-        clothing_match_checker.route_visual_reasoning = original
+        clothing_match_checker.load_model_router_client = original
 
     assert result['audio']['type'] == 'warning'
     assert result['text'].endswith('.')

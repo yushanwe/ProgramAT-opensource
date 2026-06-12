@@ -2,16 +2,44 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
+from pathlib import Path
 from typing import Any
-
-from shared.model_router_client import ModelRouterError, route_visual_reasoning
 
 
 DEFAULT_SYSTEM_INSTRUCTION = (
     'You are helping a blind user decide whether their outfit matches. '
     'Be kind, direct, and practical. Do not mention technical uncertainty unless needed.'
 )
+
+
+def load_model_router_client() -> tuple[type[Exception], Any]:
+    cached = globals().get('_clothing_match_router_client')
+    if cached:
+        return cached
+
+    candidate_paths = []
+    file_path = globals().get('__file__')
+    if file_path:
+        repo_root = Path(file_path).resolve().parents[1]
+        candidate_paths.append(repo_root / 'backend' / 'shared' / 'model_router_client.py')
+
+    cwd = Path.cwd()
+    candidate_paths.append(cwd / 'shared' / 'model_router_client.py')
+    candidate_paths.append(cwd / 'backend' / 'shared' / 'model_router_client.py')
+
+    for candidate in candidate_paths:
+        if candidate.exists():
+            spec = importlib.util.spec_from_file_location('programat_model_router_client', candidate)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                loaded = (module.ModelRouterError, module.route_visual_reasoning)
+                globals()['_clothing_match_router_client'] = loaded
+                return loaded
+
+    raise RuntimeError('Could not load backend/shared/model_router_client.py')
 
 
 def build_clothing_match_prompt(input_data: dict[str, Any] | None = None) -> str:
@@ -73,6 +101,7 @@ def main(image: Any, input_data: dict[str, Any] | None = None) -> dict[str, Any]
     api_key = str(input_data.get('api_key', '') or '')
 
     try:
+        model_router_error, route_visual_reasoning = load_model_router_client()
         response_text = route_visual_reasoning(
             image,
             prompt,
@@ -85,12 +114,13 @@ def main(image: Any, input_data: dict[str, Any] | None = None) -> dict[str, Any]
             'audio': {'type': classify_audio_type(message), 'text': message},
             'text': message,
         }
-    except ModelRouterError as exc:
-        message = f'Clothing match checker is unavailable: {exc}'
-    except Exception:
-        message = 'Clothing match checker could not analyze this image right now.'
-
-    return {
-        'audio': {'type': 'error', 'text': message},
-        'text': message,
-    }
+    except Exception as exc:
+        model_router_error = globals().get('_clothing_match_router_client', (RuntimeError, None))[0]
+        if isinstance(exc, model_router_error):
+            message = f'Clothing match checker is unavailable: {exc}'
+        else:
+            message = 'Clothing match checker could not analyze this image right now.'
+        return {
+            'audio': {'type': 'error', 'text': message},
+            'text': message,
+        }

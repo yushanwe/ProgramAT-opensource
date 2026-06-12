@@ -22,16 +22,16 @@ ALLOWED_TASK_CATEGORIES = {
 }
 
 DEFAULT_MODELS = {
-    'simple_parsing': 'gemini-2.5-flash-lite',
+    'simple_parsing': 'gemini-3-flash-preview',
     'object_detection': 'gemini-3-flash-preview',
     'object_localization': 'gemini-3-flash-preview',
     'ocr': 'gemini-3-flash-preview',
     'visual_understanding': 'gemini-3-flash-preview',
     'visual_reasoning': 'gemini-3-flash-preview',
     'navigation': 'gemini-3-flash-preview',
-    'summarization': 'gemini-2.5-flash-lite',
-    'code_generation': 'gemini-2.5-flash-lite',
-    'general_reasoning': 'gemini-2.5-flash-lite',
+    'summarization': 'gemini-3-flash-preview',
+    'code_generation': 'gemini-3-flash-preview',
+    'general_reasoning': 'gemini-3-flash-preview',
 }
 
 
@@ -65,11 +65,14 @@ def _resolve_api_key(model_name: str, explicit_api_key: str = '') -> str:
         return explicit_api_key
 
     normalized = (model_name or '').lower()
-    if normalized.startswith('gemini'):
+    provider, _, model_id = normalized.partition('/')
+    model_id = model_id or provider
+
+    if provider == 'gemini' or model_id.startswith('gemini'):
         return os.environ.get('GEMINI_API_KEY', '')
-    if normalized.startswith('claude'):
+    if provider == 'anthropic' or model_id.startswith('claude'):
         return os.environ.get('ANTHROPIC_API_KEY', '')
-    if normalized.startswith('openai') or normalized.startswith('gpt'):
+    if provider == 'openai' or model_id.startswith('gpt') or model_id.startswith('openai'):
         return os.environ.get('OPENAI_API_KEY', '')
     return os.environ.get('OPENAI_API_KEY', '') or os.environ.get('GEMINI_API_KEY', '')
 
@@ -129,7 +132,8 @@ def _image_to_data_uri(image: Any) -> str:
         if len(shape) == 2:
             pil_image = Image.fromarray(image)
         elif len(shape) == 3 and shape[2] >= 3:
-            rgb_image = image[:, :, ::-1]
+            # Reorder channels from BGR indices [0,1,2] to RGB indices [2,1,0] for PIL.
+            rgb_image = image[:, :, [2, 1, 0]]
             pil_image = Image.fromarray(rgb_image)
         else:
             raise TypeError(f'Unsupported image shape: {shape}.')
