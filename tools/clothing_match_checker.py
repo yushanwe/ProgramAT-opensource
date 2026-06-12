@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any
+
+TOOLS_DIR = os.path.dirname(__file__)
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
 
 from model_router_client import run_visual_understanding
 
