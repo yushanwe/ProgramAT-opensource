@@ -16,11 +16,14 @@ import json
 import base64
 import io
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 import cv2
 import numpy as np
 from PIL import Image
+from aiohttp import web, WSMsgType
 from google.cloud import secretmanager
 from github import Github
 import os
@@ -39,10 +42,20 @@ from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
 import re
 import traceback
+from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor
 
-# Load .env from the backend directory (if present)
-load_dotenv(dotenv_path=str(Path(__file__).parent / '.env'))
+TOOLS_DIR = Path(__file__).resolve().parent.parent / 'tools'
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from door_detection import main as door_recognition_main
+from model_router_client import (
+    routed_llm_call,
+    routed_object_detection,
+    routed_ocr_call,
+    routed_vision_call,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -96,6 +109,17 @@ def _normalize_custom_gpt_value(value) -> str:
         return 'no'
 
     return ''
+
+
+def _extract_issue_section(body: str, *section_names: str) -> str:
+    """Extract a markdown **Section** value, supporting legacy/new section names."""
+    escaped_names = "|".join(re.escape(name) for name in section_names)
+    match = re.search(
+        rf'\*\*(?:{escaped_names})\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)',
+        body or '',
+        re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(1).strip() if match else ''
 
 # Configuration
 HOST = '0.0.0.0'  # Listen on all interfaces
@@ -344,59 +368,6 @@ PAUSE_DURATION = float(os.environ.get('PAUSE_DURATION', '5.0'))  # seconds to wa
 
 # LiteLLM / Gemini Configuration
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-LLM_MODEL = os.environ.get('LLM_MODEL', os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview'))
-GEMINI_MODEL = LLM_MODEL
-
-_AVAILABLE_MODELS_CACHE: list[str] | None = None
-
-
-def list_available_models() -> list[str]:
-    """Models the server can actually serve, derived from configured API keys.
-
-    Filters LiteLLM's known-models registry to chat-capable models that also
-    support vision (the follow-up handler sends images), then keeps only those
-    whose provider env keys are present.
-
-    Cached for the lifetime of the process — restart the server to pick up
-    newly-set API keys or LiteLLM version bumps.
-    """
-    global _AVAILABLE_MODELS_CACHE
-    if _AVAILABLE_MODELS_CACHE is not None:
-        return _AVAILABLE_MODELS_CACHE
-    try:
-        from litellm.utils import get_valid_models, get_model_info
-        valid = get_valid_models(check_provider_endpoint=False)
-        filtered = []
-        for name in valid:
-            try:
-                info = get_model_info(name)
-            except Exception:
-                continue
-            if info.get('mode') == 'chat' and info.get('supports_vision'):
-                filtered.append(name)
-        # Ensure the configured default is offered even if it doesn't pass filters
-        # (e.g. a preview model LiteLLM doesn't know about yet).
-        if LLM_MODEL and LLM_MODEL not in filtered:
-            filtered.insert(0, LLM_MODEL)
-        _AVAILABLE_MODELS_CACHE = sorted(set(filtered))
-    except Exception as e:
-        logger.warning(f"Could not derive available models from LiteLLM: {e}")
-        _AVAILABLE_MODELS_CACHE = [LLM_MODEL] if LLM_MODEL else []
-    return _AVAILABLE_MODELS_CACHE
-
-
-def model_from_message(data: dict) -> str:
-    """Pick the LLM model for one request. Strict allowlist; logs and falls
-    back to LLM_MODEL when the client requests an unavailable model."""
-    requested = (data.get('model') or '').strip() if isinstance(data, dict) else ''
-    if not requested:
-        return LLM_MODEL
-    if requested in list_available_models():
-        return requested
-    logger.warning(
-        f"Client requested unavailable model '{requested}', falling back to {LLM_MODEL}"
-    )
-    return LLM_MODEL
 
 # Gemini Live manager for custom-GPT streaming mode
 gemini_live_manager = GeminiLiveManager(GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -440,7 +411,15 @@ selected_issue = {'number': None, 'title': None, 'mode': 'create'}  # mode can b
 issue_cache = {'issues': [], 'last_fetch': None, 'cache_duration': 300}  # Cache for 5 minutes
 
 # Store the last received frame for tool execution
-last_frame = {'image': None, 'timestamp': None, 'base64': None}
+last_frame = {
+    'image': None,
+    'timestamp': None,
+    'base64': None,
+    'jpeg_bytes': None,
+    'jpeg_path': None,
+}
+
+LATEST_META_FRAME_FILENAME = 'latest_meta_frame.jpg'
 
 # Active streaming tools - tracks which tools are running continuously per client
 # Format: {client_id: {'tool': {...}, 'last_run': timestamp, 'throttle_ms': 1000}}
@@ -541,6 +520,14 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
             'exec_globals_base': {
                 '__builtins__': __builtins__,
                 '__file__': str(Path(__file__).parent.parent / 'tools' / 'dynamic_tool.py'),
+                'llm_call': llm_call,
+                'vision_call': vision_call,
+                'detect_objects': detect_objects,
+                'ocr_call': ocr_call,
+                'routed_llm_call': routed_llm_call,
+                'routed_vision_call': routed_vision_call,
+                'routed_object_detection': routed_object_detection,
+                'routed_ocr_call': routed_ocr_call,
                 'yolo_model_cache': yolo_model_cache,
                 **common_modules
             }
@@ -1993,7 +1980,9 @@ def fetch_open_issues():
             issue_list.append({
                 'number': issue.number,
                 'title': issue.title,
+                'body': issue.body or '',
                 'labels': [label.name for label in issue.labels],
+                'is_pr': issue.pull_request is not None,
                 'created_at': issue.created_at.isoformat(),
                 'updated_at': issue.updated_at.isoformat()
             })
@@ -2133,6 +2122,48 @@ def get_local_tools_for_pr_merge() -> list:
     return local_tools
 
 
+def resolve_tool_code_for_execution(tool_name: str, tool_path: str = '', client_tool_code: str = '') -> str:
+    """Prefer the server's current local tool code over stale client-sent code."""
+    candidates = []
+
+    raw_path = (tool_path or '').strip()
+    if raw_path:
+        path_name = Path(raw_path).name
+        if path_name.endswith('.py'):
+            candidates.append(TOOLS_DIR / path_name)
+
+    raw_name = (tool_name or '').strip()
+    if raw_name:
+        safe_name = Path(raw_name).name
+        candidates.append(TOOLS_DIR / (safe_name if safe_name.endswith('.py') else f'{safe_name}.py'))
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        try:
+            candidate.relative_to(TOOLS_DIR.resolve())
+        except ValueError:
+            continue
+
+        if candidate.exists() and candidate.is_file():
+            try:
+                server_tool_code = candidate.read_text(encoding='utf-8')
+                if client_tool_code and client_tool_code != server_tool_code:
+                    logger.info(
+                        f"[RUN_TOOL] Using server-local tool code for {tool_name} from {candidate}; "
+                        "client-sent code was stale or different"
+                    )
+                return server_tool_code
+            except Exception as e:
+                logger.warning(f"Failed to read local tool {candidate}: {e}")
+
+    return client_tool_code or ''
+
+
 def fetch_pr_tools_from_github(pr, repo) -> list:
     """
     Fetch tool code directly from GitHub PR branch.
@@ -2151,12 +2182,11 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
             linked_issue = repo.get_issue(int(issue_ref_match.group(1)))
             linked_body = linked_issue.body or ''
             
-            cgpt_match = re.search(r'\*\*Custom GPT\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', linked_body, re.IGNORECASE | re.DOTALL)
-            if cgpt_match:
-                pr_custom_gpt = _normalize_custom_gpt_value(cgpt_match.group(1)) == 'yes'
+            live_mode_value = _extract_issue_section(linked_body, 'Live Mode', 'Custom GPT')
+            if live_mode_value:
+                pr_custom_gpt = _normalize_custom_gpt_value(live_mode_value) == 'yes'
             
-            gq_match = re.search(r'\*\*GPT Query\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', linked_body, re.IGNORECASE | re.DOTALL)
-            pr_gpt_query = gq_match.group(1).strip() if gq_match else ''
+            pr_gpt_query = _extract_issue_section(linked_body, 'Live Query', 'GPT Query')
             
             si_match = re.search(r'\*\*System Instruction\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', linked_body, re.IGNORECASE | re.DOTALL)
             pr_system_instruction = si_match.group(1).strip() if si_match else ''
@@ -2508,15 +2538,14 @@ def fetch_issue_tools(issue_number: int) -> list:
         repo = g.get_repo(GITHUB_REPO)
         issue = repo.get_issue(issue_number)
         
-        # Parse custom_gpt / Gemini Live fields from issue body
+        # Parse live-mode fields from issue body
         issue_body = issue.body or ''
-        custom_gpt_match = re.search(r'\*\*Custom GPT\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', issue_body, re.IGNORECASE | re.DOTALL)
+        live_mode_value = _extract_issue_section(issue_body, 'Live Mode', 'Custom GPT')
         issue_custom_gpt = False
-        if custom_gpt_match:
-            issue_custom_gpt = _normalize_custom_gpt_value(custom_gpt_match.group(1)) == 'yes'
+        if live_mode_value:
+            issue_custom_gpt = _normalize_custom_gpt_value(live_mode_value) == 'yes'
         
-        gpt_query_match = re.search(r'\*\*GPT Query\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', issue_body, re.IGNORECASE | re.DOTALL)
-        issue_gpt_query = gpt_query_match.group(1).strip() if gpt_query_match else ''
+        issue_gpt_query = _extract_issue_section(issue_body, 'Live Query', 'GPT Query')
         
         si_match = re.search(r'\*\*System Instruction\*\*\s*(?:<!--.*?-->)?\s*(.+?)(?:\n\n|\n\*\*|$)', issue_body, re.IGNORECASE | re.DOTALL)
         issue_system_instruction = si_match.group(1).strip() if si_match else ''
@@ -2799,7 +2828,95 @@ def extract_tool_description(code: str) -> str:
     return ' '.join(description_lines)[:200]  # Limit to 200 chars
 
 
-def parse_issue_selection(transcript: str, available_issues: list, model: str = None) -> dict:
+_DUPLICATE_STOPWORDS = {
+    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'i', 'in',
+    'is', 'it', 'make', 'me', 'my', 'of', 'on', 'or', 'please', 'problem',
+    'that', 'the', 'this', 'to', 'tool', 'use', 'with'
+}
+
+
+def _normalize_duplicate_text(text: str) -> str:
+    return ' '.join(re.findall(r'[a-z0-9]+', (text or '').lower()))
+
+
+def _duplicate_tokens(text: str) -> set[str]:
+    tokens = set()
+    for token in re.findall(r'[a-z0-9]+', (text or '').lower()):
+        if token in _DUPLICATE_STOPWORDS or len(token) <= 2:
+            continue
+        if token.endswith('ies') and len(token) > 4:
+            token = token[:-3] + 'y'
+        elif token.endswith('s') and len(token) > 4:
+            token = token[:-1]
+        if token.startswith('identif'):
+            token = 'identify'
+        if token.startswith('denom'):
+            token = 'denomination'
+        tokens.add(token)
+    return tokens
+
+
+def duplicate_similarity(text_a: str, text_b: str) -> float:
+    """Score two tool requests for likely duplication."""
+    norm_a = _normalize_duplicate_text(text_a)
+    norm_b = _normalize_duplicate_text(text_b)
+    if not norm_a or not norm_b:
+        return 0.0
+
+    tokens_a = _duplicate_tokens(norm_a)
+    tokens_b = _duplicate_tokens(norm_b)
+    token_score = 0.0
+    if tokens_a and tokens_b:
+        token_score = len(tokens_a & tokens_b) / max(1, min(len(tokens_a), len(tokens_b)))
+
+    char_score = SequenceMatcher(None, norm_a, norm_b).ratio()
+    return max(token_score, char_score)
+
+
+def _issue_duplicate_text(issue: dict) -> str:
+    body = issue.get('body') or ''
+    original_prompts = re.findall(
+        r'<!--\s*ORIGINAL_PROMPTS\s*(.*?)\s*-->',
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    prompt_text = ' '.join(original_prompts)
+    return ' '.join(
+        str(part)
+        for part in (
+            issue.get('title', ''),
+            issue.get('description', ''),
+            body,
+            prompt_text,
+        )
+        if part
+    )
+
+
+def find_duplicate_issue(transcript: str, available_issues: list, threshold: float = 0.72) -> Optional[dict]:
+    best_issue = None
+    best_score = 0.0
+
+    for issue in available_issues:
+        score = duplicate_similarity(transcript, _issue_duplicate_text(issue))
+        if score > best_score:
+            best_issue = issue
+            best_score = score
+
+    if best_issue and best_score >= threshold:
+        return {
+            'mode': 'update',
+            'issue_number': best_issue.get('number'),
+            'issue_title': best_issue.get('title', ''),
+            'is_pr': best_issue.get('is_pr', False),
+            'confidence': best_score,
+            'match_reason': 'duplicate_similarity',
+        }
+
+    return None
+
+
+def parse_issue_selection(transcript: str, available_issues: list) -> dict:
     """
     Use AI to parse voice command to select an issue or switch to create mode.
     
@@ -2812,19 +2929,23 @@ def parse_issue_selection(transcript: str, available_issues: list, model: str = 
     """
     if not available_issues:
         return {'mode': 'create', 'issue_number': None, 'issue_title': None}
-
-    if not LITELLM_AVAILABLE:
-        logger.warning("LiteLLM not available, using simple issue selection fallback")
-        return {'mode': 'create', 'issue_number': None, 'issue_title': None}
     
     try:
-        # Build list of available issues for the prompt
-        issue_list_str = "\n".join([f"- Issue #{issue['number']}: {issue['title']}" 
-                                     for issue in available_issues])
+        # Build list of available issues for the prompt, including a short body
+        # excerpt so duplicate tool requests can match beyond title wording.
+        issue_lines = []
+        for issue in available_issues[:30]:
+            body_excerpt = ' '.join((issue.get('body') or '').split())[:350]
+            issue_kind = 'PR' if issue.get('is_pr') else 'Issue'
+            line = f"- {issue_kind} #{issue['number']}: {issue['title']}"
+            if body_excerpt:
+                line += f" | Details: {body_excerpt}"
+            issue_lines.append(line)
+        issue_list_str = "\n".join(issue_lines)
         
         prompt = f"""Parse the following voice command to determine if the user wants to:
-1. Select an existing issue to update/iterate on
-2. Create a new issue
+1. Select an existing issue to update/iterate on, including when the new request duplicates or strongly overlaps an existing issue
+2. Create a new issue only when the request is meaningfully different from all existing issues
 3. Show/list available issues
 
 Available open issues:
@@ -2837,7 +2958,11 @@ If the user is selecting an issue (e.g., "select issue 42", "work on the bug abo
 - Return the issue number that best matches their description
 - Return the issue title
 
-If the user wants to create a new issue or doesn't mention an existing issue:
+If the user's request describes the same desired tool, problem, example usage, or implementation as an existing issue/PR:
+- Return mode: "update" even if the user did not explicitly say "update"
+- Prefer the best matching existing issue over creating a duplicate
+
+If the user wants to create a new issue and the request is not a duplicate or close match:
 - Return mode: "create"
 
 If the user wants to see the list of issues (e.g., "show issues", "list issues", "what issues are open"):
@@ -2851,11 +2976,9 @@ Return ONLY a valid JSON object:
   "confidence": <0.0 to 1.0>
 }}"""
 
-        active_model = model or LLM_MODEL
-        response = litellm.completion(
-            model=resolve_model_name(active_model),
+        response = llm_call(
+            capability='tool_retrieval',
             messages=[{'role': 'user', 'content': prompt}],
-            api_key=resolve_api_key(active_model),
         )
         ai_response = extract_text(response)
 
@@ -2982,8 +3105,7 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 'pr_number': pr_number,
                 'pr_url': pr_url
             }
-            import websockets
-            websockets.broadcast(connected_clients, json.dumps(success_data))
+            await broadcast_to_connected_clients(success_data)
             
             # If we mentioned @copilot, start polling for the Copilot session
             if mention_copilot and connected_clients:
@@ -3019,7 +3141,7 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         logger.error(tb)
 
 
-def parse_transcript_with_ai(transcript: str, existing_data: dict = None, model: str = None) -> dict:
+def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dict:
     """
     Use AI to parse the transcript and extract structured information for issue template.
     
@@ -3030,26 +3152,6 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None, model:
     Returns:
         Dictionary with parsed fields including 'missing_fields' list
     """
-    if not LITELLM_AVAILABLE:
-        logger.warning("LiteLLM not available, using simple parsing")
-        existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        return {
-            'type': 'visual AT',
-            'title': transcript[:100],
-            'description': transcript,
-            'problem': '',
-            'solution': '',
-            'implementation_details': '',
-            'example_usage': '',
-            'custom_gpt': '',
-            'gpt_query': '',
-            'alternatives': '',
-            'additional': '',
-            'missing_fields': ['custom_gpt'],
-            'original_prompts': existing_prompts + [f"[{timestamp}] {transcript}"]
-        }
-    
     try:
         # Build context from existing data if this is a follow-up
         context_info = ""
@@ -3079,16 +3181,16 @@ For a visual AT request, extract:
 - solution: Proposed solution
 - implementation_details: any specific tech stack details desired
 - example_usage: an example use case and how the tool should handle it
-- custom_gpt: should this tool operate similarly to a custom GPT (using Gemini Live with a repeated query on each camera frame)? ONLY set to "yes" or "no" if the user EXPLICITLY stated their preference. If they did not mention it at all, leave this field EMPTY (empty string "").
-- gpt_query: if custom_gpt is "yes", what is the exact prompt to re-ask on every frame?
+- live_mode: should this tool use backend-managed live multimodal mode with a repeated query on each camera frame? ONLY set to "yes" or "no" if the user EXPLICITLY stated their preference. If they did not mention it at all, leave this field EMPTY (empty string "").
+- live_query: if live_mode is "yes", what is the exact prompt to re-ask on every frame?
 - alternatives: Alternative solutions considered
 - additional: Any other context
 
 CRITICAL: Evaluate which IMPORTANT fields are missing or insufficiently specified.
 ONLY mark IMPORTANT fields in the missing_fields array. Optional/nice-to-have fields should NOT be included even if empty.
 
-Important fields for visual AT: title, description, problem, solution, example_usage, custom_gpt, gpt_query
-In the event custom_gpt is explicitly "no", gpt_query is no longer important.
+Important fields for visual AT: title, description, problem, solution, example_usage, live_mode, live_query
+In the event live_mode is explicitly "no", live_query is no longer important.
 
 
 Guidelines for determining if an IMPORTANT field is missing:
@@ -3097,8 +3199,8 @@ Guidelines for determining if an IMPORTANT field is missing:
 3. For "problem": If the user explains why they need the tool, this is sufficient
 4. For "solution": If the user describes what they want or how it should work, this is sufficient
 5. For "example_usage": If the user provides any concrete example use case, this is sufficient
-6. For "custom_gpt": Leave this field as an EMPTY STRING unless the user EXPLICITLY said "yes" or "no". If the transcript does not clearly contain the user saying they want or don't want custom GPT mode, the field MUST be empty. When it is empty, ALWAYS include "custom_gpt" in missing_fields. Do NOT guess, infer, or assume — this is a question we must ask the user directly.
-7. For "gpt_query": Always include this in missing_fields if custom_gpt is "yes" and no query has been provided. If custom_gpt is "no", do not include this.
+6. For "live_mode": Leave this field as an EMPTY STRING unless the user EXPLICITLY said "yes" or "no". If the transcript does not clearly contain the user saying they want or don't want live mode, the field MUST be empty. When it is empty, ALWAYS include "live_mode" in missing_fields. Do NOT guess, infer, or assume — this is a question we must ask the user directly.
+7. For "live_query": Always include this in missing_fields if live_mode is "yes" and no query has been provided. If live_mode is "no", do not include this.
 8. ALWAYS include example_usage in missing_fields if no concrete example use case (>= 10 characters) is present
 
 If ALL important fields have meaningful content (even if brief), return an empty missing_fields array: []
@@ -3117,17 +3219,15 @@ Return format:
   "implementation_details": "...",
   "example_usage": "...",
   "alternatives": "...",
-  "custom_gpt": "...",
-  "gpt_query": "...",
+  "live_mode": "...",
+  "live_query": "...",
   "additional": "...",
   "missing_fields": ["field1", "field2"]  // Only truly missing/empty important fields. Use [] if all important fields have content.
 }}"""
 
-        active_model = model or LLM_MODEL
-        response = litellm.completion(
-            model=resolve_model_name(active_model),
+        response = llm_call(
+            capability='text_parse',
             messages=[{'role': 'user', 'content': prompt}],
-            api_key=resolve_api_key(active_model),
         )
 
         # Parse the AI response
@@ -3144,12 +3244,20 @@ Return format:
         
         parsed_data = json.loads(ai_response)
 
+        if 'live_mode' in parsed_data and 'custom_gpt' not in parsed_data:
+            parsed_data['custom_gpt'] = parsed_data.get('live_mode', '')
+        if 'live_query' in parsed_data and 'gpt_query' not in parsed_data:
+            parsed_data['gpt_query'] = parsed_data.get('live_query', '')
+
         parsed_custom_gpt = _normalize_custom_gpt_value(parsed_data.get('custom_gpt', ''))
         if not parsed_custom_gpt:
             parsed_custom_gpt = _normalize_custom_gpt_value(transcript)
         parsed_data['custom_gpt'] = parsed_custom_gpt
 
-        missing_fields = parsed_data.get('missing_fields', [])
+        missing_fields = [
+            'custom_gpt' if field == 'live_mode' else 'gpt_query' if field == 'live_query' else field
+            for field in parsed_data.get('missing_fields', [])
+        ]
         if parsed_custom_gpt:
             missing_fields = [field for field in missing_fields if field != 'custom_gpt']
             if parsed_custom_gpt == 'no':
@@ -3243,9 +3351,9 @@ def fill_template(template_content: str, parsed_data: dict) -> str:
                            ensure_string(parsed_data.get('alternatives', '')))
     filled = filled.replace('<!-- Describe an example situation the tool would be used in and how it could work -->', 
                            ensure_string(parsed_data.get('example_usage', '')))
-    filled = filled.replace('<!-- Should this tool, in live mode, leverage Gemini live and work basically as a custom GPT without the need to ask again?-->', 
+    filled = filled.replace('<!-- Should this tool, in live mode, use the backend-managed live multimodal mode without the need to ask again?-->',
                            ensure_string(parsed_data.get('custom_gpt', '')))
-    filled = filled.replace('<!-- If custom GPT, what is the query to be reasked every few seconds. Otherwise leave empty-->', 
+    filled = filled.replace('<!-- If live mode is enabled, what is the query to be reasked every few seconds. Otherwise leave empty-->',
                            ensure_string(parsed_data.get('gpt_query', '')))
     filled = filled.replace('<!-- Add any other context or screenshots about the feature request here. -->', 
                            ensure_string(parsed_data.get('additional', '')))
@@ -3318,8 +3426,8 @@ def generate_feedback_message(missing_fields: list, issue_type: str) -> str:
         'description': 'tool description',
         'implementation_details': 'implementation details',
         'example_usage': 'example usage',
-        'custom_gpt': 'to know should this behave like a custom GPT, minus the need to reask often. Answer yes or no',
-        'gpt_query': 'query for custom GPT',
+        'custom_gpt': 'to know whether this should use live mode without the need to reask often. Answer yes or no',
+        'gpt_query': 'query for live mode',
         'additional': 'additional context',
         'alternatives': 'alternative solutions',
         'title': 'title'
@@ -3338,6 +3446,25 @@ def _log_to_all_sessions(level: str, message: str):
         session_log.log(level, message)
 
 
+async def broadcast_to_connected_clients(payload: dict):
+    """Broadcast JSON to aiohttp/websockets-compatible client adapters."""
+    if not connected_clients:
+        return
+
+    message = json.dumps(payload)
+    send_tasks = []
+    for client in list(connected_clients):
+        send = getattr(client, 'send', None)
+        if callable(send):
+            send_tasks.append(send(message))
+
+    if send_tasks:
+        results = await asyncio.gather(*send_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to broadcast to client: {result}")
+
+
 async def create_github_issue(text: str):
     """
     Create a GitHub issue OR update an existing one based on selected mode.
@@ -3346,9 +3473,6 @@ async def create_github_issue(text: str):
     Args:
         text: Text to parse and use for creating/updating the issue
     """
-    # Use the model stashed on `last_text` when the originating message arrived,
-    # so this background task respects the client's per-request choice.
-    active_model = last_text.get('model') or LLM_MODEL
     global incomplete_issue, selected_issue
     
     _log_to_all_sessions("INFO", f"create_github_issue called with text: {text}")
@@ -3382,7 +3506,14 @@ async def create_github_issue(text: str):
         # SECOND: Parse the text to see if it's a selection/mode change command
         logger.info(f"[DEBUG] NOT in update mode, parsing text for issue selection")
         available_issues = fetch_open_issues()
-        selection = parse_issue_selection(text.strip(), available_issues, model=active_model)
+        selection = find_duplicate_issue(text.strip(), available_issues)
+        if selection:
+            logger.info(
+                f"Duplicate issue detected locally: issue #{selection.get('issue_number')} "
+                f"score={selection.get('confidence'):.2f}"
+            )
+        else:
+            selection = parse_issue_selection(text.strip(), available_issues)
         
         # Handle list mode
         if selection.get('mode') == 'list':
@@ -3396,8 +3527,7 @@ async def create_github_issue(text: str):
                     'message': issue_list_msg,
                     'issues': available_issues[:10]
                 }
-                import websockets
-                websockets.broadcast(connected_clients, json.dumps(list_data))
+                await broadcast_to_connected_clients(list_data)
             return
         
         # Handle update mode selection
@@ -3408,14 +3538,17 @@ async def create_github_issue(text: str):
             
             # Send confirmation to client
             if connected_clients:
+                selected_kind = 'PR' if selection.get('is_pr') else 'issue'
                 confirm_data = {
                     'type': 'issue_selected',
-                    'message': f"Selected issue #{selected_issue['number']}: {selected_issue['title']}",
+                    'message': f"Found existing {selected_kind} #{selected_issue['number']}: {selected_issue['title']}. What would you like to update?",
                     'issue_number': selected_issue['number'],
-                    'issue_title': selected_issue['title']
+                    'issue_title': selected_issue['title'],
+                    'is_pr': selection.get('is_pr', False),
+                    'duplicate_match': selection.get('match_reason') == 'duplicate_similarity',
+                    'confidence': selection.get('confidence'),
                 }
-                import websockets
-                websockets.broadcast(connected_clients, json.dumps(confirm_data))
+                await broadcast_to_connected_clients(confirm_data)
             
             logger.info(f"Switched to update mode for issue #{selected_issue['number']}")
             return
@@ -3435,7 +3568,7 @@ async def create_github_issue(text: str):
             # Parse new transcript focusing on filling missing fields
             # Pass existing data as context so AI knows this is a follow-up
             _log_to_all_sessions("INFO", "Calling parse_transcript_with_ai (follow-up)")
-            new_parsed = parse_transcript_with_ai(text.strip(), existing_data=incomplete_issue['data'], model=active_model)
+            new_parsed = parse_transcript_with_ai(text.strip(), existing_data=incomplete_issue['data'])
             _log_to_all_sessions("INFO", f"AI parsing result: {new_parsed}")
             
             # Merge new data with existing incomplete data
@@ -3446,7 +3579,7 @@ async def create_github_issue(text: str):
         else:
             # First time parsing this issue
             _log_to_all_sessions("INFO", "Calling parse_transcript_with_ai (initial)")
-            parsed_data = parse_transcript_with_ai(text.strip(), model=active_model)
+            parsed_data = parse_transcript_with_ai(text.strip())
             _log_to_all_sessions("INFO", f"AI parsing result: {parsed_data}")
             logger.info(f"Initial parsing. Type: {parsed_data.get('type')}, Missing: {parsed_data.get('missing_fields', [])}")
         
@@ -3469,9 +3602,7 @@ async def create_github_issue(text: str):
                     'message': feedback_msg,
                     'missing_fields': missing_fields
                 }
-                # Send to all connected clients
-                import websockets
-                websockets.broadcast(connected_clients, json.dumps(feedback_data))
+                await broadcast_to_connected_clients(feedback_data)
             
             # Don't create issue yet, wait for more info
             logger.info("Issue incomplete, waiting for user to provide more details")
@@ -3529,6 +3660,16 @@ async def create_github_issue(text: str):
             body=body,
             labels=labels
         )
+        issue_cache['issues'].insert(0, {
+            'number': issue.number,
+            'title': issue.title,
+            'body': body,
+            'labels': labels,
+            'is_pr': False,
+            'created_at': issue.created_at.isoformat(),
+            'updated_at': issue.updated_at.isoformat(),
+        })
+        issue_cache['last_fetch'] = datetime.now()
         _log_to_all_sessions("INFO", f"GitHub API: Created issue #{issue.number}: {title} (url: {issue.html_url})")
         logger.info(f"Created GitHub issue #{issue.number}: {title[:50]}... (type: {issue_type})")
         
@@ -3540,8 +3681,7 @@ async def create_github_issue(text: str):
                 'issue_number': issue.number,
                 'issue_url': issue.html_url
             }
-            import websockets
-            websockets.broadcast(connected_clients, json.dumps(success_data))
+            await broadcast_to_connected_clients(success_data)
             
             # Start polling for Copilot session for each connected client
             for ws in connected_clients:
@@ -3643,8 +3783,165 @@ def decode_frame(base64_data: str) -> np.ndarray:
         return None
 
 
+def store_latest_meta_frame(img: np.ndarray) -> tuple[bytes, Path] | None:
+    """Encode and persist the latest Meta frame as a JPEG."""
+    if img is None or img.size == 0:
+        return None
+
+    success, encoded = cv2.imencode(
+        '.jpg',
+        img,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+    )
+
+    if not success:
+        logger.error("Failed to encode latest Meta frame as JPEG")
+        return None
+
+    jpeg_bytes = encoded.tobytes()
+    latest_path = FRAMES_DIR / LATEST_META_FRAME_FILENAME
+
+    try:
+        latest_path.write_bytes(jpeg_bytes)
+    except Exception as e:
+        logger.error(f"Failed to write latest Meta frame JPEG: {e}")
+        return None
+
+    last_frame['jpeg_bytes'] = jpeg_bytes
+    last_frame['jpeg_path'] = str(latest_path)
+
+    return jpeg_bytes, latest_path
+
+
+def get_latest_meta_frame_image() -> np.ndarray | None:
+    """Load the most recently stored Meta JPEG as an OpenCV image."""
+    jpeg_bytes = last_frame.get('jpeg_bytes')
+    jpeg_path_value = last_frame.get('jpeg_path')
+
+    if not jpeg_bytes and jpeg_path_value:
+        jpeg_path = Path(jpeg_path_value)
+        if jpeg_path.exists():
+            try:
+                jpeg_bytes = jpeg_path.read_bytes()
+            except Exception as e:
+                logger.error(f"Failed to read latest Meta frame JPEG: {e}")
+                return None
+
+    if not jpeg_bytes:
+        return None
+
+    nparr = np.frombuffer(jpeg_bytes, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+
+def format_door_detection_result(result) -> str:
+    if isinstance(result, dict):
+        for key in ('text', 'result', 'message'):
+            value = result.get(key)
+            if value:
+                return str(value)
+        return str(result)
+
+    return str(result)
+
+
+class AiohttpWebSocketAdapter:
+    def __init__(self, request: web.Request, websocket: web.WebSocketResponse):
+        self.request = request
+        self._request = request
+        self._websocket = websocket
+        peername = request.transport.get_extra_info('peername') if request.transport else None
+        if isinstance(peername, tuple) and len(peername) >= 2:
+            self.remote_address = (peername[0], peername[1])
+        else:
+            self.remote_address = (request.remote or 'unknown', 0)
+
+    async def send(self, data):
+        if isinstance(data, bytes):
+            await self._websocket.send_bytes(data)
+        else:
+            await self._websocket.send_str(str(data))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while True:
+            message = await self._websocket.receive()
+
+            if message.type == WSMsgType.TEXT:
+                return message.data
+
+            if message.type == WSMsgType.BINARY:
+                return message.data
+
+            if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                raise StopAsyncIteration
+
+    async def close(self):
+        await self._websocket.close()
+
+
+async def test_door_recognition(request: web.Request):
+    print("[MockDevice] Using latest frame")
+
+    raw_body = await request.read()
+
+    if raw_body:
+        nparr = np.frombuffer(raw_body, np.uint8)
+        latest_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if latest_image is not None:
+            last_frame['image'] = latest_image
+            last_frame['timestamp'] = datetime.now()
+            last_frame['base64'] = base64.b64encode(raw_body).decode('utf-8')
+            latest_meta_frame = store_latest_meta_frame(latest_image)
+            if latest_meta_frame is not None:
+                _, latest_path = latest_meta_frame
+                print(f"[MockDevice] Stored latest frame at {latest_path}")
+        else:
+            print("[DoorRecognition] Received body but failed to decode JPEG")
+
+    latest_image = get_latest_meta_frame_image()
+
+    if latest_image is None:
+        print("[DoorRecognition] No latest Meta frame available")
+        return web.json_response(
+            {
+                'status': 'error',
+                'error': 'No latest Meta frame available yet',
+            },
+            status=404,
+        )
+
+    print("[DoorRecognition] Running")
+
+    try:
+        result = await asyncio.to_thread(door_recognition_main, latest_image, {})
+        result_text = format_door_detection_result(result)
+        print(f"[DoorRecognition] {result_text}")
+
+        return web.json_response(
+            {
+                'status': 'success',
+                'result': result_text,
+                'saved_path': last_frame.get('jpeg_path'),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Door recognition test failed: {e}", exc_info=True)
+        print(f"[DoorRecognition] Error: {e}")
+        return web.json_response(
+            {
+                'status': 'error',
+                'error': str(e),
+            },
+            status=500,
+        )
+
+
 # New helper to process/save incoming text
-def process_text(text_payload, model: str = None) -> dict:
+def process_text(text_payload) -> dict:
     """
     Process and optionally save incoming text messages.
     Accepts a string or dict (will stringify).
@@ -3680,7 +3977,6 @@ def process_text(text_payload, model: str = None) -> dict:
             last_text['prev_raw'] = text_str
             last_text['timestamp'] = datetime.now()
             last_text['task'] = None
-            last_text['model'] = model
             return {'status': 'saved' if SAVE_FRAMES else 'received', 'text_preview': text_str[:200]}
 
         # CREATE mode: use delta calculation
@@ -3709,7 +4005,6 @@ def process_text(text_payload, model: str = None) -> dict:
         last_text['prev_raw'] = text_str
         last_text['timestamp'] = datetime.now()
         last_text['task'] = None
-        last_text['model'] = model
 
         if not delta:
             # nothing new appended
@@ -3792,6 +4087,11 @@ def process_frame(frame_data: dict) -> dict:
                 last_frame['timestamp'] = now
                 last_frame['base64'] = base64_data
 
+                latest_meta_frame = store_latest_meta_frame(img)
+                if latest_meta_frame is not None:
+                    _, latest_path = latest_meta_frame
+                    results['latest_meta_frame'] = str(latest_path)
+
                 # Note: Streaming tools will be run in handle_client after process_frame returns
 
                 # later: insert processing here, rn they are just images
@@ -3852,12 +4152,12 @@ async def handle_client(websocket):
         session_log.log_message("send", "connection", "Welcome message sent")
 
         # Send server capabilities so the app can show/hide features accordingly.
-        # `default_model` is the env-configured fallback; clients can include a
-        # `model` field on each request to override per-call.
         capabilities_payload = {
             **SERVER_CAPABILITIES,
-            'default_model': LLM_MODEL,
-            'available_models': list_available_models(),
+            'model_routing': True,
+            'routing_mode': 'semantic',
+            'default_model': '',
+            'available_models': [],
         }
         await websocket.send(json.dumps({
             'type': 'server_capabilities',
@@ -3896,11 +4196,19 @@ async def handle_client(websocket):
                     
                     custom_gpt = data.get('custom_gpt', False)
                     gpt_query = data.get('gpt_query', '')
+                    tool_name = data.get('tool_name', 'unknown')
+                    tool_path = data.get('tool_path', '')
+                    tool_code = resolve_tool_code_for_execution(
+                        tool_name=tool_name,
+                        tool_path=tool_path,
+                        client_tool_code=data.get('tool_code', ''),
+                    )
                     
                     active_streaming_tools[client_id] = {
                         'tool': {
-                            'name': data.get('tool_name', 'unknown'),
-                            'code': data.get('tool_code', ''),
+                            'name': tool_name,
+                            'path': tool_path,
+                            'code': tool_code,
                             'language': data.get('tool_language', 'python'),
                             'input': data.get('input', ''),
                         },
@@ -4514,7 +4822,7 @@ async def handle_client(websocket):
 
                 if text_payload:
                     logger.info(f"[DEBUG] Text received: {text_payload[:100]}, current mode: {selected_issue.get('mode')}, issue: {selected_issue.get('number')}")
-                    text_results = process_text(text_payload, model=model_from_message(data))
+                    text_results = process_text(text_payload)
                     logger.info(f"[DEBUG] Text processing result: {text_results}, last_text content: {last_text.get('content', '')[:100] if last_text.get('content') else 'None'}")
                     combined_results['text'] = text_results
                     if text_results.get('status') in ('saved', 'received'):
@@ -4592,7 +4900,12 @@ async def handle_client(websocket):
                 if data.get('type') == 'run_tool':
                     logger.info(f"Client {client_id} requested tool execution: {data.get('tool_name')}")
                     tool_name = data.get('tool_name', 'unknown')
-                    tool_code = data.get('tool_code', '')
+                    tool_path = data.get('tool_path', '')
+                    tool_code = resolve_tool_code_for_execution(
+                        tool_name=tool_name,
+                        tool_path=tool_path,
+                        client_tool_code=data.get('tool_code', ''),
+                    )
                     tool_language = data.get('tool_language', 'python')
                     tool_input = data.get('input', '')
                     frame_data = data.get('frame', None)  # Get optional frame data
@@ -4711,6 +5024,15 @@ async def handle_client(websocket):
                             # Create a sandboxed execution environment with image data
                             exec_globals = {
                                 '__builtins__': __builtins__,
+                                '__file__': str(TOOLS_DIR / f'{Path(tool_name).name}.py'),
+                                'llm_call': llm_call,
+                                'vision_call': vision_call,
+                                'detect_objects': detect_objects,
+                                'ocr_call': ocr_call,
+                                'routed_llm_call': routed_llm_call,
+                                'routed_vision_call': routed_vision_call,
+                                'routed_object_detection': routed_object_detection,
+                                'routed_ocr_call': routed_ocr_call,
                                 'input_data': parsed_input,  # Use parsed input (dict or string)
                                 'image': frame_image,  # OpenCV image (numpy array)
                                 'image_base64': frame_base64,  # Base64 string
@@ -4996,26 +5318,17 @@ async def handle_client(websocket):
                             # Create prompt for follow-up question
                             prompt = f"You are analyzing this image. The user is asking a follow-up question: {question}\n\nPlease provide a helpful and concise answer based on what you can see in the image."
                             
-                            # Send the follow-up through LiteLLM using the per-request model
-                            active_model = model_from_message(data)
+                            # Send the follow-up through LiteLLM using the task router
                             try:
-                                response = litellm.completion(
-                                    model=resolve_model_name(active_model),
-                                    messages=[
-                                        {
-                                            'role': 'user',
-                                            'content': [
-                                                {'type': 'text', 'text': prompt},
-                                                {'type': 'image_url', 'image_url': {'url': pil_image_to_data_uri(pil_image)}},
-                                            ],
-                                        }
-                                    ],
-                                    api_key=resolve_api_key(active_model),
+                                response = llm_call(
+                                    capability='image_analysis',
+                                    messages=[{'role': 'user', 'content': prompt}],
+                                    images=[pil_image],
                                 )
                                 answer = extract_text(response)
 
                                 logger.info(f"FOLLOW-UP: Generated answer length: {len(answer)}")
-                                logger.info(f"FOLLOW-UP: Successfully used LiteLLM with {active_model} for image+text")
+                                logger.info("FOLLOW-UP: Successfully routed image+text through model_router")
                                 
                                 await websocket.send(json.dumps({
                                     'type': 'follow_up_response',
@@ -5121,6 +5434,25 @@ async def handle_client(websocket):
         logger.info(f"Cleaned up client: {client_id}")
 
 
+async def websocket_handler(request: web.Request):
+    websocket = web.WebSocketResponse(
+        max_msg_size=20 * 1024 * 1024,
+        heartbeat=20,
+        autoping=True,
+    )
+    await websocket.prepare(request)
+
+    adapter = AiohttpWebSocketAdapter(request, websocket)
+
+    try:
+        await handle_client(adapter)
+    finally:
+        if not websocket.closed:
+            await websocket.close()
+
+    return websocket
+
+
 async def broadcast_stats():
     """
     Periodically broadcast server statistics to all clients
@@ -5143,7 +5475,14 @@ async def broadcast_stats():
                 })
                 
                 # Send to all connected clients
-                websockets.broadcast(connected_clients, message)
+                send_tasks = []
+                for client in list(connected_clients):
+                    send = getattr(client, 'send', None)
+                    if callable(send):
+                        send_tasks.append(send(message))
+
+                if send_tasks:
+                    await asyncio.gather(*send_tasks, return_exceptions=True)
     except Exception as e:
         logger.error(f"Error in broadcast_stats: {e}", exc_info=True)
 
@@ -5312,33 +5651,34 @@ async def capture_session_logs_background(session_id: str, pr_number: int):
 
 async def main():
     """
-    Start the WebSocket server
+    Start the backend server
     """
-    logger.info(f"Starting WebSocket server on {HOST}:{PORT}")
+    logger.info(f"Starting backend server on {HOST}:{PORT}")
     logger.info(f"Frame saving: {'enabled' if SAVE_FRAMES else 'disabled'}")
     logger.info(f"GitHub issue creation: {'enabled' if GITHUB_TOKEN else 'disabled'}")
-    
-    # Start server with increased message size limit (20MB to handle large base64 images)
-    # Default is 1MB which may be too small for high-quality photos
-    async with websockets.serve(
-        handle_client, 
-        HOST, 
-        PORT,
-        max_size=20 * 1024 * 1024,  # 20MB max message size
-        ping_interval=20,  # Send ping every 20 seconds
-        ping_timeout=10    # Wait 10 seconds for pong response
-    ):
-        logger.info("Server started successfully")
-        logger.info(f"Clients can connect to: wss://your-ngrok-link")
-        logger.info(f"Max message size: 20MB")
-        
-        # Start background tasks independently for resilience
-        asyncio.create_task(broadcast_stats())
-        asyncio.create_task(monitor_text_pause())
-        # Background Copilot monitoring disabled - we poll specific PRs when user comments with @copilot
-        
-        # Keep server running
-        await asyncio.Future()  # Run forever
+
+    app = web.Application(client_max_size=20 * 1024 * 1024)
+    app.router.add_get('/', websocket_handler)
+    app.router.add_get('/ws', websocket_handler)
+    app.router.add_post('/test-door-recognition', test_door_recognition)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+
+    logger.info("Server started successfully")
+    logger.info(f"Clients can connect to: wss://your-ngrok-link")
+    logger.info("Test endpoint: POST /test-door-recognition")
+    logger.info(f"Max message size: 20MB")
+
+    # Start background tasks independently for resilience
+    asyncio.create_task(broadcast_stats())
+    asyncio.create_task(monitor_text_pause())
+    # Background Copilot monitoring disabled - we poll specific PRs when user comments with @copilot
+
+    # Keep server running
+    await asyncio.Future()  # Run forever
 
 
 if __name__ == "__main__":

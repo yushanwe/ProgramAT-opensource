@@ -1,45 +1,40 @@
-"""
-Shared LiteLLM helper utilities for backend modules.
-"""
-
-import os
 import base64
 import io
+import os
 from PIL import Image
 
 
-def resolve_model_name(model_name: str, default_model: str = 'gemini-2.5-flash-lite') -> str:
-    """Normalize model names for LiteLLM provider routing."""
+def resolve_model_name(model_name: str = "", default_model: str = "gemini-2.5-flash-lite") -> str:
+    """Backward-compatible LiteLLM model-name normalizer.
 
+    New code should call model_router.llm_call and let semantic routing choose
+    the model. This helper remains so older generated tools that import it do
+    not fail at import time.
+    """
     raw = (model_name or default_model).strip()
-
-    # Already fully qualified provider/model
-    known_providers = [
-        'openrouter/',
-        'gemini/',
-        'openai/',
-        'anthropic/',
-        'ollama/',
-        'groq/',
-        'vertex_ai/',
-    ]
-
-    if any(raw.startswith(p) for p in known_providers):
+    known_prefixes = (
+        "openrouter/",
+        "gemini/",
+        "openai/",
+        "anthropic/",
+        "ollama/",
+        "groq/",
+        "mistral/",
+        "vertex_ai/",
+    )
+    if raw.startswith(known_prefixes):
         return raw
-
-    # Gemini shorthand
-    if raw.startswith('gemini'):
-        return f'gemini/{raw}'
-
-    # Claude shorthand
-    if raw.startswith('claude'):
-        return f'anthropic/{raw}'
-
+    if raw.startswith("gemini"):
+        return f"gemini/{raw}"
+    if raw.startswith("claude"):
+        return f"anthropic/{raw}"
+    if raw.startswith("gpt"):
+        return f"openai/{raw}"
     return raw
 
 
-def resolve_api_key(model_name: str, explicit_api_key: str = '') -> str:
-    """Pick the matching provider API key based on model name."""
+def resolve_api_key(model_name: str = "", explicit_api_key: str = "") -> str:
+    """Backward-compatible provider API key resolver for older tools."""
     if explicit_api_key:
         return explicit_api_key
 
@@ -56,8 +51,6 @@ def resolve_api_key(model_name: str, explicit_api_key: str = '') -> str:
     if normalized.startswith('openai'):
         return os.environ.get('OPENAI_API_KEY', '')
 
-    # Fallback: prefer OPENAI, then GEMINI
-    return os.environ.get('OPENAI_API_KEY', '') or os.environ.get('GEMINI_API_KEY', '')
 
     # Fallback: prefer OPENAI, then GEMINI
     return os.environ.get('OPENAI_API_KEY', '') or os.environ.get('GEMINI_API_KEY', '')
