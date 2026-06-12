@@ -31,14 +31,31 @@ The server uses environment variables for configuration:
 
 ### Required for AI-Powered Template Filling
 
-- `LLM_MODEL`: Optional model name used by LiteLLM (for example `gemini-3-flash-preview` or `openai/gpt-4o`). Change this to switch provider/model without code changes.
+- `ROUTING_MODE`: Optional model routing mode. Defaults to `semantic`, which compares the request against each model's `routes` in `model_profiles.yaml`. Legacy options are `fixed` and `score`.
 
-- Provider API keys: keep any provider keys you need in the environment, for example `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`.
+- Provider API keys: keep any provider keys you need in the environment, for example `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`.
   - If a provider-specific model is selected, ensure the corresponding provider API key is present.
+- Code-generation routing uses Groq's lightweight Llama profile by default, so keep `GROQ_API_KEY` set. Override defaults with `LLAMA_MODEL` or `LLAVA_MODEL`.
+- Local Ollama models remain optional. Set `OLLAMA_API_BASE` if you override a routed model to an Ollama model and your Ollama server is not at `http://localhost:11434`.
+
+### Semantic Model Routing
+
+The backend routes LLM calls directly to model profiles. Each profile declares what that model is good at:
+
+```yaml
+models:
+  gpt4o:
+    model: openai/gpt-4o
+    description: Vision-first multimodal model for image understanding.
+    routes:
+      - answer questions about an image
+      - describe a camera frame or scene
+```
+
+Add or edit `routes` under a model to change when that model is selected. Product code should call `llm_call(...)` and let the router pick the model.
 
 ### Optional
 
-- `GEMINI_MODEL`: (legacy) Gemini model name used as a fallback if `LLM_MODEL` isn't set (default: `gemini-3-flash-preview`)
 - `HOST`: Server host (default: `0.0.0.0`)
 - `PORT`: Server port (default: `8081`)
 - `PAUSE_DURATION`: Seconds to wait before creating issue (default: `5.0`)
@@ -55,7 +72,6 @@ python stream_server.py
 
 ```bash
 export GITHUB_TOKEN="your_github_token_here"
-export LLM_MODEL="gemini-3-flash-preview"
 export GEMINI_API_KEY="your_gemini_api_key_here"
 export OPENAI_API_KEY="your_openai_key_here"
 export GITHUB_REPO="owner/repo"
@@ -172,7 +188,7 @@ User: "I open the camera and click the photo button. I expected to take a photo 
 
 ## Security Notes
 
-- Never commit your `GITHUB_TOKEN` or any provider API key (for example `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) to source control
+- Never commit your `GITHUB_TOKEN` or any provider API key (for example `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`) to source control
 - Use environment variables or a secure secrets manager
 - The GitHub token should have minimal required permissions (only `repo` scope)
 - Provider API keys should be kept secure and rotated regularly

@@ -14,14 +14,14 @@ import {
   Alert,
   Switch,
   TextInput,
+  ActivityIndicator,
+  NativeModules,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Config, { AppMode } from './config';
 import WebSocketService from './WebSocketService';
-import { getModelPreference, setModelPreference } from './ModelPreference';
 import { useTheme } from './ThemeContext';
-import ModelPickerScreen from './ModelPickerScreen';
 
 const SERVER_URL_KEY = '@server_url';
 
@@ -37,26 +37,29 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
   const [serverUrl, setServerUrl] = useState('');
   const [currentServerUrl, setCurrentServerUrl] = useState(Config.WEBSOCKET_SERVER_URL);
 
-  // Mirror of ModelPreference for re-render. null = use server default.
-  const [selectedModel, setSelectedModel] = useState<string | null>(getModelPreference());
   const [serverDefaultModel, setServerDefaultModel] = useState<string>('');
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [showModelPicker, setShowModelPicker] = useState(false);
+
+  // Loading state for the Register Device button.
+  const [isRegistering, setIsRegistering] = useState(false);
+
+  // Meta / Ray-Ban (DAT) native iOS bridge. Only one-time device registration
+  // is exposed here; the live camera pipeline is driven from the Tools screen.
+  const { MetaWearablesModule } = NativeModules as {
+    MetaWearablesModule?: {
+      registerDevice?: () => void | Promise<void>;
+    };
+  };
 
   useEffect(() => {
     setIsConnected(WebSocketService.isConnected());
     setCurrentServerUrl(WebSocketService.getServerUrl());
     loadSavedServerUrl();
-    // Re-sync from ModelPreference in case it loaded after our initial render.
-    setSelectedModel(getModelPreference());
-
     const checkConnection = setInterval(() => {
       setIsConnected(WebSocketService.isConnected());
       setCurrentServerUrl(WebSocketService.getServerUrl());
       // Poll the service for the latest cached capabilities — picks up the
-      // server's reported default + preset list once the socket handshakes.
+      // server's routing status once the socket handshakes.
       setServerDefaultModel(WebSocketService.getDefaultModel());
-      setAvailableModels(WebSocketService.getAvailableModels());
     }, 1000);
 
     return () => clearInterval(checkConnection);
@@ -90,12 +93,6 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     await AsyncStorage.setItem(SERVER_URL_KEY, trimmed);
     Alert.alert('Server Saved', `Connecting to ${trimmed}...`, [{ text: 'OK' }]);
     WebSocketService.setServerUrl(trimmed, true);
-  };
-
-  // Single entry point: null clears the choice (use server default), a string picks it.
-  const applyModel = async (model: string | null) => {
-    setSelectedModel(model);
-    await setModelPreference(model);
   };
 
   const handleClearServerUrl = async () => {
@@ -205,17 +202,32 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     }
   };
 
-  if (showModelPicker) {
-    return (
-      <ModelPickerScreen
-        onBack={() => setShowModelPicker(false)}
-        selectedModel={selectedModel}
-        serverDefaultModel={serverDefaultModel}
-        availableModels={availableModels}
-        onSelect={applyModel}
-      />
-    );
-  }
+  // --- Meta / Ray-Ban device registration ---
+
+  // One-time setup: launches the Meta AI authorization flow so the paired
+  // Ray-Ban glasses become usable as a camera source. Registration state is
+  // persisted by the Meta SDK, so this normally only needs to run once.
+  const handleRegisterDevice = async () => {
+    try {
+      if (typeof MetaWearablesModule?.registerDevice !== 'function') {
+        throw new Error(
+          'Meta Ray-Ban registration is only available on iOS builds with the Meta DAT SDK.'
+        );
+      }
+      setIsRegistering(true);
+      await Promise.resolve(MetaWearablesModule.registerDevice());
+      Alert.alert(
+        'Register Device',
+        'Follow the Meta AI authorization prompts to finish registering your Ray-Ban glasses.'
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[Settings] Device registration failed:', message);
+      Alert.alert('Register Device', message);
+    } finally {
+      setIsRegistering(false);
+    }
+  };
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={['bottom']}>
@@ -454,32 +466,56 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
           <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">AI Model</Text>
 
           <Pressable
-            style={({ pressed }) => [
+            style={[
               styles.settingCard,
               styles.modelRow,
+              styles.disabledSettingCard,
               { backgroundColor: theme.card, borderColor: theme.border },
-              pressed && { opacity: 0.6 },
             ]}
-            onPress={() => setShowModelPicker(true)}
+            disabled={true}
             accessible={true}
             accessibilityRole="button"
-            accessibilityLabel="Choose AI model"
-            accessibilityHint="Double tap to open the model picker"
+            accessibilityLabel="AI model routing"
+            accessibilityHint="Models are selected automatically by semantic routing"
+            accessibilityState={{ disabled: true }}
             accessibilityValue={{
-              text: selectedModel ?? (serverDefaultModel ? `Server default (${serverDefaultModel})` : 'Server default'),
+              text: serverDefaultModel || 'Semantic routing',
             }}>
             <View style={styles.modelRowText}>
-              <Text style={[styles.settingLabel, { color: theme.text }]}>Active model</Text>
+              <Text style={[styles.settingLabel, { color: theme.text }]}>AI model routing</Text>
               <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
-                {selectedModel
-                  ? selectedModel
-                  : serverDefaultModel
-                    ? `Server default (${serverDefaultModel})`
-                    : 'Connect to see available models'}
+                {serverDefaultModel || 'Semantic routing chooses the model automatically'}
               </Text>
             </View>
-            <Text style={[styles.chevron, { color: theme.textSecondary }]}>›</Text>
+            <Text style={[styles.chevron, { color: theme.textSecondary }]}>Managed</Text>
           </Pressable>
+        </View>
+
+        {/* Meta Ray-Ban Section */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Meta Ray-Ban</Text>
+
+          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text style={[styles.settingDescription, styles.debugDescription, { color: theme.textSecondary }]}>
+              First-time setup only. Pair your glasses in the Meta AI app, then register them here to use Meta Ray-Ban as a camera source. You normally only need to do this once.
+            </Text>
+
+            <TouchableOpacity
+              style={[styles.debugButton, styles.debugButtonLast, { backgroundColor: theme.primary }]}
+              onPress={handleRegisterDevice}
+              disabled={isRegistering}
+              accessible={true}
+              accessibilityRole="button"
+              accessibilityLabel="Register device"
+              accessibilityHint="Starts the Meta AI authorization flow to register your Ray-Ban glasses"
+              accessibilityState={{ disabled: isRegistering }}>
+              {isRegistering ? (
+                <ActivityIndicator size="small" color="#fff" accessible={false} />
+              ) : (
+                <Text style={styles.debugButtonText}>Register Device</Text>
+              )}
+            </TouchableOpacity>
+          </View>
         </View>
 
         {/* App Info Section */}
@@ -770,6 +806,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  disabledSettingCard: {
+    opacity: 0.6,
+  },
   modelRowText: {
     flex: 1,
     marginRight: 12,
@@ -777,5 +816,23 @@ const styles = StyleSheet.create({
   chevron: {
     fontSize: 24,
     fontWeight: '400',
+  },
+  debugButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  debugButtonLast: {
+    marginBottom: 0,
+  },
+  debugButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  debugDescription: {
+    marginBottom: 12,
   },
 });
