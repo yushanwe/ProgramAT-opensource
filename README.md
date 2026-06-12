@@ -93,10 +93,12 @@ Use the table below as a quick reference for what each value does.
 
 | Variable                           | Required                       | Description                                                                                                                                       |
 | ---------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LLM_MODEL`                        | Optional                       | Model name used by LiteLLM. Update this in `backend/.env` to change which provider/model is active (falls back to `GEMINI_MODEL` if present).    |
-| `GEMINI_API_KEY`                   | Optional                       | Provider API key for Google Gemini. Keep provider keys in `.env` as needed: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`. |
-| `GROQ_API_KEY`                     | Optional                       | Provider API key for Groq. Set `LLM_MODEL` to e.g. `groq/llama-3.3-70b-versatile`. Free tier available, no credit card required.                 |
-| `MISTRAL_API_KEY`                  | Optional                       | Provider API key for Mistral AI. Set `LLM_MODEL` to e.g. `mistral/mistral-small-latest`. Free tier available.                                    |
+| `ROUTING_MODE`                     | Optional                       | Model routing mode. Defaults to `semantic`, which routes each request directly to the closest model profile in `backend/model_profiles.yaml`; legacy options are `fixed` and `score`. |
+| `GEMINI_API_KEY`                   | Optional                       | Provider API key for Google Gemini. Keep provider keys in `.env` as needed: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`. |
+| `GROQ_API_KEY`                     | For routed code tasks          | Provider API key for Groq. The default lightweight code-generation route uses `groq/llama-3.1-8b-instant`. Free tier available, no credit card required. |
+| `MISTRAL_API_KEY`                  | Optional                       | Provider API key for Mistral AI. Add Mistral models to `backend/model_profiles.yaml` if you want semantic routing to select them. Free tier available. |
+| `OLLAMA_API_BASE`                  | Optional                       | Local Ollama URL if you override a routed model to use Ollama. Defaults to `http://localhost:11434`. |
+| `LLAMA_MODEL` / `LLAVA_MODEL`      | Optional                       | Override routed model names. Defaults are `groq/llama-3.1-8b-instant` and `groq/meta-llama/llama-4-scout-17b-16e-instruct`. |
 | `GOOGLE_APPLICATION_CREDENTIALS`   | For OCR tools                  | Google Cloud Vision API credentials used by Live OCR                                                                                              |
 | `GITHUB_TOKEN`                     | For GitHub features            | GitHub personal access token with `repo` scope                                                                                                    |
 | `GITHUB_REPO`                      | Yes (to access your own tools) | Target repo in `owner/repo` format                                                                                                                |
@@ -134,7 +136,7 @@ Billing:
 3. Click **Create API Key**, give it a name, and click **Submit**.
 4. Copy the generated key immediately — you won't be able to see it again.
 5. Paste the key into `backend/.env` as `GROQ_API_KEY`.
-6. Set `LLM_MODEL` to a Groq-hosted model, e.g. `groq/llama-3.3-70b-versatile`.
+6. Add the Groq-hosted model to `backend/model_profiles.yaml` with `routes` that describe when it should be selected.
 
 #### Mistral API Key
 
@@ -143,7 +145,7 @@ Billing:
 3. Click **Create new key**, give it a name, and click **Create**.
 4. Copy the generated key immediately — you won't be able to see it again.
 5. Paste the key into `backend/.env` as `MISTRAL_API_KEY`.
-6. Set `LLM_MODEL` to a Mistral model, e.g. `mistral/mistral-small-latest` or `mistral/mistral-medium-latest`.
+6. Add the Mistral model to `backend/model_profiles.yaml` with `routes` that describe when it should be selected.
 
 #### Google Application Credentials
 
@@ -192,8 +194,9 @@ We provide instructions here for hosting from your personal machine. If you woul
    ```
 4. **Fill in the values in `backend/.env`**
 
-   - `LLM_MODEL`: model name used by LiteLLM (for example `gemini-3-flash-preview` or `openai/gpt-4o`). Change this to switch provider/model without modifying code.
-   - Provider API keys: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`
+   - `ROUTING_MODE`: model routing mode. Leave unset for semantic model routing, or set `fixed` / `score` to use the legacy routing behavior.
+   - Provider API keys: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`
+   - Model routing overrides: optional `LLAMA_MODEL`, `LLAVA_MODEL`, `OLLAMA_API_BASE`
    - `GITHUB_TOKEN`
    - `GITHUB_REPO`
    - `GOOGLE_APPLICATION_CREDENTIALS`
@@ -251,7 +254,7 @@ Since you are working from a fork of this repository, GitHub-related features ma
 
 1. **Select a Tool** — Navigate to the **Tools** tab, browse the available tools, and tap one to select it.
 2. **Run** — The Tool Runner opens with a live camera preview. Tap **Run** to execute the tool on single frames, or **Stream** to process frames continuously. Results are spoken aloud via TTS.
-3. **Chat** — After a tool run, tap **Chat** to ask follow-up questions about the result (powered by LiteLLM; change the active model with `LLM_MODEL` in `backend/.env`).
+3. **Chat** — After a tool run, tap **Chat** to ask follow-up questions about the result (powered by LiteLLM and semantic model routing).
 4. **Development mode** — Use the **PRs** tab to browse open pull requests, select one to load its tools, and send text updates to GitHub issues.
 5. **Tool creation** — To instead create a new tool, from development mode, select the "Create New Issue Instead" button in the PRs tab. Then, type or dictate the tool you would like to make into the text box, then submit. If more information is needed, the app will ask for it: in this case, dictate or type an answer to the request and resubmit, it will be appended to your initial request. Once the request is complete, the app will tell you it has made a new issue successfully. Copilot will automatically be assigned and create a relevant pull request. From there, wait for it to generate, and then run it as described in the earlier usage steps!
 
@@ -273,6 +276,61 @@ Since you are working from a fork of this repository, GitHub-related features ma
 - **Text-to-Speech feedback** — all tool results are spoken aloud automatically
 - **Rich audio output** — tools can return speech, beeps, haptic vibration, earcons, and more via the AudioOutputService
 - **Speech-to-Text input** — voice input for follow-up questions using `@react-native-voice/voice` and OS-level dictation
+
+## Meta Ray-Ban Integration (iOS)
+
+ProgramAT can use **Meta Ray-Ban** glasses as a camera source instead of the phone
+camera. Streaming tools use the glasses' live frames and take-photo tools use a
+captured frame; results are spoken back through the same audio path as the phone
+camera. This integration is **iOS-only** and built on Meta's Device Access Toolkit
+(DAT).
+
+### Setup (developers)
+
+- **SDK** — The Meta Wearables DAT SDK is added as a Swift Package
+  (`https://github.com/facebook/meta-wearables-dat-ios`), providing the `MWDATCore`
+  and `MWDATCamera` modules. Xcode resolves it automatically on build via
+  `ProgramATApp.xcworkspace`.
+- **Info.plist** — The `ios/ProgramATApp/Info.plist` must contain:
+  - An `MWDAT` dictionary with your `MetaAppID`, `ClientToken`, `TeamID`,
+    `AppLinkURLScheme`, and `DAMEnabled` — obtained when you register your app in the
+    Meta developer console (DAT).
+  - A matching `CFBundleURLSchemes` entry for the `AppLinkURLScheme` (so Meta AI can
+    redirect back to the app after authorization).
+  - `NSCameraUsageDescription` and `NSBluetoothAlwaysUsageDescription` permission
+    strings.
+- **Build** — Start Metro and the backend as usual (see *Running the Application*).
+  Native module changes require a full `npm run ios` rebuild, not just a Metro
+  reload.
+
+### First-time setup (users)
+
+1. Install the **Meta AI** app and pair your Meta Ray-Ban glasses with it.
+2. Open **ProgramAT** and go to the **Settings** tab.
+3. Tap **Register Device** and complete the Meta AI authorization flow.
+4. Grant the requested camera and Bluetooth permissions.
+
+Registration is a one-time step — its state is persisted by the Meta SDK, so you do
+not need to register again when switching tools or camera sources.
+
+### Normal usage
+
+1. Open the **Tools** tab and select a tool.
+2. In the camera view, choose **Phone** or **Ray-Ban** as the camera source.
+3. Use the tool normally:
+   - Streaming tools use live Ray-Ban frames.
+   - Take-photo tools use a captured Ray-Ban frame.
+   - Results are spoken back through the existing audio output path.
+
+### Stopping / switching
+
+- Press **Stop** before switching tools or camera sources.
+- Leaving the Tool Runner (Back to Tools, or switching tabs) also stops the active
+  stream and releases the Ray-Ban session automatically.
+- Switching tools or sources does **not** require re-registration.
+
+> **Re-registration** is only needed if you unpair the glasses in Meta AI, reinstall
+> the app, or the Meta authorization is revoked or expires.
 
 ## Usage Modes
 
@@ -402,7 +460,7 @@ For iOS:
 ### Backend
 
 - **Python 3.11** with async `websockets`
-- **LiteLLM (configurable providers)** — Model runtime used for AI parsing, scene description, and clothing recognition. LiteLLM can route requests to provider backends such as Google Gemini, OpenAI, Anthropic, Groq, or Mistral; switch the active model via `LLM_MODEL` in `backend/.env`.
+- **LiteLLM (configurable providers)** — Model runtime used for AI parsing, scene description, and clothing recognition. The backend selects among model profiles with semantic routing by default; edit `backend/model_profiles.yaml` to describe which tasks each model should handle.
 - **Google Cloud Vision API** — OCR
 - **Ultralytics (YOLOv11 / YOLOWorld)** — Object detection
 - **OpenCV / NumPy / Pillow** — Image processing
