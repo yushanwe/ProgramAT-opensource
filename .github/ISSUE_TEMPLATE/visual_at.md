@@ -21,7 +21,7 @@ assignees: ''
 
 **Implementation details**
 <!-- Any particular models or libraries that should be employed -->
-If not specified otherwise above, tools for object detection should either utilize Yolo11 and COCO or YoloWorld, based on the conditions described in the copilot instructions. Tools involving text extraction should utilize the Google Cloud Vision API. 
+Assume each generated tool implements one user-facing task. Do not plan subtasks or chain multiple model calls unless the user explicitly asks for that. For any LLM or VLM operation, generated tools must call the existing backend model router through the existing client with `from model_router_client import llm_call`. Choose the single nearest task category for `llm_call(task_category=...)`: `simple_parsing`, `object_detection`, `object_localization`, `ocr`, `visual_understanding`, `visual_reasoning`, `navigation`, `summarization`, `code_generation`, or `general_reasoning`. Do not implement detection, OCR, VLM, LLM, model loading, or provider calls inside generated tool files. Generated tools must not implement model routing, create routers, create capability registries, create detector/OCR/LLM wrappers, create new model-router clients, choose provider/model names, resolve API keys, define provider-specific `DEFAULT_MODEL` constants, define `COCO_CLASSES`, search for model files, load `.pt` files, import provider SDKs, import detector libraries, call `YOLO(...)`, or call `litellm.completion()` directly.
 
 **Alternatives Considered**
 <!-- Describe any alternative solutions or features you've considered. -->
@@ -29,11 +29,11 @@ If not specified otherwise above, tools for object detection should either utili
 **Example usage**
 <!-- Describe an example situation the tool would be used in and how it could work -->
 
-**Custom GPT**
-<!-- Should this tool, in live mode, leverage Gemini live and work basically as a custom GPT without the need to ask again?-->
+**Live Mode**
+<!-- Should this tool, in live mode, use the backend-managed live multimodal mode without the need to ask again?-->
 
-**GPT Query**
-<!-- If custom GPT, what is the query to be reasked every few seconds. Otherwise leave empty-->
+**Live Query**
+<!-- If live mode is enabled, what is the query to be reasked every few seconds. Otherwise leave empty-->
 
 **Additional Context**
 <!-- Add any other context or screenshots about the feature request here. -->
