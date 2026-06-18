@@ -1,9 +1,8 @@
-"""Tests for semantic model routing."""
+"""Tests for the semantic capability router."""
 
-import unittest
 from pathlib import Path
 import sys
-from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -11,187 +10,643 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import model_router
 
 
-class TestSemanticModelRouter(unittest.TestCase):
-    def setUp(self):
-        self.original_mode = model_router.ROUTING_MODE
-        model_router.ROUTING_MODE = "semantic"
+class TestSemanticCapabilityRouter(unittest.TestCase):
+    def test_loads_profiles_and_capabilities_from_yaml(self):
+        capabilities = model_router.load_capability_descriptions()
+        profiles = model_router.load_model_profiles()
+        raw = model_router._load_yaml(model_router.CAPABILITY_PROFILES_PATH)["capabilities"]
 
-    def tearDown(self):
-        model_router.ROUTING_MODE = self.original_mode
+        self.assertIn("object_detection", capabilities)
+        self.assertIn("ocr", capabilities)
+        self.assertIsInstance(raw["ocr"], dict)
+        self.assertIn("description", raw["ocr"])
+        self.assertIn("include_examples", raw["ocr"])
+        self.assertIn("exclude_examples", raw["ocr"])
+        self.assertTrue(len(capabilities["map_web"]) >= 3)
+        self.assertIn("YOLO-World", {profile.name for profile in profiles})
+        self.assertIn("GoogleVisionOCR", {profile.name for profile in profiles})
 
-    def test_routes_visual_requests_directly_to_vision_model(self):
-        route = model_router.get_route_info(
-            "image_analysis",
-            {"route_text": "answer a user's follow-up question about an image from the camera frame"},
+    def test_benchmark_profiles_use_benchmark_max_scaling(self):
+        profiles = {profile.name: profile for profile in model_router.load_model_profiles()}
+
+        self.assertEqual(profiles["LLaVA-OneVision-7B"].capabilities["general_reasoning"], 0.619)
+        self.assertEqual(profiles["Qwen2.5-VL-7B"].capabilities["general_reasoning"], 0.641)
+        self.assertEqual(profiles["Gemini-2.5-pro"].capabilities["general_reasoning"], 0.736)
+
+    def test_compute_capability_weights_uses_general_reasoning_fallback(self):
+        weights = model_router.compute_capability_weights("Locate a specific item in the scene.")
+
+        self.assertEqual(weights, {"general_reasoning": 1.0})
+
+    def test_compute_capability_weights_uses_first_capability_if_general_missing(self):
+        descriptions = {
+            "ocr": ["Read text from images"],
+            "object_detection": ["Detect objects"],
+        }
+        weights = model_router.compute_capability_weights("Read label", descriptions)
+
+        self.assertEqual(weights, {"ocr": 1.0})
+
+    def test_rank_models_prefers_routing_analysis_over_fallback(self):
+        profiles = [
+            model_router.ModelProfile("ocr_model", "general_vlm", 1000, "test", {"ocr": 0.95, "general_reasoning": 0.1}, latency=0.6),
+            model_router.ModelProfile("general_model", "general_vlm", 1000, "test", {"ocr": 0.1, "general_reasoning": 0.95}, latency=0.6),
+        ]
+        routing_analysis = {
+            "tasks": [{"name": "ocr", "weight": 1.0, "reason": "Read text"}],
+            "latency_sensitivity": {"level": "medium", "weight": 0.5, "reason": ""},
+        }
+
+        result = model_router.rank_models("Read this label.", profiles, routing_analysis=routing_analysis)
+
+        self.assertEqual(result["selected_model"], "ocr_model")
+
+    def test_score_model_treats_missing_capabilities_as_zero(self):
+        profile = model_router.ModelProfile(
+            name="narrow",
+            type="specialized_expert",
+            latency_ms=100,
+            source="test",
+            capabilities={"object_detection": 1.0},
         )
 
-        self.assertEqual(route["selected_profile"], "gpt4o")
+        score = model_router.score_model(profile, {"object_detection": 0.4, "ocr": 0.6})
 
-    def test_routes_code_requests_directly_to_coding_model(self):
-        route = model_router.get_route_info(
-            "code_generation",
-            {"route_text": "generate Python code for a new assistive technology tool and fix failing tests"},
+        self.assertEqual(score, 0.4)
+
+    def test_rank_models_prefers_quality_before_latency(self):
+        descriptions = {"ocr": ["Read text from an image."]}
+        profiles = [
+            model_router.ModelProfile("strong_ocr", "general_vlm", 1000, "test", {"ocr": 1.0}),
+            model_router.ModelProfile("weak_fast_ocr", "general_vlm", 10, "test", {"ocr": 0.7}),
+        ]
+
+        result = model_router.rank_models("Read text from an image.", profiles, descriptions)
+
+        self.assertEqual(result["selected_model"], "strong_ocr")
+        self.assertGreater(result["selected"]["capability_score"], 0)
+
+    def test_rank_models_uses_latency_when_capability_is_equal(self):
+        descriptions = {"ocr": ["Read text from an image."]}
+        profiles = [
+            model_router.ModelProfile("slow_ocr", "general_vlm", 2000, "test", {"ocr": 0.9}),
+            model_router.ModelProfile("fast_ocr", "general_vlm", 100, "test", {"ocr": 0.9}),
+        ]
+
+        result = model_router.rank_models("Read text from an image.", profiles, descriptions)
+
+        self.assertEqual(result["selected_model"], "fast_ocr")
+
+    def test_rank_models_prefers_fast_model_when_latency_is_high(self):
+        profiles = [
+            model_router.ModelProfile(
+                "accurate_but_slow",
+                "general_vlm",
+                2500,
+                "test",
+                {"ocr": 0.95, "general_reasoning": 0.95},
+                latency=0.3,
+            ),
+            model_router.ModelProfile(
+                "balanced_fast",
+                "general_vlm",
+                600,
+                "test",
+                {"ocr": 0.85, "general_reasoning": 0.8},
+                latency=0.9,
+            ),
+        ]
+        routing_analysis = {
+            "tasks": [
+                {"name": "ocr", "weight": 0.6, "reason": "Read text."},
+                {"name": "general_reasoning", "weight": 0.4, "reason": "Explain clearly."},
+            ],
+            "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": "Live feedback."},
+        }
+
+        result = model_router.rank_models("Read this label quickly.", profiles, routing_analysis=routing_analysis)
+
+        self.assertEqual(result["selected_model"], "balanced_fast")
+        self.assertIsNotNone(result.get("routing_analysis"))
+
+    def test_pipeline_analysis_false_keeps_single_model_plan(self):
+        profiles = [
+            model_router.ModelProfile(
+                "general_model",
+                "general_vlm",
+                1000,
+                "test",
+                {"general_reasoning": 0.9, "object_detection": 0.8},
+                latency=0.7,
+            ),
+            model_router.ModelProfile(
+                "detector",
+                "specialized_expert",
+                80,
+                "test",
+                {"object_detection": 1.0, "general_reasoning": 0.0},
+                latency=0.98,
+            ),
+        ]
+        routing_analysis = {
+            "tasks": [
+                {"name": "general_reasoning", "weight": 0.7, "reason": "Holistic scene summary."},
+                {"name": "object_detection", "weight": 0.3, "reason": "Notice key objects."},
+            ],
+            "latency_sensitivity": {"level": "medium", "weight": 0.5, "reason": ""},
+        }
+        pipeline_analysis = {
+            "should_chain": False,
+            "reason": "The later model would still need the full image.",
+            "stages": [],
+        }
+
+        result = model_router.rank_models(
+            "Describe this room and mention important objects.",
+            profiles,
+            routing_analysis=routing_analysis,
+            pipeline_analysis=pipeline_analysis,
         )
 
-        self.assertEqual(route["selected_profile"], "llama")
-        self.assertEqual(route["selected_model"], "groq/llama-3.1-8b-instant")
+        self.assertEqual(result["selected_model"], "general_model")
+        self.assertFalse(result["pipeline_analysis"]["should_chain"])
+        self.assertEqual(result["stage_model_selection"], [])
+        self.assertEqual(result["final_execution_plan"]["mode"], "single_model")
 
-    def test_routes_text_json_requests_directly_to_fast_lite_model(self):
-        route = model_router.get_route_info(
-            "text_parse",
-            {"route_text": "parse a voice transcript into structured JSON fields for an issue"},
-        )
-
-        self.assertEqual(route["selected_profile"], "gemini_flash_lite")
-        self.assertEqual(route["selected_model"], "gemini/gemini-2.5-flash-lite")
-
-    def test_routes_summaries_directly_to_fast_lite_model(self):
-        route = model_router.get_route_info(
-            "summarization",
-            {"route_text": "summarize Copilot logs concisely for text to speech"},
-        )
-
-        self.assertEqual(route["selected_profile"], "gemini_flash_lite")
-
-    def test_routes_new_task_categories(self):
-        simple_route = model_router.get_route_info(
-            "simple_parsing",
-            {"route_text": "classify a short command and extract fields"},
-        )
-        ocr_route = model_router.get_route_info(
-            "OCR",
-            {"route_text": "read text from a sign in the camera frame"},
-        )
-        detection_route = model_router.get_route_info(
-            "object_detection",
-            {"labels": ["car"], "route_text": "detect cars with bounding boxes"},
-        )
-        world_route = model_router.get_route_info(
-            "object_localization",
-            {"labels": ["door handle"], "route_text": "localize a door handle"},
-        )
-        visual_reasoning_route = model_router.get_route_info(
-            "visual_reasoning",
-            {"route_text": "reason about the spatial layout of objects in an image"},
-        )
-
-        self.assertEqual(simple_route["task_category"], "simple_parsing")
-        self.assertEqual(simple_route["selected_profile"], "gemini_flash_lite")
-        self.assertEqual(ocr_route["task_category"], "ocr")
-        self.assertEqual(ocr_route["selected_profile"], "google_vision_ocr")
-        self.assertEqual(detection_route["selected_profile"], "yolo11_detector")
-        self.assertEqual(world_route["selected_profile"], "yolo_world_detector")
-        self.assertEqual(visual_reasoning_route["task_category"], "visual_reasoning")
-        self.assertEqual(visual_reasoning_route["selected_profile"], "gpt4o")
-
-    def test_llm_call_accepts_task_alias(self):
-        fake_litellm = SimpleNamespace()
-
-        with patch.object(model_router, "LITELLM_AVAILABLE", True), \
-             patch.object(model_router, "litellm", fake_litellm), \
-             patch.object(fake_litellm, "completion", return_value={"choices": []}, create=True) as completion:
-            model_router.llm_call(
-                task="visual_understanding",
-                messages=[{"role": "user", "content": "Describe the clothing."}],
-                metadata={
-                    "tool_name": "clothing_recognition",
-                    "route_text": "identify clothing in a camera frame",
+    def test_pipeline_analysis_true_selects_model_per_stage(self):
+        profiles = [
+            model_router.ModelProfile(
+                "general_navigation",
+                "general_vlm",
+                1200,
+                "test",
+                {"navigation": 0.9, "object_detection": 0.2},
+                latency=0.7,
+            ),
+            model_router.ModelProfile(
+                "fast_detector",
+                "specialized_expert",
+                80,
+                "test",
+                {"object_detection": 1.0, "navigation": 0.0},
+                latency=0.98,
+            ),
+            model_router.ModelProfile(
+                "weak_allrounder",
+                "general_vlm",
+                300,
+                "test",
+                {"object_detection": 0.4, "navigation": 0.4},
+                latency=0.9,
+            ),
+        ]
+        routing_analysis = {
+            "tasks": [
+                {"name": "object_detection", "weight": 0.5, "reason": "Find the door."},
+                {"name": "navigation", "weight": 0.5, "reason": "Guide the user to it."},
+            ],
+            "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": "Live guidance."},
+        }
+        pipeline_analysis = {
+            "should_chain": True,
+            "reason": "A door bounding box reduces navigation work.",
+            "stages": [
+                {
+                    "capability": "object_detection",
+                    "purpose": "Find the door.",
+                    "input": "Full image.",
+                    "output": "Door bounding box.",
+                    "preferred_model_type": "fast_detector",
                 },
-            )
-
-        self.assertEqual(completion.call_args.kwargs["model"], "openai/gpt-4o")
-
-    def test_llm_call_encodes_numpy_ndarray_image(self):
-        try:
-            import numpy as np
-        except ImportError:
-            self.skipTest("numpy is not installed")
-
-        fake_litellm = SimpleNamespace()
-        image = np.zeros((2, 2, 3), dtype=np.uint8)
-        image[0, 0] = [255, 0, 0]
-
-        with patch.object(model_router, "LITELLM_AVAILABLE", True), \
-             patch.object(model_router, "litellm", fake_litellm), \
-             patch.object(fake_litellm, "completion", return_value={"choices": []}, create=True) as completion:
-            model_router.llm_call(
-                task_category="visual_understanding",
-                messages=[{"role": "user", "content": "Describe this image."}],
-                images=[image],
-                metadata={
-                    "tool_name": "ndarray_image_test",
-                    "route_text": "describe a camera frame",
+                {
+                    "capability": "navigation",
+                    "purpose": "Guide the user to the detected door.",
+                    "input": "Door bounding box and current frame.",
+                    "output": "Movement guidance.",
+                    "preferred_model_type": "reasoning_vlm",
                 },
-            )
+            ],
+        }
 
-        content = completion.call_args.kwargs["messages"][-1]["content"]
-        image_part = next(part for part in content if part.get("type") == "image_url")
-        self.assertTrue(image_part["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        result = model_router.rank_models(
+            "Find the door and guide me there.",
+            profiles,
+            routing_analysis=routing_analysis,
+            pipeline_analysis=pipeline_analysis,
+        )
 
-    def test_llm_call_falls_back_from_non_llm_backend(self):
-        fake_litellm = SimpleNamespace()
+        self.assertIsNone(result["selected_model"])
+        self.assertTrue(result["pipeline_analysis"]["should_chain"])
+        self.assertEqual(result["final_execution_plan"]["mode"], "pipeline")
+        self.assertEqual(
+            [stage["selected_model"] for stage in result["stage_model_selection"]],
+            ["fast_detector", "general_navigation"],
+        )
 
-        with patch.object(model_router, "LITELLM_AVAILABLE", True), \
-             patch.object(model_router, "litellm", fake_litellm), \
-             patch.object(fake_litellm, "completion", return_value={"choices": []}, create=True) as completion:
-            model_router.llm_call(
-                task="ocr",
-                messages=[{"role": "user", "content": "Clean up OCR text."}],
-                metadata={"tool_name": "ocr_cleanup"},
-            )
-
-        self.assertEqual(completion.call_args.kwargs["model"], "gemini/gemini-2.5-flash-lite")
-
-    def test_vision_call_routes_images_to_llm_call(self):
-        with patch.object(model_router, "llm_call", return_value={"choices": []}) as llm_call:
-            model_router.vision_call(
-                task="visual_reasoning",
-                image="abc123",
-                prompt="Find the correct vehicle.",
-                metadata={"tool_name": "uber_finder"},
-            )
-
-        self.assertEqual(llm_call.call_args.kwargs["task"], "visual_reasoning")
-        self.assertEqual(llm_call.call_args.kwargs["images"], ["abc123"])
-
-    def test_detect_objects_routes_to_detector_backend(self):
-        with patch.object(model_router, "_run_ultralytics_detector", return_value=[]) as run_detector:
-            result = model_router.detect_objects(
-                task="object_detection",
-                image=object(),
-                labels=["car"],
-                metadata={"tool_name": "car_counter"},
-            )
-
-        self.assertEqual(result, [])
-        self.assertEqual(run_detector.call_args.kwargs["model_name"], "local/yolo11n.pt")
-
-    def test_unknown_category_reports_fallback_model(self):
-        original_min_score = model_router.ROUTING_MIN_SCORE
-        model_router.ROUTING_MIN_SCORE = 1.0
-        try:
-            route = model_router.get_route_info(
-                "unknown_category",
-                {"route_text": "something unrelated"},
-            )
-        finally:
-            model_router.ROUTING_MIN_SCORE = original_min_score
-
-        self.assertEqual(route["fallback_profile"], "gemini_flash")
-        self.assertEqual(route["fallback_model"], "gemini/gemini-3-flash-preview")
-        self.assertIsNotNone(route["fallback_reason"])
-
-    def test_explicit_model_override_still_wins(self):
-        route = model_router.get_route_info(
-            "image_analysis",
+    def test_pipeline_analysis_requires_two_valid_stages(self):
+        result = model_router.normalize_pipeline_analysis(
             {
-                "requested_model": "groq/meta-llama/llama-4-scout-17b-16e-instruct",
-                "route_text": "answer a visual question about an image",
+                "should_chain": True,
+                "reason": "Only one valid stage was provided.",
+                "stages": [
+                    {"capability": "object_detection", "purpose": "Find objects."},
+                    {"capability": "unknown", "purpose": "Invalid."},
+                ],
             },
+            supported_capabilities=["object_detection", "navigation"],
         )
 
-        self.assertEqual(route["selected_profile"], "llava")
-        self.assertEqual(route["selected_model"], "groq/meta-llama/llama-4-scout-17b-16e-instruct")
+        self.assertFalse(result["should_chain"])
+        self.assertEqual(result["stages"], [])
+
+    def test_information_reduction_infers_find_then_guide_pipeline(self):
+        profiles = [
+            model_router.ModelProfile(
+                "navigator",
+                "general_vlm",
+                1000,
+                "test",
+                {"navigation": 0.9, "object_detection": 0.1},
+                latency=0.7,
+            ),
+            model_router.ModelProfile(
+                "detector",
+                "specialized_expert",
+                80,
+                "test",
+                {"object_detection": 1.0, "navigation": 0.0},
+                latency=0.98,
+            ),
+        ]
+        routing_analysis = {
+            "tasks": [{"name": "navigation", "weight": 1.0, "reason": "Guide to elevator."}],
+            "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": "Live navigation."},
+        }
+        pipeline_analysis = {
+            "should_chain": False,
+            "reason": "A single VLM can do it.",
+            "stages": [],
+        }
+
+        result = model_router.rank_models(
+            "Find the elevator and guide me to it.",
+            profiles,
+            {"object_detection": ["Detect objects"], "navigation": ["Navigate"]},
+            routing_analysis=routing_analysis,
+            pipeline_analysis=pipeline_analysis,
+        )
+
+        self.assertTrue(result["pipeline_analysis"]["should_chain"])
+        self.assertEqual(result["final_execution_plan"]["mode"], "pipeline")
+        self.assertEqual(
+            [stage["capability"] for stage in result["pipeline_analysis"]["stages"]],
+            ["object_detection", "navigation"],
+        )
+
+    def test_information_reduction_infers_bus_entrance_pipeline(self):
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Identify the correct bus and tell me where the entrance is.",
+            {
+                "tasks": [
+                    {"name": "map_web", "weight": 0.6, "reason": "Identify correct bus."},
+                    {"name": "object_detection", "weight": 0.4, "reason": "Find entrance."},
+                ],
+                "latency_sensitivity": {"level": "high", "weight": 0.8, "reason": ""},
+            },
+            {"should_chain": False, "reason": "Too conservative.", "stages": []},
+            ["object_detection", "map_web", "spatial_relationship"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(result["stages"][0]["capability"], "object_detection")
+        self.assertEqual(result["stages"][1]["capability"], "map_web")
+
+    def test_information_reduction_infers_parent_object_localization_pipeline(self):
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Find the passenger-side door handle.",
+            {
+                "tasks": [
+                    {"name": "object_detection", "weight": 0.7, "reason": "Find handle."},
+                    {"name": "general_reasoning", "weight": 0.3, "reason": "Reason about passenger side."},
+                ],
+                "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": ""},
+            },
+            {"should_chain": False, "reason": "Too conservative.", "stages": []},
+            ["object_detection", "spatial_relationship", "general_reasoning"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(
+            [stage["capability"] for stage in result["stages"]],
+            ["object_detection", "general_reasoning"],
+        )
+
+    def test_information_flow_camera_guidance_uses_detection_then_camera_motion(self):
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Guide my camera toward the target.",
+            {
+                "tasks": [
+                    {"name": "navigation", "weight": 0.7, "reason": "guidance toward target"},
+                    {"name": "camera_motion", "weight": 0.3, "reason": "camera movement guidance"},
+                ],
+                "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": "live guidance"},
+            },
+            {"should_chain": False, "reason": "Too conservative.", "stages": []},
+            ["object_detection", "navigation", "camera_motion", "spatial_relationship"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(
+            [stage["capability"] for stage in result["stages"]],
+            ["object_detection", "camera_motion"],
+        )
+
+    def test_information_flow_find_then_guide_prefers_navigation_not_camera_motion(self):
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Find the elevator and guide me to it.",
+            {
+                "tasks": [
+                    {"name": "navigation", "weight": 0.7, "reason": "wayfinding guidance"},
+                    {"name": "camera_motion", "weight": 0.3, "reason": "camera alignment"},
+                ],
+                "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": "live guidance"},
+            },
+            {"should_chain": False, "reason": "Too conservative.", "stages": []},
+            ["object_detection", "navigation", "camera_motion"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(
+            [stage["capability"] for stage in result["stages"]],
+            ["object_detection", "navigation"],
+        )
+
+    def test_pipeline_normalization_uses_complexity_penalty_without_stage_cap(self):
+        result = model_router.normalize_pipeline_analysis(
+            {
+                "should_chain": True,
+                "reason": "Multiple useful waypoints preserve artifact flow.",
+                "artifact_value_score": 1.0,
+                "information_reduction": "significant",
+                "stages": [
+                    {"capability": "object_detection", "purpose": "Find the office.", "input": "scene", "output": "office bbox"},
+                    {"capability": "spatial_relationship", "purpose": "Locate stairs near office.", "input": "office bbox", "output": "stairs waypoint"},
+                    {"capability": "navigation", "purpose": "Guide to stairs.", "input": "stairs waypoint", "output": "stairs route"},
+                    {"capability": "object_detection", "purpose": "Find the exit.", "input": "new scene", "output": "exit bbox"},
+                    {"capability": "navigation", "purpose": "Guide to Uber pickup.", "input": "exit waypoint", "output": "pickup route"},
+                ],
+            },
+            supported_capabilities=["object_detection", "spatial_relationship", "navigation"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(result["stage_count"], 5)
+        self.assertGreater(result["complexity_penalty"], 0)
+        self.assertGreater(result["pipeline_score"], 0)
+
+    def test_information_reduction_rejects_simple_ocr_extra_reasoning_stage(self):
+        original = model_router.normalize_pipeline_analysis(
+            {
+                "should_chain": True,
+                "reason": "Over-eager OCR plus reasoning.",
+                "artifact_value_score": 0.8,
+                "information_reduction": "moderate",
+                "stages": [
+                    {"capability": "ocr", "purpose": "Read label.", "input": "image", "output": "text"},
+                    {"capability": "general_reasoning", "purpose": "Restate text.", "input": "text", "output": "answer"},
+                ],
+            },
+            supported_capabilities=["ocr", "general_reasoning"],
+        )
+
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Read the medication bottle label.",
+            {
+                "tasks": [
+                    {"name": "ocr", "weight": 0.8, "reason": "Read label."},
+                    {"name": "general_reasoning", "weight": 0.2, "reason": "Answer user."},
+                ],
+                "latency_sensitivity": {"level": "medium", "weight": 1.0, "reason": ""},
+            },
+            original,
+            ["ocr", "general_reasoning"],
+        )
+
+        self.assertFalse(result["should_chain"])
+
+    def test_information_reduction_rejects_holistic_chart_pipeline(self):
+        original = model_router.normalize_pipeline_analysis(
+            {
+                "should_chain": True,
+                "reason": "Over-eager chart pipeline.",
+                "artifact_value_score": 0.8,
+                "information_reduction": "moderate",
+                "stages": [
+                    {"capability": "ocr", "purpose": "Read chart labels.", "input": "chart", "output": "text"},
+                    {"capability": "map_web", "purpose": "Interpret chart.", "input": "text", "output": "answer"},
+                ],
+            },
+            supported_capabilities=["ocr", "map_web"],
+        )
+
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Interpret a weather chart.",
+            {
+                "tasks": [
+                    {"name": "ocr", "weight": 0.2, "reason": "Read labels."},
+                    {"name": "map_web", "weight": 0.8, "reason": "Interpret chart."},
+                ],
+                "latency_sensitivity": {"level": "medium", "weight": 1.0, "reason": ""},
+            },
+            original,
+            ["ocr", "map_web"],
+        )
+
+        self.assertFalse(result["should_chain"])
+
+    def test_information_reduction_preserves_good_three_stage_bus_plan(self):
+        original = model_router.normalize_pipeline_analysis(
+            {
+                "should_chain": True,
+                "reason": "Bus detection, entrance localization, and guidance each preserve a useful artifact.",
+                "artifact_value_score": 0.95,
+                "information_reduction": "significant",
+                "stages": [
+                    {"capability": "object_detection", "purpose": "Find the correct bus.", "input": "scene", "output": "bus bbox"},
+                    {"capability": "spatial_relationship", "purpose": "Locate entrance relative to bus.", "input": "bus bbox", "output": "entrance waypoint"},
+                    {"capability": "navigation", "purpose": "Guide user to entrance.", "input": "entrance waypoint", "output": "movement guidance"},
+                ],
+            },
+            supported_capabilities=["object_detection", "spatial_relationship", "navigation"],
+        )
+
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Identify the correct bus, locate the entrance, and guide me there.",
+            {
+                "tasks": [
+                    {"name": "object_detection", "weight": 0.4, "reason": "Find bus."},
+                    {"name": "spatial_relationship", "weight": 0.3, "reason": "Locate entrance."},
+                    {"name": "navigation", "weight": 0.3, "reason": "Guide user."},
+                ],
+                "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": ""},
+            },
+            original,
+            ["object_detection", "spatial_relationship", "navigation"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(
+            [stage["capability"] for stage in result["stages"]],
+            ["object_detection", "spatial_relationship", "navigation"],
+        )
+
+    def test_information_reduction_infers_three_stage_bus_entrance_from_text(self):
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Identify the correct bus and tell me where the entrance is.",
+            {
+                "tasks": [
+                    {"name": "object_detection", "weight": 0.75, "reason": "Find bus."},
+                    {"name": "general_reasoning", "weight": 0.25, "reason": "Locate entrance."},
+                ],
+                "latency_sensitivity": {"level": "high", "weight": 0.8, "reason": ""},
+            },
+            model_router.normalize_pipeline_analysis(
+                {
+                    "should_chain": True,
+                    "reason": "Overly generic downstream reasoning.",
+                    "artifact_value_score": 0.85,
+                    "information_reduction": "significant",
+                    "stages": [
+                        {"capability": "object_detection", "purpose": "Find bus.", "input": "scene", "output": "bus bbox"},
+                        {"capability": "general_reasoning", "purpose": "Reason about entrance.", "input": "bus bbox", "output": "answer"},
+                    ],
+                },
+                supported_capabilities=["object_detection", "general_reasoning", "spatial_relationship", "navigation"],
+            ),
+            ["object_detection", "general_reasoning", "spatial_relationship", "navigation"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(
+            [stage["capability"] for stage in result["stages"]],
+            ["object_detection", "spatial_relationship", "navigation"],
+        )
+
+    def test_information_flow_read_then_summarize_uses_ocr_then_reasoning(self):
+        result = model_router.infer_pipeline_from_information_reduction(
+            "Read the medication label and summarize it.",
+            {
+                "tasks": [
+                    {"name": "ocr", "weight": 0.7, "reason": "read label text"},
+                    {"name": "general_reasoning", "weight": 0.3, "reason": "summarize content"},
+                ],
+                "latency_sensitivity": {"level": "low", "weight": 1.0, "reason": "not urgent"},
+            },
+            {"should_chain": False, "reason": "Too conservative.", "stages": []},
+            ["ocr", "general_reasoning", "object_detection"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(
+            [stage["capability"] for stage in result["stages"]],
+            ["ocr", "general_reasoning"],
+        )
+
+    def test_rank_models_rewrites_inconsistent_pipeline_by_artifact_flow(self):
+        profiles = [
+            model_router.ModelProfile("detector", "specialized_expert", 80, "test", {"object_detection": 1.0}, latency=0.98),
+            model_router.ModelProfile("navigator", "general_vlm", 900, "test", {"navigation": 0.9, "camera_motion": 0.3}, latency=0.78),
+            model_router.ModelProfile("camera_guide", "general_vlm", 700, "test", {"camera_motion": 0.9, "navigation": 0.2}, latency=0.84),
+        ]
+        routing_analysis = {
+            "tasks": [
+                {"name": "navigation", "weight": 0.7, "reason": "guidance toward target"},
+                {"name": "camera_motion", "weight": 0.3, "reason": "camera movement guidance"},
+            ],
+            "latency_sensitivity": {"level": "high", "weight": 1.0, "reason": "live guidance"},
+        }
+        bad_pipeline = {
+            "should_chain": True,
+            "reason": "incorrect capability list as stages",
+            "stages": [
+                {"capability": "camera_motion", "purpose": "", "input": "", "output": "", "preferred_model_type": ""},
+                {"capability": "object_detection", "purpose": "", "input": "", "output": "", "preferred_model_type": ""},
+                {"capability": "spatial_relationship", "purpose": "", "input": "", "output": "", "preferred_model_type": ""},
+                {"capability": "navigation", "purpose": "", "input": "", "output": "", "preferred_model_type": ""},
+            ],
+        }
+
+        result = model_router.rank_models(
+            "Guide my camera toward the target.",
+            profiles,
+            routing_analysis=routing_analysis,
+            pipeline_analysis=bad_pipeline,
+        )
+
+        self.assertEqual(result["final_execution_plan"]["mode"], "pipeline")
+        self.assertEqual(
+            [stage["capability"] for stage in result["pipeline_analysis"]["stages"]],
+            ["object_detection", "camera_motion"],
+        )
+
+    def test_rank_models_falls_back_when_routing_analysis_invalid(self):
+        descriptions = {"ocr": ["Read text from an image."]}
+        profiles = [
+            model_router.ModelProfile("strong_ocr", "general_vlm", 1000, "test", {"ocr": 1.0}),
+            model_router.ModelProfile("weak_fast_ocr", "general_vlm", 10, "test", {"ocr": 0.7}),
+        ]
+
+        result = model_router.rank_models(
+            "Read text from an image.",
+            profiles,
+            descriptions,
+            routing_analysis={"tasks": [{"name": "unknown_task", "weight": 1.0}]},
+        )
+
+        self.assertEqual(result["selected_model"], "strong_ocr")
+        self.assertIsNone(result.get("routing_analysis"))
+
+    def test_default_routing_without_analysis_uses_general_fallback(self):
+        result = model_router.select_model("Any task without parse agent routing analysis")
+
+        self.assertEqual(result["capability_weights"], {"general_reasoning": 1.0})
+        self.assertIsNotNone(result["selected_model"])
+        self.assertGreaterEqual(len(result["ranking"]), 1)
+
+    def test_system_llm_call_uses_fixed_model_without_router(self):
+        with patch.object(model_router, "call_model", return_value={"choices": []}) as call_model, \
+             patch.object(model_router, "rank_models") as rank_models:
+            model_router.system_llm_call(messages=[{"role": "user", "content": "Parse this."}])
+
+        rank_models.assert_not_called()
+        self.assertEqual(call_model.call_args.args[0], model_router.SYSTEM_MODEL)
+
+    def test_copilot_llm_call_routes_then_calls_selected_profile_model(self):
+        profiles = [
+            model_router.ModelProfile(
+                name="FastCopilot",
+                type="general_vlm",
+                latency_ms=100,
+                source="test",
+                capabilities={"general_reasoning": 1.0},
+                model="gemini/gemini-2.0-flash",
+            )
+        ]
+        route = {
+            "selected_model": "FastCopilot",
+            "capability_weights": {"general_reasoning": 1.0},
+        }
+
+        with patch.object(model_router, "load_model_profiles", return_value=profiles), \
+             patch.object(model_router, "rank_models", return_value=route) as rank_models, \
+             patch.object(model_router, "call_model", return_value={"choices": []}) as call_model:
+            model_router.copilot_llm_call(
+                task="code_generation",
+                messages=[{"role": "user", "content": "Build a tool."}],
+            )
+
+        rank_models.assert_called_once()
+        self.assertEqual(call_model.call_args.args[0], "gemini/gemini-2.0-flash")
 
 
 if __name__ == "__main__":
