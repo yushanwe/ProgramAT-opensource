@@ -19,7 +19,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 import cv2
 import numpy as np
 from PIL import Image
@@ -32,7 +32,14 @@ from dotenv import load_dotenv
 # Load .env before importing modules that read routing/provider settings at import time.
 load_dotenv(dotenv_path=str(Path(__file__).parent / '.env'))
 
-from model_router import detect_objects, llm_call, ocr_call, vision_call
+from model_router import (
+    load_capability_descriptions,
+    load_capability_profiles,
+    normalize_pipeline_analysis,
+    normalize_routing_analysis,
+    select_model,
+    system_llm_call,
+)
 from litellm_utils import (
     extract_text,
 )
@@ -50,12 +57,7 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from door_detection import main as door_recognition_main
-from model_router_client import (
-    routed_llm_call,
-    routed_object_detection,
-    routed_ocr_call,
-    routed_vision_call,
-)
+from model_router_client import copilot_llm_call as tool_copilot_llm_call
 
 # Configure logging
 logging.basicConfig(
@@ -120,6 +122,30 @@ def _extract_issue_section(body: str, *section_names: str) -> str:
         re.IGNORECASE | re.DOTALL,
     )
     return match.group(1).strip() if match else ''
+
+
+def _format_capability_profiles_for_prompt() -> tuple[str, list[str]]:
+    profiles = load_capability_profiles()
+    names = sorted(profiles.keys())
+    lines = []
+    for name in names:
+        profile = profiles[name]
+        description = profile.get('description', '')
+        include_examples = profile.get('include_examples', [])
+        exclude_examples = profile.get('exclude_examples', [])
+        notes = profile.get('notes', '')
+        lines.append(f"- {name}")
+        if description:
+            lines.append(f"  description: {description}")
+        if include_examples:
+            lines.append("  includes:")
+            lines.extend(f"    - {example}" for example in include_examples)
+        if exclude_examples:
+            lines.append("  excludes:")
+            lines.extend(f"    - {example}" for example in exclude_examples)
+        if notes:
+            lines.append(f"  notes: {notes}")
+    return "\n".join(lines), names
 
 # Configuration
 HOST = '0.0.0.0'  # Listen on all interfaces
@@ -520,14 +546,7 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
             'exec_globals_base': {
                 '__builtins__': __builtins__,
                 '__file__': str(Path(__file__).parent.parent / 'tools' / 'dynamic_tool.py'),
-                'llm_call': llm_call,
-                'vision_call': vision_call,
-                'detect_objects': detect_objects,
-                'ocr_call': ocr_call,
-                'routed_llm_call': routed_llm_call,
-                'routed_vision_call': routed_vision_call,
-                'routed_object_detection': routed_object_detection,
-                'routed_ocr_call': routed_ocr_call,
+                'copilot_llm_call': tool_copilot_llm_call,
                 'yolo_model_cache': yolo_model_cache,
                 **common_modules
             }
@@ -2976,7 +2995,7 @@ Return ONLY a valid JSON object:
   "confidence": <0.0 to 1.0>
 }}"""
 
-        response = llm_call(
+        response = system_llm_call(
             capability='tool_retrieval',
             messages=[{'role': 'user', 'content': prompt}],
         )
@@ -3153,6 +3172,13 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
         Dictionary with parsed fields including 'missing_fields' list
     """
     try:
+        try:
+            capability_profiles_text, capability_names = _format_capability_profiles_for_prompt()
+        except Exception:
+            capability_profiles_text = ""
+            capability_names = ['general_reasoning', 'ocr', 'object_detection', 'map_web', 'spatial_relationship', 'navigation', 'camera_motion', 'video']
+        capability_names_text = ', '.join(capability_names)
+
         # Build context from existing data if this is a follow-up
         context_info = ""
         if existing_data:
@@ -3185,6 +3211,57 @@ For a visual AT request, extract:
 - live_query: if live_mode is "yes", what is the exact prompt to re-ask on every frame?
 - alternatives: Alternative solutions considered
 - additional: Any other context
+- routing_analysis: A lightweight routing plan used by backend model selection.
+- pipeline_analysis: A conservative execution-plan decision using the same capabilities.
+
+Routing rules:
+1. Provide 2-4 task entries when possible.
+2. Task weights should sum to approximately 1.0.
+3. Select only from these capability names: {capability_names_text}
+4. Do not create new capability names.
+5. Map the user request onto the closest existing capabilities from that list.
+6. Prefer the minimum necessary capability set.
+7. Prefer 1 capability when one capability is sufficient.
+8. Prefer 2 capabilities over 3 unless the task truly requires more.
+9. Do not include a capability unless removing it would significantly reduce task success.
+10. Use capability exclusions as hard negative evidence.
+11. You are given the full capability definitions below. Use them to decide what is required.
+
+Capability definitions:
+{capability_profiles_text}
+
+12. latency_sensitivity levels:
+    - high: live camera, navigation, object finding, real-time assistive feedback
+    - medium: normal interactive tasks
+    - low: offline generation, code generation, long-form reasoning, non-urgent analysis
+
+Pipeline decision rules:
+1. First decide the capability distribution in routing_analysis. Then separately decide whether those capabilities should run inside one model or as a pipeline.
+2. Do not create a pipeline merely because multiple capabilities exist.
+3. Do NOT decide should_chain=false because a single modern VLM could theoretically perform all capabilities. That is not the criterion.
+4. The primary criterion is information reduction: can an earlier stage produce a structured intermediate artifact that reduces the search space, visual scope, or reasoning burden for a later stage?
+5. Good intermediate artifacts include bounding boxes, object coordinates, segmentation masks, cropped regions, OCR text, object lists, target locations, clock-face directions, and navigation waypoints.
+6. Stages must follow producer -> consumer information flow, not capability ranking order.
+7. Do not add stage capabilities that are unrelated to routing_analysis, unless that stage is strictly required to produce an intermediate artifact for a downstream stage.
+8. Increase chaining confidence for useful transitions: object_detection -> camera_motion, object_detection -> navigation, object_detection -> general_reasoning, ocr -> general_reasoning, ocr -> map_web, map_web -> general_reasoning.
+9. Avoid redundant overlapping stages. If one capability can directly consume the upstream artifact, do not insert an extra stage.
+10. Distinguish camera_motion vs navigation strictly:
+    - camera_motion: camera framing or aiming actions (left/right/up/down, closer/farther, zoom, center target)
+    - navigation: physical wayfinding and walking guidance through space
+11. Do not treat camera_motion and navigation as interchangeable. Include both only if both are explicitly required.
+12. Prefer should_chain=true for tasks like "find X then guide me", "find X then localize Y", "detect X then reason about X", and "extract text then analyze text" because Stage 1 compresses the problem.
+13. Prefer should_chain=false for holistic tasks such as describing a room, explaining a chart, rating an outfit, summarizing an image, or interpreting an overall scene when no meaningful intermediate artifact reduces later work.
+14. Default to should_chain=false only when no useful intermediate artifact or information reduction exists.
+15. Do not hardcode or assume a maximum stage count. Infer the stage count dynamically from useful artifact flow.
+16. Optimize for the minimum useful stage count, not the minimum stage count alone.
+17. Use a complexity penalty to discourage unnecessary stages:
+    pipeline_score = artifact_gain - complexity_penalty
+    complexity_penalty = (stage_count - 1) * penalty_per_stage
+18. Add another stage when it preserves an important intermediate artifact or materially improves information reduction/task success probability.
+19. Do not add another stage when it only repeats work, changes wording, or does not improve downstream inputs.
+20. Stage preferred_model_type should describe the kind of model wanted, such as "fast_detector", "ocr_extractor", "reasoning_vlm", "navigation_model", or "response_generator"; do not name a specific model.
+21. Include artifact_value_score from 0.0 to 1.0. Set it high when Stage 1 removes substantial irrelevant visual information.
+22. Include information_reduction as "none", "minor", "moderate", or "significant".
 
 CRITICAL: Evaluate which IMPORTANT fields are missing or insufficiently specified.
 ONLY mark IMPORTANT fields in the missing_fields array. Optional/nice-to-have fields should NOT be included even if empty.
@@ -3222,10 +3299,27 @@ Return format:
   "live_mode": "...",
   "live_query": "...",
   "additional": "...",
-  "missing_fields": ["field1", "field2"]  // Only truly missing/empty important fields. Use [] if all important fields have content.
+    "missing_fields": ["field1", "field2"],  // Only truly missing/empty important fields. Use [] if all important fields have content.
+    "routing_analysis": {{
+        "tasks": [
+            {{"name": "ocr", "weight": 0.8, "reason": "The user needs text from the image."}},
+            {{"name": "general_reasoning", "weight": 0.2, "reason": "The response should explain the extracted content."}}
+        ],
+        "latency_sensitivity": {{"level": "high|medium|low", "weight": 0.0, "reason": "..."}}
+    }},
+    "pipeline_analysis": {{
+        "should_chain": false,
+        "reason": "No structured intermediate artifact would significantly reduce later visual scope or reasoning burden.",
+        "artifact_value_score": 0.0,
+        "information_reduction": "none",
+        "artifact_gain": 0.0,
+        "complexity_penalty": 0.0,
+        "pipeline_score": 0.0,
+        "stages": []
+    }}
 }}"""
 
-        response = llm_call(
+        response = system_llm_call(
             capability='text_parse',
             messages=[{'role': 'user', 'content': prompt}],
         )
@@ -3243,6 +3337,21 @@ Return format:
         ai_response = ai_response.strip()
         
         parsed_data = json.loads(ai_response)
+
+        normalized_routing_analysis = normalize_routing_analysis(
+            parsed_data.get('routing_analysis'),
+            supported_capabilities=capability_names,
+        )
+        if normalized_routing_analysis:
+            parsed_data['routing_analysis'] = normalized_routing_analysis
+        elif 'routing_analysis' in parsed_data:
+            # Keep backward compatibility by allowing invalid field to be dropped.
+            parsed_data.pop('routing_analysis', None)
+
+        parsed_data['pipeline_analysis'] = normalize_pipeline_analysis(
+            parsed_data.get('pipeline_analysis'),
+            supported_capabilities=capability_names,
+        )
 
         if 'live_mode' in parsed_data and 'custom_gpt' not in parsed_data:
             parsed_data['custom_gpt'] = parsed_data.get('live_mode', '')
@@ -3276,6 +3385,34 @@ Return format:
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         parsed_data['original_prompts'] = existing_prompts + [f"[{timestamp}] {transcript}"]
+
+        routing_tasks_for_log = []
+        if parsed_data.get('routing_analysis'):
+            routing_tasks_for_log = [
+                {
+                    'name': t.get('name'),
+                    'weight': round(float(t.get('weight', 0.0)), 3),
+                }
+                for t in parsed_data['routing_analysis'].get('tasks', [])
+            ]
+        logger.info("Routing analysis tasks=%s", json.dumps(routing_tasks_for_log))
+        logger.info(
+            "Routing analysis latency=%s",
+            json.dumps((parsed_data.get('routing_analysis') or {}).get('latency_sensitivity', {})),
+        )
+        logger.info(
+            "Pipeline decision=%s",
+            json.dumps({
+                'should_chain': parsed_data['pipeline_analysis'].get('should_chain'),
+                'reason': parsed_data['pipeline_analysis'].get('reason'),
+                'artifact_value_score': parsed_data['pipeline_analysis'].get('artifact_value_score'),
+                'information_reduction': parsed_data['pipeline_analysis'].get('information_reduction'),
+                'artifact_gain': parsed_data['pipeline_analysis'].get('artifact_gain'),
+                'complexity_penalty': parsed_data['pipeline_analysis'].get('complexity_penalty'),
+                'pipeline_score': parsed_data['pipeline_analysis'].get('pipeline_score'),
+            }),
+        )
+        logger.info("Pipeline stages=%s", json.dumps(parsed_data['pipeline_analysis'].get('stages', [])))
         
         logger.info(f"Successfully parsed transcript with AI: type={parsed_data.get('type', 'unknown')}, missing={len(parsed_data.get('missing_fields', []))}")
         return parsed_data
@@ -3586,6 +3723,34 @@ async def create_github_issue(text: str):
         # Check for missing fields
         missing_fields = parsed_data.get('missing_fields', [])
         issue_type = 'visual AT'  # Always visual AT now
+
+        try:
+            route_result = select_model(
+                text.strip(),
+                routing_analysis=parsed_data.get('routing_analysis'),
+                pipeline_analysis=parsed_data.get('pipeline_analysis'),
+            )
+            selected_model = route_result.get('selected_model')
+            parsed_data['selected_model'] = selected_model
+            parsed_data['final_execution_plan'] = route_result.get('final_execution_plan')
+            parsed_data['stage_model_selection'] = [
+                {
+                    'index': stage.get('index'),
+                    'capability': stage.get('capability'),
+                    'selected_model': stage.get('selected_model'),
+                }
+                for stage in route_result.get('stage_model_selection', [])
+            ]
+            logger.info("Parsed routing selected_model=%s", selected_model)
+            logger.info("Parsed routing final_execution_plan=%s", json.dumps(parsed_data.get('final_execution_plan')))
+            for candidate in route_result.get('ranking', []):
+                logger.info(
+                    "Parsed routing candidate=%s final_score=%.4f",
+                    candidate.get('model'),
+                    float(candidate.get('final_score', 0.0)),
+                )
+        except Exception as route_error:
+            logger.warning(f"Routing selection skipped due to error: {route_error}")
         
         # If there are important missing fields, send feedback and save incomplete data
         if missing_fields:
@@ -5025,14 +5190,7 @@ async def handle_client(websocket):
                             exec_globals = {
                                 '__builtins__': __builtins__,
                                 '__file__': str(TOOLS_DIR / f'{Path(tool_name).name}.py'),
-                                'llm_call': llm_call,
-                                'vision_call': vision_call,
-                                'detect_objects': detect_objects,
-                                'ocr_call': ocr_call,
-                                'routed_llm_call': routed_llm_call,
-                                'routed_vision_call': routed_vision_call,
-                                'routed_object_detection': routed_object_detection,
-                                'routed_ocr_call': routed_ocr_call,
+                                'copilot_llm_call': tool_copilot_llm_call,
                                 'input_data': parsed_input,  # Use parsed input (dict or string)
                                 'image': frame_image,  # OpenCV image (numpy array)
                                 'image_base64': frame_base64,  # Base64 string
@@ -5318,9 +5476,9 @@ async def handle_client(websocket):
                             # Create prompt for follow-up question
                             prompt = f"You are analyzing this image. The user is asking a follow-up question: {question}\n\nPlease provide a helpful and concise answer based on what you can see in the image."
                             
-                            # Send the follow-up through LiteLLM using the task router
+                            # Send the follow-up through the fixed system LLM path.
                             try:
-                                response = llm_call(
+                                response = system_llm_call(
                                     capability='image_analysis',
                                     messages=[{'role': 'user', 'content': prompt}],
                                     images=[pil_image],
@@ -5328,7 +5486,7 @@ async def handle_client(websocket):
                                 answer = extract_text(response)
 
                                 logger.info(f"FOLLOW-UP: Generated answer length: {len(answer)}")
-                                logger.info("FOLLOW-UP: Successfully routed image+text through model_router")
+                                logger.info("FOLLOW-UP: Successfully answered image+text through system LLM")
                                 
                                 await websocket.send(json.dumps({
                                     'type': 'follow_up_response',
