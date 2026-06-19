@@ -24,21 +24,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-import cv2
 import numpy as np
 
-from litellm_utils import extract_text, pil_image_to_data_uri
+from litellm_utils import extract_text
 from model_router_client import copilot_llm_call
 
 TOOL_NAME = "uber_car_locator"
 TASK_CATEGORY = "visual_reasoning"
-
-
-def _bgr_to_pil(image: np.ndarray):
-    """Convert a BGR OpenCV array to a PIL Image."""
-    from PIL import Image as PILImage
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return PILImage.fromarray(rgb)
 
 
 def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
@@ -74,9 +66,6 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
     )
 
     try:
-        pil_image = _bgr_to_pil(image)
-        image_uri = pil_image_to_data_uri(pil_image)
-
         response = copilot_llm_call(
             task_category=TASK_CATEGORY,
             messages=[
@@ -89,7 +78,7 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
                 },
                 {"role": "user", "content": prompt},
             ],
-            images=[image_uri],
+            images=[image],
             metadata={
                 "tool_name": TOOL_NAME,
                 "route_text": (
@@ -101,7 +90,7 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
 
         guidance = extract_text(response)
         if not guidance:
-            return "Could not analyze the image. Please try again."
+            return "Unable to process the camera view. Please ensure good lighting and try again."
         return guidance
 
     except Exception as exc:

@@ -17,7 +17,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "tools"))
 sys.path.insert(0, _HERE)
 
-from uber_car_locator import main, _bgr_to_pil, TOOL_NAME, TASK_CATEGORY
+from uber_car_locator import main, TOOL_NAME, TASK_CATEGORY
 
 
 # ---------------------------------------------------------------------------
@@ -59,14 +59,14 @@ def test_constants():
     print()
 
 
-def test_bgr_to_pil():
-    """_bgr_to_pil converts a BGR numpy array to a PIL image correctly."""
-    print("Testing _bgr_to_pil()...")
-    img = _solid_image(color_bgr=(0, 0, 255))  # pure red in BGR
-    pil = _bgr_to_pil(img)
-    r, g, b = pil.getpixel((0, 0))
-    assert r == 255 and g == 0 and b == 0, "BGR→RGB conversion failed"
-    print("  BGR→RGB conversion: ✓")
+def test_image_shapes():
+    """Verify that helper images have the expected shapes."""
+    print("Testing test image creation...")
+    img = _solid_image()
+    assert img.shape == (480, 640, 3), f"Unexpected shape: {img.shape}"
+    lot = _parking_lot_image()
+    assert lot.shape == (480, 640, 3), f"Unexpected shape: {lot.shape}"
+    print("  Image shapes: ✓")
     print()
 
 
@@ -146,7 +146,7 @@ def run_all_tests():
     print()
 
     test_constants()
-    test_bgr_to_pil()
+    test_image_shapes()
     test_no_image()
     test_empty_input_data()
     test_full_flow_with_vehicle_details()
