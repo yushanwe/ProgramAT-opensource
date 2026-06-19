@@ -124,7 +124,7 @@ def main(image: Optional[np.ndarray], input_data: Optional[Dict[str, Any]] = Non
     Locate the user's rideshare vehicle and guide them to the passenger door.
 
     input_data keys (all optional):
-        color  – vehicle colour, e.g. "white"
+        color  – vehicle color, e.g. "white"
         make   – manufacturer, e.g. "Toyota"
         model  – model name, e.g. "Camry"
         plate  – license-plate text, e.g. "ABC123"
@@ -158,7 +158,17 @@ def main(image: Optional[np.ndarray], input_data: Optional[Dict[str, Any]] = Non
 
     try:
         guidance = locate_vehicle(image, color=color, make=make, model=model, plate=plate)
-        return guidance if guidance else "Could not determine vehicle location. Try pointing the camera at the pickup area."
+        if not guidance:
+            return {
+                "audio": {
+                    "type": "warning",
+                    "text": "Could not determine vehicle location. Try pointing the camera at the pickup area.",
+                    "rate": 1.0,
+                    "interrupt": False,
+                },
+                "text": "Could not determine vehicle location.",
+            }
+        return guidance
     except Exception as exc:
         return {
             "audio": {
