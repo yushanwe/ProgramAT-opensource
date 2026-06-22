@@ -8,7 +8,20 @@ When using other tool files as building blocks, use their patterns but do not im
 
 From the Github agent, tools must NOT connect to the backend server or use WebSockets. Tools execute ON the backend server and receive data as function parameters. The mobile app handles all network communication. Tools should only process the image and input_data parameters passed to their main() function and return results as strings or dictionaries.
 
-Assume each generated tool implements one user-facing task. Do not plan subtasks or chain multiple model calls unless the user explicitly asks for that. When the tool needs model-backed work, choose the single nearest task category for that call and let ProgramAT's centralized model router choose the backend.
+Assume each generated tool implements one user-facing task.
+
+Hierarchy for staged issues:
+- One user-facing task = one generated tool.
+- One generated tool may contain multiple internal stages.
+- Each model-backed stage = one `copilot_llm_call()`.
+
+If the generated issue explicitly enumerates a `Task Stages` section, generated tools must follow that stage list exactly:
+- Each model-backed stage MUST map to its own `copilot_llm_call(...)`.
+- Do NOT merge multiple stage capabilities into one generic call.
+- Use exactly that stage's listed capability as `task_category`.
+- Pass earlier stage outputs into later stages via prompts/context/metadata.
+
+Task decomposition and model selection are separate concerns: the issue parser decides whether stages are required, and the generated tool owns stage execution. The model router only selects the most appropriate model for each declared capability. Do not ask the model router to execute stages, manage workflows, pass outputs between stages, or orchestrate pipelines.
 
 From the Github agent, ALL tools MUST return audio-friendly output. Tool results are automatically spoken aloud via text-to-speech on the mobile device unless another form of audio is specified. Return values should be:
 - Natural language strings that sound good when spoken (not JSON, not code, not cryptic abbreviations)
@@ -72,7 +85,7 @@ Public backend capability interfaces available to generated tools:
 
 Treat this function as the existing Copilot-routed backend call exposed through the existing `model_router_client`. Do not implement it, wrap it, subclass it, replace it, create another client, or create an alternate router. Do not choose or instantiate any detector directly in generated tools.
 
-Specialized detection-style capabilities are not automatically sufficient for fine-grained identification, attributes, make/model, license plates, visual comparison, or contextual reasoning. For those requests, use `visual_understanding`, `visual_reasoning`, or `OCR` as the single nearest task category for the model-backed call.
+Specialized detection-style capabilities are not automatically sufficient for fine-grained identification, attributes, make/model, license plates, visual comparison, or contextual reasoning. For those requests, use the nearest canonical capability, usually `general_reasoning`, `spatial_relationship`, or `ocr`.
 
 The backend understands object labels and supported detector classes. Generated tools should only pass user-relevant labels and the declared capability; they should not inspect, copy, or encode backend class lists such as COCO class lists.
 For OCR or text extraction, call `copilot_llm_call(task_category="ocr", ...)` and let the backend choose the implementation.
@@ -82,7 +95,7 @@ For any LLM or VLM task, do not directly call `litellm.completion()` from a gene
 ```python
 from model_router_client import copilot_llm_call
 
-TASK_CATEGORY = "visual_understanding"
+TASK_CATEGORY = "general_reasoning"
 TOOL_NAME = "example_tool"
 
 response = copilot_llm_call(
@@ -100,17 +113,62 @@ response = copilot_llm_call(
 ```
 
 Use one of these task categories:
-- `simple_parsing`: parse short inputs, classify simple commands, or extract structured fields.
+- `general_reasoning`: general visual understanding, identification, planning, summarization, code-related reasoning, or concise assistant responses.
 - `object_detection`: detect/count known object categories with bounding boxes; no fine-grained identification or reasoning.
-- `object_localization`: locate a known target or part with a bounding box/position after the target is already specified.
-- `visual_understanding`: describe or identify visible objects, scenes, clothing, colors, layout, or text-adjacent visual context.
-- `visual_reasoning`: answer questions that require reasoning over visual relationships, accessibility context, spatial layout, or multi-step visual interpretation.
+- `spatial_relationship`: locate a known target or describe relative position, direction, and distance.
 - `ocr`: read or extract text from an image. Use the backend OCR capability path for text extraction; use a reasoning capability only when the extracted text needs interpretation or cleanup.
-- `summarization`: summarize logs, text, observations, or repeated results.
-- `code_generation`: generate, repair, or explain code.
-- `general_reasoning`: non-visual reasoning, classification, planning, or concise assistant responses.
+- `map_web`: interpret maps, charts, tables, layouts, diagrams, webpages, icons, or symbols.
+- `navigation`: provide physical wayfinding and walking guidance.
+- `camera_motion`: provide camera aiming, framing, centering, or zoom guidance.
+- `video`: reason over temporal events across video frames.
+
+Do not invent or substitute task categories. In particular, never use `visual_reasoning`; use the nearest canonical category from the list above.
 
 When creating a new tool, explicitly choose the nearest task category before writing a model-backed call. Let the backend choose the actual model/backend and emit routing logs. Do not pass `model`, `requested_model`, provider-specific names, detector names, OCR engine names, or routing registries in generated tools. Do not import `litellm`, provider SDKs, detector libraries, OCR SDKs, `ultralytics`, or `YOLO` directly. Do not call `litellm.completion()` or `YOLO(...)`. Do not create a `ModelRouter` class, model registry, model cache, provider fallback logic, `COCO_CLASSES`, hardcoded model names, `.pt` model loading/discovery logic, wrapper functions, new client modules, or alternative model-routing helpers. If the approved API cannot support the needed capability, add support to the centralized backend router instead of implementing it inside the tool.
+
+For multi-stage issues, follow the issue's stage list. Each stage should have a stage name, goal, capability, input if it consumes an earlier result, and expected output. For each model-backed stage, call `copilot_llm_call` with that stage's capability as the task category and include stage-specific metadata. Store the stage output in a local variable and pass it into later stage prompts as needed. The final spoken response should summarize the completed user-facing task, not expose raw intermediate JSON unless that is the requested output.
+
+Example (Uber pickup guidance):
+
+```python
+vehicle_result = copilot_llm_call(
+    task_category="object_detection",
+    messages=[{"role": "user", "content": "Locate the correct vehicle."}],
+    images=[image],
+    metadata={
+        "tool_name": TOOL_NAME,
+        "stage_name": "Stage 1",
+        "stage_goal": "Locate the correct vehicle",
+    },
+)
+
+door_result = copilot_llm_call(
+    task_category="spatial_relationship",
+    messages=[{"role": "user", "content": "Locate the passenger-side door."}],
+    images=[image],
+    metadata={
+        "tool_name": TOOL_NAME,
+        "stage_name": "Stage 2",
+        "stage_goal": "Locate the passenger-side door",
+        "previous_stage_output": vehicle_result,
+    },
+)
+
+guidance_result = copilot_llm_call(
+    task_category="navigation",
+    messages=[{"role": "user", "content": "Guide the user toward the door."}],
+    images=[image],
+    metadata={
+        "tool_name": TOOL_NAME,
+        "stage_name": "Stage 3",
+        "stage_goal": "Guide the user toward the door",
+        "previous_stage_outputs": {
+            "vehicle": vehicle_result,
+            "door": door_result,
+        },
+    },
+)
+```
 
 For tools where the live-mode field is filled to indicate that is what they want, use the backend-managed live multimodal mode. For these tools, arrange for the specified query to be re-pushed without the user needing to say anything new every 5 seconds.
 
