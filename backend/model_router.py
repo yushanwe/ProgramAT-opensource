@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 BACKEND_DIR = Path(__file__).resolve().parent
 MODEL_PROFILES_PATH = BACKEND_DIR / "model_profiles.yaml"
 CAPABILITY_PROFILES_PATH = BACKEND_DIR / "capability_profiles.yaml"
-SYSTEM_MODEL = os.environ.get("SYSTEM_LLM_MODEL", "gemini/gemini-2.0-flash-preview")
+SYSTEM_MODEL = os.environ.get("SYSTEM_LLM_MODEL", "groq/llama-3.1-8b-instant")
 DEFAULT_FALLBACK_CAPABILITY = "general_reasoning"
 
 STRUCTURED_ARTIFACTS_BY_CAPABILITY = {
@@ -243,12 +243,12 @@ def normalize_routing_analysis(
 
     if supported_capabilities is None:
         supported_capabilities = load_capability_descriptions().keys()
-    canonical_capabilities = {
-        str(name).strip().lower(): str(name).strip().lower()
+    supported = {
+        str(name).strip().lower()
         for name in supported_capabilities
         if str(name).strip()
     }
-    if not canonical_capabilities:
+    if not supported:
         return None
 
     tasks = routing_analysis.get("tasks")
@@ -259,9 +259,9 @@ def normalize_routing_analysis(
     for task in tasks:
         if not isinstance(task, dict):
             continue
-        raw_name = str(task.get("name", "")).strip().lower()
-        key = canonical_capabilities.get(raw_name)
-        if key is None:
+        key = str(task.get("name", "")).strip().lower()
+        if key not in supported:
+            logger.warning("[Model Router] unknown_capability=%s", key)
             continue
         weight = max(0.0, _safe_weight(task.get("weight"), 0.0))
         if weight <= 0.0:
@@ -299,11 +299,11 @@ def normalize_routing_analysis(
     }
 
 
-def _canonical_capability_map(supported_capabilities: Optional[Iterable[str]] = None) -> Dict[str, str]:
+def _supported_capabilities(supported_capabilities: Optional[Iterable[str]] = None) -> set[str]:
     if supported_capabilities is None:
         supported_capabilities = load_capability_descriptions().keys()
     return {
-        str(name).strip().lower(): str(name).strip().lower()
+        str(name).strip().lower()
         for name in supported_capabilities
         if str(name).strip()
     }
@@ -329,7 +329,7 @@ def normalize_pipeline_analysis(
 
     should_chain = bool(pipeline_analysis.get("should_chain"))
     reason = str(pipeline_analysis.get("reason", "")).strip()
-    canonical_capabilities = _canonical_capability_map(supported_capabilities)
+    supported = _supported_capabilities(supported_capabilities)
     normalized_stages = []
     raw_stages = pipeline_analysis.get("stages", [])
 
@@ -337,15 +337,21 @@ def normalize_pipeline_analysis(
         for raw_stage in raw_stages:
             if not isinstance(raw_stage, dict):
                 continue
-            raw_capability = str(raw_stage.get("capability", "")).strip().lower()
-            capability = canonical_capabilities.get(raw_capability)
-            if capability is None:
+            capability = str(raw_stage.get("capability", "")).strip().lower()
+            if capability not in supported:
+                logger.warning("[Model Router] unknown_capability=%s", capability)
                 continue
+            stage_name = str(raw_stage.get("stage_name", raw_stage.get("name", ""))).strip()
+            goal = str(raw_stage.get("goal", raw_stage.get("purpose", ""))).strip()
+            expected_output = str(raw_stage.get("expected_output", raw_stage.get("output", ""))).strip()
             normalized_stages.append({
+                "stage_name": stage_name,
+                "goal": goal,
                 "capability": capability,
-                "purpose": str(raw_stage.get("purpose", "")).strip(),
+                "purpose": goal,
                 "input": str(raw_stage.get("input", "")).strip(),
-                "output": str(raw_stage.get("output", "")).strip(),
+                "expected_output": expected_output,
+                "output": expected_output,
                 "preferred_model_type": str(raw_stage.get("preferred_model_type", "")).strip(),
             })
 
@@ -1137,7 +1143,6 @@ def system_llm_call(
     messages: Optional[List[Dict[str, Any]]] = None,
     images: Optional[Iterable[Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
-    **_: Any,
 ):
     """Call the fixed infrastructure model without semantic routing."""
     logger.info("[System LLM] model=%s", SYSTEM_MODEL)
@@ -1157,6 +1162,21 @@ def copilot_llm_call(
     route_text = _task_text(capability, task, task_category, messages, metadata)
     callable_profiles = [profile for profile in load_model_profiles() if profile.model]
     routing_analysis = metadata.get("routing_analysis") if isinstance(metadata, dict) else None
+    if routing_analysis is None:
+        declared_capability = capability or task_category
+        if isinstance(declared_capability, str) and declared_capability.strip():
+            routing_analysis = {
+                "tasks": [{
+                    "name": declared_capability.strip().lower(),
+                    "weight": 1.0,
+                    "reason": "Capability declared by the generated tool.",
+                }],
+                "latency_sensitivity": {
+                    "level": "medium",
+                    "weight": 0.5,
+                    "reason": "Default latency for a generated-tool capability call.",
+                },
+            }
     route = rank_models(route_text, callable_profiles, routing_analysis=routing_analysis)
     selected_profile = next(profile for profile in callable_profiles if profile.name == route["selected_model"])
     weights = {key: round(value, 3) for key, value in route["capability_weights"].items() if value > 0.005}
@@ -1178,6 +1198,7 @@ __all__ = [
     "SYSTEM_MODEL",
     "ModelProfile",
     "load_capability_descriptions",
+    "load_capability_profiles",
     "load_model_profiles",
     "compute_capability_weights",
     "normalize_routing_analysis",
