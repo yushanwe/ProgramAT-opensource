@@ -4,7 +4,49 @@ These tests test the logic in isolation without importing stream_server
 """
 import unittest
 import json
+import ast
+import re
+import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stage_decomposition import build_stage_decomposition_prompt
+
+
+def load_stream_server_function(name: str):
+    """Load one pure helper without importing the server and triggering startup config."""
+    source_path = Path(__file__).resolve().parent / "stream_server.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    function_node = next(
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    )
+    namespace = {
+        "Any": Any,
+        "Dict": Dict,
+        "List": List,
+        "Optional": Optional,
+        "json": json,
+        "re": re,
+        "ToolPlanningContext": Any,
+    }
+    dependency_names = {
+        "_normalize_issue_creation_requirements": {
+            "_normalize_custom_gpt_value",
+            "_explicit_custom_gpt_value",
+        },
+        "_append_task_stages_to_issue_body": {"_build_task_stages_markdown"},
+    }.get(name, set())
+    dependencies = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in dependency_names
+    ]
+    exec(
+        compile(ast.Module(body=[*dependencies, function_node], type_ignores=[]), str(source_path), "exec"),
+        namespace,
+    )
+    return namespace[name]
 
 
 class TestIssueTemplateGuidance(unittest.TestCase):
@@ -15,15 +57,221 @@ class TestIssueTemplateGuidance(unittest.TestCase):
         template = template_path.read_text(encoding="utf-8")
 
         self.assertIn("one user-facing task", template)
-        self.assertIn("Do not plan subtasks", template)
+        self.assertIn("If this issue enumerates multiple stages", template)
+        self.assertIn("pass intermediate outputs from earlier stages into later stages", template)
+        self.assertIn("The model router only selects the most appropriate model for a capability", template)
         self.assertIn("existing Copilot-routed backend interface through the existing client with `from model_router_client import copilot_llm_call`", template)
-        self.assertIn("object_localization", template)
+        self.assertIn("spatial_relationship", template)
+        self.assertIn("Choose only from these task categories", template)
         self.assertNotIn("Capability Pipeline", template)
-        self.assertNotIn("Outputs from earlier stages", template)
         self.assertNotIn("should either utilize Yolo11", template)
         self.assertNotIn("Google Vision", template)
         self.assertIn("call `YOLO(...)`", template)
         self.assertIn("define provider-specific `DEFAULT_MODEL` constants", template)
+
+
+class TestParserStageIssueIntegration(unittest.TestCase):
+    """Test parser-owned stage normalization and issue-section wiring."""
+
+    def setUp(self):
+        self.normalize_requirements = load_stream_server_function("_normalize_issue_creation_requirements")
+        self.extraction_prompt = load_stream_server_function("_build_issue_extraction_prompt")
+        self.merge_outputs = load_stream_server_function("_merge_issue_and_stage_outputs")
+        self.normalize = load_stream_server_function("_normalize_parser_stage_plan")
+        self.render = load_stream_server_function("_build_task_stages_markdown")
+        self.append_stages = load_stream_server_function("_append_task_stages_to_issue_body")
+        self.parse_json = load_stream_server_function("_parse_llm_json_object")
+
+    def test_custom_gpt_no_does_not_require_query(self):
+        normalized = self.normalize_requirements(
+            {
+                "description": "Find the user's Uber and guide them to it.",
+                "example_usage": "Find the white Toyota and guide me to its passenger door.",
+                "live_mode": "yes",
+                "live_query": "",
+                "missing_fields": ["live_query"],
+            },
+            "Custom GPT: No",
+        )
+
+        self.assertEqual(normalized["custom_gpt"], "no")
+        self.assertEqual(normalized["gpt_query"], "")
+        self.assertEqual(normalized["missing_fields"], [])
+
+    def test_parser_uses_separate_extraction_and_decomposition_contracts(self):
+        task = "Find my Uber, locate the passenger-side door, and guide me to it."
+        extraction = self.extraction_prompt(task)
+        decomposition = build_stage_decomposition_prompt(task)
+
+        self.assertIn('"missing_fields"', extraction)
+        self.assertNotIn('"routing_analysis"', extraction)
+        self.assertNotIn('"pipeline_analysis"', extraction)
+        self.assertIn('"routing_analysis"', decomposition)
+        self.assertIn('"pipeline_analysis"', decomposition)
+        self.assertIn("object_detection -> spatial_relationship", decomposition)
+        self.assertIn("spatial_relationship -> navigation", decomposition)
+        self.assertNotIn('"missing_fields"', decomposition)
+
+    def test_merges_issue_and_stage_outputs_without_changing_schemas(self):
+        issue_data = {"title": "Find my Uber", "missing_fields": []}
+        decomposition_data = {
+            "routing_analysis": {"tasks": [{"name": "navigation", "weight": 1.0}]},
+            "pipeline_analysis": {
+                "should_chain": True,
+                "stages": [{"capability": "object_detection"}, {"capability": "navigation"}],
+            },
+        }
+
+        merged = self.merge_outputs(issue_data, decomposition_data)
+
+        self.assertEqual(merged["title"], "Find my Uber")
+        self.assertIs(merged["routing_analysis"], decomposition_data["routing_analysis"])
+        self.assertIs(merged["pipeline_analysis"], decomposition_data["pipeline_analysis"])
+
+    def test_parses_fenced_json_with_trailing_text(self):
+        result = self.parse_json(
+            '```json\n{"pipeline_analysis":{"stages":[{"capability":"navigation"}]}}\n```\nDone.'
+        )
+
+        self.assertEqual(
+            result["pipeline_analysis"]["stages"][0]["capability"],
+            "navigation",
+        )
+
+    def test_preserves_single_stage(self):
+        result = self.normalize(
+            {
+                "should_chain": False,
+                "stages": [{
+                    "stage_name": "Read label",
+                    "goal": "Extract the medication instructions.",
+                    "capability": "ocr",
+                    "input": "Current camera frame",
+                    "expected_output": "Extracted label text",
+                }],
+            },
+            ["ocr", "general_reasoning"],
+        )
+
+        self.assertFalse(result["should_chain"])
+        self.assertEqual(len(result["stages"]), 1)
+        self.assertEqual(result["stages"][0]["stage_name"], "Read label")
+        self.assertEqual(result["stages"][0]["expected_output"], "Extracted label text")
+
+    def test_preserves_multi_stage_dependencies(self):
+        result = self.normalize(
+            {
+                "stages": [
+                    {
+                        "name": "Find vehicle",
+                        "purpose": "Identify the user's vehicle.",
+                        "capability": "object_detection",
+                        "output": "Vehicle location and description",
+                    },
+                    {
+                        "name": "Find handle",
+                        "purpose": "Locate the passenger-side handle.",
+                        "capability": "spatial_relationship",
+                        "input": "Vehicle information from Stage 1",
+                        "output": "Door handle location",
+                    },
+                ],
+            },
+            ["object_detection", "spatial_relationship"],
+        )
+
+        self.assertTrue(result["should_chain"])
+        self.assertEqual(len(result["stages"]), 2)
+        self.assertEqual(result["stages"][1]["input"], "Vehicle information from Stage 1")
+
+    def test_issue_flow_contains_task_stages_section_and_logging(self):
+        source = (Path(__file__).resolve().parent / "stream_server.py").read_text(encoding="utf-8")
+        stage_plan = {
+            "stages": [{
+                "stage_name": "Find handle",
+                "goal": "Locate the passenger-side handle.",
+                "capability": "spatial_relationship",
+                "input": "Vehicle information from Stage 1",
+                "expected_output": "Door handle location",
+            }],
+        }
+        markdown = self.render(stage_plan)
+
+        self.assertIn("## Task Stages", markdown)
+        self.assertIn("### Find handle", markdown)
+        self.assertIn("**Input dependencies:** Vehicle information from Stage 1", markdown)
+        self.assertIn("Including Task Stages in GitHub issue", source)
+        self.assertIn("Issue body stage handoff", source)
+        self.assertIn("Issue creation stopped because stage decomposition failed", source)
+        self.assertIn("Always return at least one stage", build_stage_decomposition_prompt("test"))
+
+    def test_uber_stage_plan_reaches_issue_markdown(self):
+        plan = self.normalize(
+            {
+                "should_chain": True,
+                "stages": [
+                    {
+                        "stage_name": "Identify vehicle",
+                        "goal": "Identify the white Toyota Camry with plate ABC123.",
+                        "capability": "object_detection",
+                        "expected_output": "Vehicle location and description",
+                    },
+                    {
+                        "stage_name": "Locate passenger door",
+                        "goal": "Locate the passenger-side door.",
+                        "capability": "spatial_relationship",
+                        "input": "Vehicle information from Stage 1",
+                        "expected_output": "Passenger-side door location",
+                    },
+                    {
+                        "stage_name": "Guide user",
+                        "goal": "Guide the user toward the passenger-side door.",
+                        "capability": "navigation",
+                        "input": "Door location from Stage 2",
+                        "expected_output": "Walking guidance",
+                    },
+                ],
+            },
+            ["object_detection", "spatial_relationship", "navigation"],
+        )
+        markdown = self.render(plan)
+
+        self.assertIn("## Task Stages", markdown)
+        self.assertIn("### Identify vehicle", markdown)
+        self.assertIn("### Locate passenger door", markdown)
+        self.assertIn("### Guide user", markdown)
+
+        complete = self.normalize_requirements(
+            {
+                "problem": "Crowded pickup areas make the correct car difficult to find.",
+                "example_usage": "Find my Uber, locate its passenger door, and guide me to it.",
+                "implementation_details": "",
+                "custom_gpt": "no",
+                "gpt_query": "",
+            },
+            "Custom GPT: No",
+        )
+        body = self.append_stages("**Feature Description**\nUber guidance", plan)
+
+        self.assertEqual(complete["missing_fields"], [])
+        self.assertIn("## Task Stages", body)
+        self.assertIn("### Guide user", body)
+        self.assertNotIn("selected_model", body)
+
+    def test_issue_creation_path_does_not_call_model_router(self):
+        source_path = Path(__file__).resolve().parent / "stream_server.py"
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        create_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_github_issue"
+        )
+        create_source = ast.get_source_segment(source, create_node)
+
+        self.assertNotIn("_build_tool_planning_context", create_source)
+        self.assertNotIn("select_model(", create_source)
+        self.assertNotIn("final_execution_plan", create_source)
+        self.assertNotIn("stage_model_selection", create_source)
 
 
 class TestSentenceDetectionLogic(unittest.TestCase):
