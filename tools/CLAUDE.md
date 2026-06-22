@@ -40,17 +40,19 @@ def main(image, input_data=None):
   the user hears the same thing every ~500ms. Streaming output is capped at ~15 words.
 - **Model-backed work:** treat capability categories as declarations, not
   implementation requirements. Assume each generated tool implements one
-  user-facing task; do not plan subtasks or chain multiple model calls unless
-  the user explicitly asks for that. Use the existing backend model router
-  through the existing tool-facing client. Do
+  user-facing task. If the issue enumerates multiple stages, implement those
+  stages sequentially inside the tool and pass intermediate outputs from earlier
+  stages into later stages. Use the existing backend model router
+  through the existing tool-facing client for model selection only. Do
   not implement routing, create routers, create capability registries, create
   detector/OCR/LLM wrappers, concrete detector functions, model-backed
   inference, model loading, or provider calls inside a generated tool.
+  Do not ask the router to execute stages, manage workflows, pass outputs
+  between stages, or orchestrate pipelines.
   Import `copilot_llm_call` from `model_router_client` as the existing Copilot-routed backend entrypoint.
-  Supported categories for new tools include
-  `simple_parsing`, `object_detection`, `object_localization`,
-  `visual_understanding`, `visual_reasoning`, `ocr`, `summarization`,
-  `code_generation`, and `general_reasoning`. Include
+  Canonical categories for new tools are `general_reasoning`, `ocr`,
+  `object_detection`, `map_web`, `spatial_relationship`, `navigation`,
+  `camera_motion`, and `video`. Use only these category names. Include
   `metadata={"tool_name": "...", "route_text": "..."}` for routing logs. Do not
   hardcode provider/model names, detector names, provider-specific
   `DEFAULT_MODEL` constants, `COCO_CLASSES`, direct `litellm.completion()`
@@ -75,8 +77,10 @@ def main(image, input_data=None):
 
 1. Create `tools/your_tool.py` with `main(image, input_data)`.
 2. Write a `backend/test_<tool>.py` script and verify with `python test_<tool>.py`.
-3. Default building blocks: express the needed capability and call the matching
-   backend-provided capability entrypoint. The backend decides concrete models,
-   providers, detector backends, OCR engines, and fallback behavior.
+3. Default building blocks: express each needed stage capability and call the
+   matching backend-provided capability entrypoint. The generated tool owns
+   sequential stage execution and intermediate outputs; the backend decides
+   concrete models, providers, detector backends, OCR engines, and fallback
+   behavior for each capability call.
 4. `MODEL_SETUP.md` covers model files; `.github/copilot-instructions.md` has the
    full tool-generation spec. `CONTRIBUTING.md` has the PR and review process.
