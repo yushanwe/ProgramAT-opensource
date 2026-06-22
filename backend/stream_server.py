@@ -33,16 +33,14 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=str(Path(__file__).parent / '.env'))
 
 from model_router import (
-    load_capability_descriptions,
     load_capability_profiles,
-    normalize_pipeline_analysis,
     normalize_routing_analysis,
-    select_model,
     system_llm_call,
 )
 from litellm_utils import (
     extract_text,
 )
+from stage_decomposition import build_stage_decomposition_prompt
 from module_manager import get_module_manager
 import copilot_db
 from gemini_summarizer import summarize_entries_sync
@@ -105,12 +103,22 @@ def _normalize_custom_gpt_value(value) -> str:
         "don't reask",
     )
 
-    if any(phrase in text for phrase in affirmative_phrases):
-        return 'yes'
     if any(phrase in text for phrase in negative_phrases):
         return 'no'
+    if any(phrase in text for phrase in affirmative_phrases):
+        return 'yes'
 
     return ''
+
+
+def _explicit_custom_gpt_value(transcript: str) -> str:
+    """Read an explicit Custom GPT or live-mode yes/no label from user text."""
+    match = re.search(
+        r'\b(?:custom\s*gpt|live\s*mode)\s*:\s*(yes|no)\b',
+        str(transcript or ''),
+        re.IGNORECASE,
+    )
+    return match.group(1).lower() if match else ''
 
 
 def _extract_issue_section(body: str, *section_names: str) -> str:
@@ -147,11 +155,174 @@ def _format_capability_profiles_for_prompt() -> tuple[str, list[str]]:
             lines.append(f"  notes: {notes}")
     return "\n".join(lines), names
 
+
+def _normalize_parser_stage_plan(raw_plan: Any, supported_capabilities: List[str]) -> Dict[str, Any]:
+    """Normalize the parser's existing stage-decomposition output for issue generation."""
+    plan = raw_plan if isinstance(raw_plan, dict) else {}
+    supported = {str(name).strip().lower() for name in supported_capabilities}
+    stages: List[Dict[str, str]] = []
+
+    for index, raw_stage in enumerate(plan.get('stages') or [], start=1):
+        if not isinstance(raw_stage, dict):
+            continue
+        capability = str(raw_stage.get('capability', '')).strip().lower()
+        if capability not in supported:
+            logger.warning("Parser returned unknown capability: %s", capability)
+            continue
+        stages.append({
+            'stage_name': str(
+                raw_stage.get('stage_name') or raw_stage.get('name') or f'Stage {index}'
+            ).strip(),
+            'goal': str(raw_stage.get('goal') or raw_stage.get('purpose') or '').strip(),
+            'capability': capability,
+            'input': str(raw_stage.get('input') or '').strip(),
+            'expected_output': str(
+                raw_stage.get('expected_output') or raw_stage.get('output') or ''
+            ).strip(),
+        })
+
+    return {
+        'should_chain': len(stages) > 1,
+        'reason': str(plan.get('reason') or '').strip(),
+        'stages': stages,
+        'artifact_value_score': plan.get('artifact_value_score', 0.0),
+        'information_reduction': plan.get('information_reduction', 'none'),
+        'artifact_gain': plan.get('artifact_gain', 0.0),
+        'complexity_penalty': plan.get('complexity_penalty', 0.0),
+        'pipeline_score': plan.get('pipeline_score', 0.0),
+    }
+
+
+def _parse_llm_json_object(raw_text: str) -> Dict[str, Any]:
+    """Parse the first JSON object from a structured LLM response."""
+    text = str(raw_text or '').strip()
+    if text.startswith('```'):
+        first_newline = text.find('\n')
+        text = text[first_newline + 1:] if first_newline >= 0 else ''
+    if text.endswith('```'):
+        text = text[:-3].rstrip()
+
+    object_start = text.find('{')
+    if object_start < 0:
+        raise ValueError("Parser response did not contain a JSON object")
+    parsed, _ = json.JSONDecoder().raw_decode(text[object_start:])
+    if not isinstance(parsed, dict):
+        raise ValueError("Parser response JSON must be an object")
+    return parsed
+
+
+
+def _build_task_stages_markdown(stage_plan: Dict[str, Any]) -> str:
+    lines = [
+        "## Task Stages",
+        "",
+    ]
+
+    stages = stage_plan.get('stages') or []
+    for index, stage in enumerate(stages, start=1):
+        stage_title = stage.get('stage_name') or f"Stage {index}"
+        lines.extend([
+            f"### {stage_title}",
+            "",
+            f"- **Goal:** {stage.get('goal') or 'Not specified'}",
+            f"- **Capability:** {stage.get('capability') or 'Not specified'}",
+        ])
+        if stage.get('input'):
+            lines.append(f"- **Input dependencies:** {stage.get('input')}")
+        else:
+            lines.append("- **Input dependencies:** Original user request and current input")
+        lines.extend([
+            f"- **Expected output:** {stage.get('expected_output') or 'Not specified'}",
+            "",
+        ])
+
+    return "\n".join(lines).rstrip()
+
+
+def _append_task_stages_to_issue_body(
+    body: str,
+    stage_plan: Dict[str, Any],
+) -> str:
+    stages_section = _build_task_stages_markdown(stage_plan)
+    metadata_value = {
+        'execution_mode': 'sequential_stages' if len(stage_plan.get('stages') or []) > 1 else 'single_model',
+        'recommended_stage_count': len(stage_plan.get('stages') or []),
+        'stages': stage_plan.get('stages') or [],
+    }
+    metadata = json.dumps(metadata_value, indent=2, ensure_ascii=False)
+    metadata_section = "\n".join(
+        [
+            "## Parser Stage Metadata",
+            "",
+            "```json",
+            metadata,
+            "```",
+        ]
+    )
+    base = (body or '').rstrip()
+    return f"{base}\n\n{stages_section}\n\n{metadata_section}\n"
+
 # Configuration
-HOST = '0.0.0.0'  # Listen on all interfaces
-PORT = 8081 #port for listening
+HOST = os.environ.get('HOST', '127.0.0.1')
+PORT = int(os.environ.get('PORT', '8081'))
+AUTH_TOKEN = os.environ.get('AUTH_TOKEN', '').strip()
 SAVE_FRAMES = True  # Set to True to save frames to disk
 FRAMES_DIR = Path(__file__).parent / 'received_frames'
+
+SENSITIVE_LOG_KEY_RE = re.compile(
+    r"(api[_-]?key|token|secret|authorization|credential|password)",
+    re.IGNORECASE,
+)
+SENSITIVE_TEXT_REPLACEMENTS = (
+    (
+        re.compile(
+            r"(?i)(api[_-]?key|token|secret|authorization|credential|password)([\"']?\s*[:=]\s*[\"']?)([^\"'\s,}]+)"
+        ),
+        r"\1\2<redacted>",
+    ),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1<redacted>"),
+)
+
+
+def _is_sensitive_log_key(key: Any) -> bool:
+    return bool(SENSITIVE_LOG_KEY_RE.search(str(key or "")))
+
+
+def _summarize_log_string(value: str) -> str:
+    if len(value) > 2000:
+        return f"<str length={len(value)}>"
+    redacted = value
+    for pattern, replacement in SENSITIVE_TEXT_REPLACEMENTS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_for_log(value: Any, key: Any = "") -> Any:
+    if _is_sensitive_log_key(key):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {k: _redact_for_log(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_for_log(item) for item in value]
+    if isinstance(value, str):
+        return _summarize_log_string(value)
+    return value
+
+
+def _websocket_auth_failed(request: web.Request) -> bool:
+    if not AUTH_TOKEN:
+        return False
+
+    supplied = (
+        request.query.get('auth')
+        or request.query.get('token')
+        or request.headers.get('X-ProgramAT-Auth', '')
+    )
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.lower().startswith('bearer '):
+        supplied = auth_header[7:].strip()
+
+    return supplied != AUTH_TOKEN
 
 # Directory setup
 FRAMES_DIR = Path("backend/received_frames")
@@ -245,28 +416,13 @@ class SessionLogger:
             obj = None
 
         if obj and isinstance(obj, dict):
-            # Summarize any large binary fields while keeping other data intact
-            summarized = {}
-            for k, v in obj.items():
-                if k == 'data' and isinstance(v, dict):
-                    # summarize inner data
-                    inner = {}
-                    for ik, iv in v.items():
-                        if isinstance(iv, str) and len(iv) > 1000:
-                            inner[ik] = f"<str length={len(iv)}>"
-                        else:
-                            inner[ik] = iv
-                    summarized[k] = inner
-                elif isinstance(v, str) and len(v) > 2000:
-                    summarized[k] = f"<str length={len(v)}>"
-                else:
-                    summarized[k] = v
+            summarized = _redact_for_log(obj)
             try:
                 detail_str = _json.dumps(summarized, ensure_ascii=False)
             except Exception:
                 detail_str = str(summarized)
         else:
-            detail_str = details
+            detail_str = _summarize_log_string(details) if isinstance(details, str) else details
 
         self.log("MSG", f"{arrow} {msg_type}: {detail_str}")
     
@@ -2996,7 +3152,6 @@ Return ONLY a valid JSON object:
 }}"""
 
         response = system_llm_call(
-            capability='tool_retrieval',
             messages=[{'role': 'user', 'content': prompt}],
         )
         ai_response = extract_text(response)
@@ -3160,133 +3315,56 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         logger.error(tb)
 
 
-def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dict:
-    """
-    Use AI to parse the transcript and extract structured information for issue template.
-    
-    Args:
-        transcript: The voice transcript to parse
-        existing_data: Optional existing incomplete issue data for context
-        
-    Returns:
-        Dictionary with parsed fields including 'missing_fields' list
-    """
-    try:
-        try:
-            capability_profiles_text, capability_names = _format_capability_profiles_for_prompt()
-        except Exception:
-            capability_profiles_text = ""
-            capability_names = ['general_reasoning', 'ocr', 'object_detection', 'map_web', 'spatial_relationship', 'navigation', 'camera_motion', 'video']
-        capability_names_text = ', '.join(capability_names)
+def _build_issue_extraction_prompt(transcript: str, existing_data: Optional[dict] = None) -> str:
+    context_info = ""
+    if existing_data:
+        issue_fields = {
+            key: value
+            for key, value in existing_data.items()
+            if key not in {
+                'missing_fields', 'routing_analysis', 'pipeline_analysis',
+                'original_prompts',
+            }
+            and value
+        }
+        context_info = f"""
+IMPORTANT: This is a follow-up response to an incomplete issue.
 
-        # Build context from existing data if this is a follow-up
-        context_info = ""
-        if existing_data:
-            # Filter out empty values and missing_fields for cleaner context
-            existing_fields = {k: v for k, v in existing_data.items() 
-                             if k != 'missing_fields' and v and (isinstance(v, str) and v.strip() or not isinstance(v, str))}
-            context_info = f"""
-IMPORTANT: This is a follow-up response to an incomplete issue. The user is providing additional information.
+Previously captured issue information:
+{json.dumps(issue_fields, indent=2)}
 
-Previously captured information:
-{json.dumps(existing_fields, indent=2)}
-
-Fields that were previously missing: {existing_data.get('missing_fields', [])}
-
-The new transcript below is the user providing the missing information. Focus on extracting the information they are providing now.
+Fields previously missing: {existing_data.get('missing_fields', [])}
+Merge the new transcript into those issue fields.
 """
-        
-        prompt = f"""Parse the following voice transcript and extract information for a visual assistive technology (AT) tool request.
 
-CRITICAL: Do not make up, infer, or extrapolate ANY content that was not explicitly said. If a field is empty or not mentioned, leave it empty - it can be filled in later. Only extract information that was directly stated in the transcript.
+    return f"""Parse the following voice transcript and extract information for a visual assistive technology (AT) tool request.
 
-For a visual AT request, extract:
-- title: A concise summary (max 100 characters)
+CRITICAL: Do not make up, infer, or extrapolate content that was not explicitly provided. Leave unmentioned fields empty.
+
+Extract only these issue fields:
+- title: concise summary, maximum 100 characters
 - description: description of the desired visual assistive technology
-- problem: Problem it solves
-- solution: Proposed solution
-- implementation_details: any specific tech stack details desired
-- example_usage: an example use case and how the tool should handle it
-- live_mode: should this tool use backend-managed live multimodal mode with a repeated query on each camera frame? ONLY set to "yes" or "no" if the user EXPLICITLY stated their preference. If they did not mention it at all, leave this field EMPTY (empty string "").
-- live_query: if live_mode is "yes", what is the exact prompt to re-ask on every frame?
-- alternatives: Alternative solutions considered
-- additional: Any other context
-- routing_analysis: A lightweight routing plan used by backend model selection.
-- pipeline_analysis: A conservative execution-plan decision using the same capabilities.
+- problem: problem it solves
+- solution: proposed solution
+- implementation_details: requested implementation details
+- example_usage: concrete example and expected behavior
+- alternatives: alternatives considered
+- live_mode: exactly "yes", "no", or empty when not explicitly stated
+- live_query: repeated live-mode query, otherwise empty
+- additional: other context
+- missing_fields: only missing important fields
 
-Routing rules:
-1. Provide 2-4 task entries when possible.
-2. Task weights should sum to approximately 1.0.
-3. Select only from these capability names: {capability_names_text}
-4. Do not create new capability names.
-5. Map the user request onto the closest existing capabilities from that list.
-6. Prefer the minimum necessary capability set.
-7. Prefer 1 capability when one capability is sufficient.
-8. Prefer 2 capabilities over 3 unless the task truly requires more.
-9. Do not include a capability unless removing it would significantly reduce task success.
-10. Use capability exclusions as hard negative evidence.
-11. You are given the full capability definitions below. Use them to decide what is required.
+Only block creation when the core task is genuinely unclear.
+- Core context: problem or description.
+- Core goal: example_usage or another clear task goal in solution/description.
+- Derive a concise title, description, and solution from an explicit problem or example when possible without inventing new requirements.
+- implementation_details, alternatives, and additional are optional.
+- live_mode is optional when not explicitly stated.
+- If live_mode is "yes" and live_query is empty, include "live_query" in missing_fields.
+- If live_mode is "no", live_query is optional and must not be included in missing_fields.
+- Do not return routing_analysis, pipeline_analysis, capabilities, or stages.
 
-Capability definitions:
-{capability_profiles_text}
-
-12. latency_sensitivity levels:
-    - high: live camera, navigation, object finding, real-time assistive feedback
-    - medium: normal interactive tasks
-    - low: offline generation, code generation, long-form reasoning, non-urgent analysis
-
-Pipeline decision rules:
-1. First decide the capability distribution in routing_analysis. Then separately decide whether those capabilities should run inside one model or as a pipeline.
-2. Do not create a pipeline merely because multiple capabilities exist.
-3. Do NOT decide should_chain=false because a single modern VLM could theoretically perform all capabilities. That is not the criterion.
-4. The primary criterion is information reduction: can an earlier stage produce a structured intermediate artifact that reduces the search space, visual scope, or reasoning burden for a later stage?
-5. Good intermediate artifacts include bounding boxes, object coordinates, segmentation masks, cropped regions, OCR text, object lists, target locations, clock-face directions, and navigation waypoints.
-6. Stages must follow producer -> consumer information flow, not capability ranking order.
-7. Do not add stage capabilities that are unrelated to routing_analysis, unless that stage is strictly required to produce an intermediate artifact for a downstream stage.
-8. Increase chaining confidence for useful transitions: object_detection -> camera_motion, object_detection -> navigation, object_detection -> general_reasoning, ocr -> general_reasoning, ocr -> map_web, map_web -> general_reasoning.
-9. Avoid redundant overlapping stages. If one capability can directly consume the upstream artifact, do not insert an extra stage.
-10. Distinguish camera_motion vs navigation strictly:
-    - camera_motion: camera framing or aiming actions (left/right/up/down, closer/farther, zoom, center target)
-    - navigation: physical wayfinding and walking guidance through space
-11. Do not treat camera_motion and navigation as interchangeable. Include both only if both are explicitly required.
-12. Prefer should_chain=true for tasks like "find X then guide me", "find X then localize Y", "detect X then reason about X", and "extract text then analyze text" because Stage 1 compresses the problem.
-13. Prefer should_chain=false for holistic tasks such as describing a room, explaining a chart, rating an outfit, summarizing an image, or interpreting an overall scene when no meaningful intermediate artifact reduces later work.
-14. Default to should_chain=false only when no useful intermediate artifact or information reduction exists.
-15. Do not hardcode or assume a maximum stage count. Infer the stage count dynamically from useful artifact flow.
-16. Optimize for the minimum useful stage count, not the minimum stage count alone.
-17. Use a complexity penalty to discourage unnecessary stages:
-    pipeline_score = artifact_gain - complexity_penalty
-    complexity_penalty = (stage_count - 1) * penalty_per_stage
-18. Add another stage when it preserves an important intermediate artifact or materially improves information reduction/task success probability.
-19. Do not add another stage when it only repeats work, changes wording, or does not improve downstream inputs.
-20. Stage preferred_model_type should describe the kind of model wanted, such as "fast_detector", "ocr_extractor", "reasoning_vlm", "navigation_model", or "response_generator"; do not name a specific model.
-21. Include artifact_value_score from 0.0 to 1.0. Set it high when Stage 1 removes substantial irrelevant visual information.
-22. Include information_reduction as "none", "minor", "moderate", or "significant".
-
-CRITICAL: Evaluate which IMPORTANT fields are missing or insufficiently specified.
-ONLY mark IMPORTANT fields in the missing_fields array. Optional/nice-to-have fields should NOT be included even if empty.
-
-Important fields for visual AT: title, description, problem, solution, example_usage, live_mode, live_query
-In the event live_mode is explicitly "no", live_query is no longer important.
-
-
-Guidelines for determining if an IMPORTANT field is missing:
-1. A field should ONLY be marked as missing if it is completely absent or so vague it provides no useful information
-2. If a field has ANY meaningful content that addresses its purpose, it should NOT be marked as missing
-3. For "problem": If the user explains why they need the tool, this is sufficient
-4. For "solution": If the user describes what they want or how it should work, this is sufficient
-5. For "example_usage": If the user provides any concrete example use case, this is sufficient
-6. For "live_mode": Leave this field as an EMPTY STRING unless the user EXPLICITLY said "yes" or "no". If the transcript does not clearly contain the user saying they want or don't want live mode, the field MUST be empty. When it is empty, ALWAYS include "live_mode" in missing_fields. Do NOT guess, infer, or assume — this is a question we must ask the user directly.
-7. For "live_query": Always include this in missing_fields if live_mode is "yes" and no query has been provided. If live_mode is "no", do not include this.
-8. ALWAYS include example_usage in missing_fields if no concrete example use case (>= 10 characters) is present
-
-If ALL important fields have meaningful content (even if brief), return an empty missing_fields array: []
-
-Return ONLY a valid JSON object with the fields. Leave fields empty if not mentioned in the transcript.
-{context_info}
-Transcript: {transcript}
-
-Return format:
+Return ONLY this JSON object:
 {{
   "type": "visual AT",
   "title": "...",
@@ -3299,44 +3377,123 @@ Return format:
   "live_mode": "...",
   "live_query": "...",
   "additional": "...",
-    "missing_fields": ["field1", "field2"],  // Only truly missing/empty important fields. Use [] if all important fields have content.
-    "routing_analysis": {{
-        "tasks": [
-            {{"name": "ocr", "weight": 0.8, "reason": "The user needs text from the image."}},
-            {{"name": "general_reasoning", "weight": 0.2, "reason": "The response should explain the extracted content."}}
-        ],
-        "latency_sensitivity": {{"level": "high|medium|low", "weight": 0.0, "reason": "..."}}
-    }},
-    "pipeline_analysis": {{
-        "should_chain": false,
-        "reason": "No structured intermediate artifact would significantly reduce later visual scope or reasoning burden.",
-        "artifact_value_score": 0.0,
-        "information_reduction": "none",
-        "artifact_gain": 0.0,
-        "complexity_penalty": 0.0,
-        "pipeline_score": 0.0,
-        "stages": []
-    }}
-}}"""
+  "missing_fields": []
+}}
+{context_info}
+Transcript: {transcript}
+"""
 
-        response = system_llm_call(
-            capability='text_parse',
-            messages=[{'role': 'user', 'content': prompt}],
+
+def _stage_decomposition_input(transcript: str, existing_data: Optional[dict] = None) -> str:
+    previous_prompts = list((existing_data or {}).get('original_prompts') or [])
+    prior_text = [entry.split('] ', 1)[-1] for entry in previous_prompts]
+    return "\n".join([*prior_text, transcript]).strip()
+
+
+def _merge_issue_and_stage_outputs(
+    issue_data: Dict[str, Any],
+    decomposition_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = dict(issue_data)
+    merged['routing_analysis'] = decomposition_data.get('routing_analysis')
+    merged['pipeline_analysis'] = decomposition_data.get('pipeline_analysis')
+    return merged
+
+
+def _normalize_issue_creation_requirements(
+    parsed_data: Dict[str, Any],
+    transcript: str,
+) -> Dict[str, Any]:
+    normalized = dict(parsed_data)
+    explicit_custom_gpt = _explicit_custom_gpt_value(transcript)
+    parsed_custom_gpt = _normalize_custom_gpt_value(
+        normalized.get('custom_gpt') or normalized.get('live_mode')
+    )
+    custom_gpt = explicit_custom_gpt or parsed_custom_gpt
+    gpt_query = str(normalized.get('gpt_query') or normalized.get('live_query') or '').strip()
+
+    normalized['custom_gpt'] = custom_gpt
+    normalized['gpt_query'] = '' if custom_gpt == 'no' else gpt_query
+
+    has_context = bool(str(normalized.get('problem') or normalized.get('description') or '').strip())
+    has_goal = bool(str(
+        normalized.get('example_usage')
+        or normalized.get('solution')
+        or normalized.get('description')
+        or ''
+    ).strip())
+
+    missing_fields = []
+    if not has_context:
+        missing_fields.append('description')
+    if not has_goal:
+        missing_fields.append('example_usage')
+    if custom_gpt == 'yes' and not normalized['gpt_query']:
+        missing_fields.append('gpt_query')
+    normalized['missing_fields'] = missing_fields
+    return normalized
+
+
+def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dict:
+    """
+    Use AI to parse the transcript and extract structured information for issue template.
+
+    Args:
+        transcript: The voice transcript to parse
+        existing_data: Optional existing incomplete issue data for context
+
+    Returns:
+        Dictionary with parsed fields including 'missing_fields' list
+    """
+    try:
+        try:
+            capability_names = sorted(load_capability_profiles())
+        except Exception:
+            capability_names = ['general_reasoning', 'ocr', 'object_detection', 'map_web', 'spatial_relationship', 'navigation', 'camera_motion', 'video']
+
+        issue_prompt = _build_issue_extraction_prompt(transcript, existing_data)
+        issue_response = system_llm_call(
+            messages=[{'role': 'user', 'content': issue_prompt}],
+            metadata={'response_format': {'type': 'json_object'}},
+        )
+        issue_raw = extract_text(issue_response)
+        issue_data = _parse_llm_json_object(issue_raw)
+        logger.info(
+            "Issue extraction output=%s",
+            json.dumps(issue_data, ensure_ascii=False),
         )
 
-        # Parse the AI response
-        ai_response = extract_text(response)
-        
-        # Remove markdown code blocks if present
-        if ai_response.startswith('```json'):
-            ai_response = ai_response[7:]
-        if ai_response.startswith('```'):
-            ai_response = ai_response[3:]
-        if ai_response.endswith('```'):
-            ai_response = ai_response[:-3]
-        ai_response = ai_response.strip()
-        
-        parsed_data = json.loads(ai_response)
+        decomposition_input = _stage_decomposition_input(transcript, existing_data)
+        decomposition_prompt = build_stage_decomposition_prompt(decomposition_input)
+        decomposition_response = system_llm_call(
+            messages=[{'role': 'user', 'content': decomposition_prompt}],
+            metadata={'response_format': {'type': 'json_object'}},
+        )
+        decomposition_raw = extract_text(decomposition_response)
+        logger.info(
+            "Stage decomposition raw response length=%s preview=%s",
+            len(decomposition_raw),
+            decomposition_raw[:2000],
+        )
+        decomposition_data = _parse_llm_json_object(decomposition_raw)
+        logger.info(
+            "Stage decomposition output=%s",
+            json.dumps(decomposition_data, ensure_ascii=False),
+        )
+
+        parsed_data = _merge_issue_and_stage_outputs(issue_data, decomposition_data)
+        logger.info(
+            "Merged parser output=%s",
+            json.dumps(parsed_data, ensure_ascii=False),
+        )
+
+        raw_stage_plan = parsed_data.get('pipeline_analysis')
+        raw_stages = raw_stage_plan.get('stages') if isinstance(raw_stage_plan, dict) else []
+        logger.info(
+            "Parser raw stage plan present=%s stage_count=%s",
+            isinstance(raw_stage_plan, dict),
+            len(raw_stages) if isinstance(raw_stages, list) else 0,
+        )
 
         normalized_routing_analysis = normalize_routing_analysis(
             parsed_data.get('routing_analysis'),
@@ -3348,38 +3505,16 @@ Return format:
             # Keep backward compatibility by allowing invalid field to be dropped.
             parsed_data.pop('routing_analysis', None)
 
-        parsed_data['pipeline_analysis'] = normalize_pipeline_analysis(
+        parsed_data['pipeline_analysis'] = _normalize_parser_stage_plan(
             parsed_data.get('pipeline_analysis'),
-            supported_capabilities=capability_names,
+            capability_names,
+        )
+        logger.info(
+            "Parser normalized stage_count=%s",
+            len(parsed_data['pipeline_analysis'].get('stages') or []),
         )
 
-        if 'live_mode' in parsed_data and 'custom_gpt' not in parsed_data:
-            parsed_data['custom_gpt'] = parsed_data.get('live_mode', '')
-        if 'live_query' in parsed_data and 'gpt_query' not in parsed_data:
-            parsed_data['gpt_query'] = parsed_data.get('live_query', '')
-
-        parsed_custom_gpt = _normalize_custom_gpt_value(parsed_data.get('custom_gpt', ''))
-        if not parsed_custom_gpt:
-            parsed_custom_gpt = _normalize_custom_gpt_value(transcript)
-        parsed_data['custom_gpt'] = parsed_custom_gpt
-
-        missing_fields = [
-            'custom_gpt' if field == 'live_mode' else 'gpt_query' if field == 'live_query' else field
-            for field in parsed_data.get('missing_fields', [])
-        ]
-        if parsed_custom_gpt:
-            missing_fields = [field for field in missing_fields if field != 'custom_gpt']
-            if parsed_custom_gpt == 'no':
-                missing_fields = [field for field in missing_fields if field != 'gpt_query']
-            elif parsed_custom_gpt == 'yes' and not parsed_data.get('gpt_query'):
-                if 'gpt_query' not in missing_fields:
-                    missing_fields.append('gpt_query')
-
-        parsed_data['missing_fields'] = missing_fields
-        
-        # Ensure missing_fields exists
-        if 'missing_fields' not in parsed_data:
-            parsed_data['missing_fields'] = []
+        parsed_data = _normalize_issue_creation_requirements(parsed_data, transcript)
         
         # Preserve the original transcript for bookkeeping
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
@@ -3401,7 +3536,7 @@ Return format:
             json.dumps((parsed_data.get('routing_analysis') or {}).get('latency_sensitivity', {})),
         )
         logger.info(
-            "Pipeline decision=%s",
+            "Parser stage decision=%s",
             json.dumps({
                 'should_chain': parsed_data['pipeline_analysis'].get('should_chain'),
                 'reason': parsed_data['pipeline_analysis'].get('reason'),
@@ -3412,13 +3547,17 @@ Return format:
                 'pipeline_score': parsed_data['pipeline_analysis'].get('pipeline_score'),
             }),
         )
-        logger.info("Pipeline stages=%s", json.dumps(parsed_data['pipeline_analysis'].get('stages', [])))
+        logger.info(
+            "Parser stages for issue=%s",
+            json.dumps(parsed_data['pipeline_analysis'].get('stages', []), ensure_ascii=False),
+        )
         
         logger.info(f"Successfully parsed transcript with AI: type={parsed_data.get('type', 'unknown')}, missing={len(parsed_data.get('missing_fields', []))}")
         return parsed_data
         
     except Exception as e:
-        logger.error(f"Failed to parse transcript with AI: {e}")
+        logger.exception("Failed to complete issue extraction and stage decomposition")
+        _log_to_all_sessions("ERROR", f"Issue parser workflow failed: {e}")
         # Fallback to simple parsing
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -3440,6 +3579,8 @@ Return format:
             'gpt_query': '',
             'alternatives': '',
             'additional': '',
+            'parser_failed': True,
+            'parser_error': str(e),
             'missing_fields': fallback_missing_fields,
             'original_prompts': existing_prompts + [f"[{timestamp}] {transcript}"]
         }
@@ -3719,39 +3860,25 @@ async def create_github_issue(text: str):
             parsed_data = parse_transcript_with_ai(text.strip())
             _log_to_all_sessions("INFO", f"AI parsing result: {parsed_data}")
             logger.info(f"Initial parsing. Type: {parsed_data.get('type')}, Missing: {parsed_data.get('missing_fields', [])}")
+
+        if parsed_data.get('parser_failed'):
+            error_message = parsed_data.get('parser_error') or 'unknown parser error'
+            logger.error("Issue creation stopped because stage decomposition failed: %s", error_message)
+            _log_to_all_sessions(
+                "ERROR",
+                f"Issue creation stopped because stage decomposition failed: {error_message}",
+            )
+            if connected_clients:
+                await broadcast_to_connected_clients({
+                    'type': 'issue_creation_error',
+                    'message': 'I could not decompose the task, so no incomplete issue was created. Please try again.',
+                })
+            return
         
         # Check for missing fields
         missing_fields = parsed_data.get('missing_fields', [])
         issue_type = 'visual AT'  # Always visual AT now
 
-        try:
-            route_result = select_model(
-                text.strip(),
-                routing_analysis=parsed_data.get('routing_analysis'),
-                pipeline_analysis=parsed_data.get('pipeline_analysis'),
-            )
-            selected_model = route_result.get('selected_model')
-            parsed_data['selected_model'] = selected_model
-            parsed_data['final_execution_plan'] = route_result.get('final_execution_plan')
-            parsed_data['stage_model_selection'] = [
-                {
-                    'index': stage.get('index'),
-                    'capability': stage.get('capability'),
-                    'selected_model': stage.get('selected_model'),
-                }
-                for stage in route_result.get('stage_model_selection', [])
-            ]
-            logger.info("Parsed routing selected_model=%s", selected_model)
-            logger.info("Parsed routing final_execution_plan=%s", json.dumps(parsed_data.get('final_execution_plan')))
-            for candidate in route_result.get('ranking', []):
-                logger.info(
-                    "Parsed routing candidate=%s final_score=%.4f",
-                    candidate.get('model'),
-                    float(candidate.get('final_score', 0.0)),
-                )
-        except Exception as route_error:
-            logger.warning(f"Routing selection skipped due to error: {route_error}")
-        
         # If there are important missing fields, send feedback and save incomplete data
         if missing_fields:
             # Store incomplete issue for next round
@@ -3799,6 +3926,25 @@ async def create_github_issue(text: str):
         else:
             # Fallback if template doesn't exist
             body = f"**Transcript:**\n{text}\n\n**Parsed Data:**\n{json.dumps(parsed_data, indent=2)}"
+
+        stage_plan = parsed_data.get('pipeline_analysis') or {}
+        issue_stages = stage_plan.get('stages') or []
+        logger.info(
+            "Issue body stage handoff: pipeline_present=%s stage_count=%s",
+            bool(stage_plan),
+            len(issue_stages),
+        )
+        if issue_stages:
+            body = _append_task_stages_to_issue_body(body, stage_plan)
+            logger.info(
+                "Including Task Stages in GitHub issue: %s",
+                json.dumps(issue_stages, ensure_ascii=False),
+            )
+            _log_to_all_sessions(
+                "INFO",
+                f"Including {len(issue_stages)} Task Stages in GitHub issue: "
+                f"{json.dumps(issue_stages, ensure_ascii=False)}",
+            )
         
         # Create GitHub client
         g = Github(GITHUB_TOKEN)
@@ -5479,7 +5625,6 @@ async def handle_client(websocket):
                             # Send the follow-up through the fixed system LLM path.
                             try:
                                 response = system_llm_call(
-                                    capability='image_analysis',
                                     messages=[{'role': 'user', 'content': prompt}],
                                     images=[pil_image],
                                 )
@@ -5593,6 +5738,10 @@ async def handle_client(websocket):
 
 
 async def websocket_handler(request: web.Request):
+    if _websocket_auth_failed(request):
+        logger.warning("Rejected unauthorized WebSocket connection from %s", request.remote)
+        return web.Response(status=401, text="Unauthorized")
+
     websocket = web.WebSocketResponse(
         max_msg_size=20 * 1024 * 1024,
         heartbeat=20,
