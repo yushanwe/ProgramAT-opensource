@@ -12,7 +12,7 @@ from model_router_client import copilot_llm_call
 
 
 TOOL_NAME = "nearest_exit_locator"
-EXIT_DETECTION_CATEGORY = "object_detection"
+EXIT_DETECTION_CATEGORY = "object_detection_localization"
 NAVIGATION_CATEGORY = "navigation"
 
 
