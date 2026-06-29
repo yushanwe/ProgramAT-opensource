@@ -49,6 +49,8 @@ CANONICAL_TASK_CATEGORIES = {
 }
 
 STAGE_CAPABILITY_ALIASES = {
+    # Some issue templates still emit older/non-canonical stage names.
+    # Normalize only known equivalents to the router's canonical categories here.
     "object_detection_localization": "object_detection",
     "structured_visual_understanding": "map_web",
     "spatial_reasoning": "spatial_relationship",
