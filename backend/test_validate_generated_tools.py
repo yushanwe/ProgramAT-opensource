@@ -25,6 +25,18 @@ Stage 3:
 Capability: navigation
 """
 
+    EXIT_STAGE_ALIAS_ISSUE = """
+## Feature Description
+Nearest Exit Locator
+
+## Task Stages
+Stage 1:
+Capability: object_detection_localization
+
+Stage 2:
+Capability: navigation
+"""
+
     def _write_temp_tool(self, name: str, text: str) -> Path:
         temp_dir = tempfile.TemporaryDirectory(dir=validate_generated_tools.TOOLS_DIR)
         self.addCleanup(temp_dir.cleanup)
@@ -159,6 +171,42 @@ def main(image, input_data=None):
         )
 
         failures = validate_generated_tools.validate_files([path], issue_text=self.UBER_STAGE_ISSUE)
+        self.assertEqual(failures, [])
+
+    def test_normalizes_stage_capability_aliases_to_canonical_categories(self):
+        self.assertEqual(
+            validate_generated_tools.extract_stage_capabilities(self.EXIT_STAGE_ALIAS_ISSUE),
+            ["object_detection", "navigation"],
+        )
+
+    def test_allows_canonical_tool_calls_for_alias_stage_names(self):
+        path = self._write_temp_tool(
+            "nearest_exit_alias_stage_tool.py",
+            """
+from model_router_client import copilot_llm_call
+
+def main(image, input_data=None):
+    detection_result = copilot_llm_call(
+        task_category="object_detection",
+        messages=[{"role": "user", "content": "Locate the nearest exit door."}],
+        images=[image],
+        metadata={"tool_name": "nearest_exit_alias_stage_tool", "stage_name": "Stage 1"},
+    )
+    guidance_result = copilot_llm_call(
+        task_category="navigation",
+        messages=[{"role": "user", "content": "Guide the user to the exit."}],
+        images=[image],
+        metadata={
+            "tool_name": "nearest_exit_alias_stage_tool",
+            "stage_name": "Stage 2",
+            "previous_stage_output": detection_result,
+        },
+    )
+    return guidance_result
+""",
+        )
+
+        failures = validate_generated_tools.validate_files([path], issue_text=self.EXIT_STAGE_ALIAS_ISSUE)
         self.assertEqual(failures, [])
 
 

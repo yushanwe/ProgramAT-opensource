@@ -48,6 +48,13 @@ CANONICAL_TASK_CATEGORIES = {
     "video",
 }
 
+STAGE_CAPABILITY_ALIASES = {
+    "object_detection_localization": "object_detection",
+    "structured_visual_understanding": "map_web",
+    "spatial_reasoning": "spatial_relationship",
+    "temporal_reasoning": "video",
+}
+
 
 def _extract_task_stages_section(issue_text: str) -> str:
     match = re.search(r"^##\s+Task\s+Stages\s*$", issue_text, re.IGNORECASE | re.MULTILINE)
@@ -69,7 +76,7 @@ def extract_stage_capabilities(issue_text: str) -> List[str]:
 
     capabilities: List[str] = []
     for cap in re.findall(r"^\s*(?:[-*]\s*)?Capability\s*:\s*`?([a-z_]+)`?\s*$", section, re.IGNORECASE | re.MULTILINE):
-        capability = cap.strip()
+        capability = STAGE_CAPABILITY_ALIASES.get(cap.strip(), cap.strip())
         if capability in CANONICAL_TASK_CATEGORIES:
             capabilities.append(capability)
     return capabilities
