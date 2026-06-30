@@ -16,6 +16,13 @@ from litellm_utils import extract_text
 TOOL_NAME = "locate_nearest_exit"
 
 
+def _get_text(response) -> str:
+    """Extract plain text from a copilot_llm_call response."""
+    if hasattr(response, "choices"):
+        return extract_text(response)
+    return str(response)
+
+
 def main(image, input_data=None):
     """
     Locate the nearest exit door and guide the user toward it.
@@ -58,7 +65,7 @@ def main(image, input_data=None):
         },
     )
 
-    detection_text = extract_text(detection_response) if hasattr(detection_response, "choices") else str(detection_response)
+    detection_text = _get_text(detection_response)
 
     # Stage 2: Guide the user toward the detected exit
     navigation_response = copilot_llm_call(
@@ -69,8 +76,8 @@ def main(image, input_data=None):
                 "content": (
                     "You are a navigation assistant helping a blind user reach the nearest exit door. "
                     "Based on the exit detection results and the camera image, provide clear, step-by-step "
-                    "walking directions. Use clock positions (1 through 12) or simple directions (left, right, "
-                    "straight ahead) to guide the user. Keep guidance brief and actionable."
+                    "walking directions. Use clock positions (1 to 3 or 9 to 12 o'clock) or simple directions "
+                    "(left, right, straight ahead) to guide the user. Keep guidance brief and actionable."
                 ),
             },
             {
@@ -91,7 +98,7 @@ def main(image, input_data=None):
         },
     )
 
-    navigation_text = extract_text(navigation_response) if hasattr(navigation_response, "choices") else str(navigation_response)
+    navigation_text = _get_text(navigation_response)
 
     if not navigation_text or navigation_text.strip() == "":
         return "No exit found in view. Try turning slowly to scan for exit signs."
