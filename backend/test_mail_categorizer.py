@@ -61,7 +61,16 @@ def test_with_synthetic_image():
         spoken = result.get("text") or result.get("audio", {}).get("text", "")
     else:
         spoken = result
+    assert isinstance(spoken, str), f"Spoken output must be a string, got {type(spoken)}"
+    spoken_lower = spoken.lower()
+    # The tool should produce categorization language
+    categorization_keywords = {"important", "junk", "bank", "statement", "mail", "letter", "envelope"}
+    matched = [kw for kw in categorization_keywords if kw in spoken_lower]
+    assert matched, (
+        f"Expected at least one categorization keyword in output, got: {spoken[:200]}"
+    )
     print(f"  Result type: {type(result).__name__}")
+    print(f"  Matched keywords: {matched}")
     print(f"  Spoken output: {spoken[:300]}")
     print("  PASS\n")
 

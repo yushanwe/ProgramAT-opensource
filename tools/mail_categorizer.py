@@ -8,21 +8,11 @@ as important or junk and speaks the result to the user.
 
 from typing import Any, Dict, Optional
 
-import cv2
 import numpy as np
-from PIL import Image
 
-from litellm_utils import pil_image_to_data_uri
 from model_router_client import copilot_llm_call
 
 TOOL_NAME = "mail_categorizer"
-
-
-def _image_to_data_uri(image: np.ndarray) -> str:
-    """Convert an OpenCV BGR image to a data URI for LLM calls."""
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(rgb)
-    return pil_image_to_data_uri(pil_img)
 
 
 def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
@@ -44,16 +34,11 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
     if image is None:
         return "No image received. Please point the camera at your mail."
 
-    try:
-        image_uri = _image_to_data_uri(image)
-    except Exception:
-        return "Could not process the image. Please try again."
-
     # Stage 1 – Detect mail objects in the frame
     detection = copilot_llm_call(
         capability="object_detection_localization",
         goal="Detect mail items in the image such as envelopes, letters, packages, and postcards.",
-        images=[image_uri],
+        images=[image],
         metadata={
             "tool_name": TOOL_NAME,
             "route_text": "detect envelopes, letters, packages, and postcards in the camera frame",
@@ -65,7 +50,7 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
     ocr_result = copilot_llm_call(
         capability="ocr",
         goal="Read all text visible on the mail items, including sender names, return addresses, subject lines, and any promotional labels.",
-        images=[image_uri],
+        images=[image],
         metadata={
             "tool_name": TOOL_NAME,
             "route_text": "extract text from mail items including sender, address, and subject",
