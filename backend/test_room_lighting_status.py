@@ -3,6 +3,7 @@
 
 import os
 import sys
+from unittest.mock import patch
 
 import numpy as np
 
@@ -32,8 +33,8 @@ def test_general_reasoning_stage() -> None:
         calls.append(kwargs)
         return {"response": "LEVEL: normal\nMESSAGE: Lighting is normal."}
 
-    room_lighting_status.copilot_llm_call = fake_call
-    output = room_lighting_status.main(make_test_image(), {})
+    with patch.object(room_lighting_status, "copilot_llm_call", side_effect=fake_call):
+        output = room_lighting_status.main(make_test_image(), {})
 
     assert isinstance(output, str)
     assert "normal" in output.lower()
@@ -43,11 +44,12 @@ def test_general_reasoning_stage() -> None:
 
 
 def test_low_light_warning() -> None:
-    def fake_call(**_kwargs):
+    def fake_call(**kwargs):
+        assert kwargs.get("capability") == "general_reasoning"
         return {"response": "LEVEL: dark\nMESSAGE: Room is dark. Turn on a light."}
 
-    room_lighting_status.copilot_llm_call = fake_call
-    output = room_lighting_status.main(make_test_image(), {})
+    with patch.object(room_lighting_status, "copilot_llm_call", side_effect=fake_call):
+        output = room_lighting_status.main(make_test_image(), {})
 
     assert isinstance(output, dict)
     assert output.get("audio", {}).get("type") == "warning"
@@ -55,11 +57,12 @@ def test_low_light_warning() -> None:
 
 
 def test_significant_change_warning() -> None:
-    def fake_call(**_kwargs):
+    def fake_call(**kwargs):
+        assert kwargs.get("capability") == "general_reasoning"
         return {"response": "LEVEL: bright\nMESSAGE: Room is now bright."}
 
-    room_lighting_status.copilot_llm_call = fake_call
-    output = room_lighting_status.main(make_test_image(), {"previous_level": "dark"})
+    with patch.object(room_lighting_status, "copilot_llm_call", side_effect=fake_call):
+        output = room_lighting_status.main(make_test_image(), {"previous_level": "dark"})
 
     assert isinstance(output, dict)
     assert output.get("audio", {}).get("type") == "warning"
@@ -77,12 +80,15 @@ def main() -> int:
 
     passed = 0
     for test in tests:
-        test()
-        passed += 1
-        print(f"✓ {test.__name__}")
+        try:
+            test()
+            passed += 1
+            print(f"✓ {test.__name__}")
+        except Exception as exc:
+            print(f"✗ {test.__name__}: {exc}")
 
     print(f"\n{passed}/{len(tests)} tests passed.")
-    return 0
+    return 0 if passed == len(tests) else 1
 
 
 if __name__ == "__main__":

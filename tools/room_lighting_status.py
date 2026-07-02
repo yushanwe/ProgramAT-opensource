@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from io import BytesIO
-import base64
 import re
 from typing import Any, Dict, Optional
 
 import numpy as np
-from PIL import Image
 
 from model_router_client import copilot_llm_call
 
@@ -16,16 +13,6 @@ TOOL_NAME = "room_lighting_status"
 TASK_CATEGORY = "general_reasoning"
 LIGHT_LEVELS = ("dark", "dim", "normal", "bright")
 LIGHT_ORDER = {level: index for index, level in enumerate(LIGHT_LEVELS)}
-
-
-def image_to_data_uri(image: np.ndarray) -> str:
-    """Convert OpenCV BGR image to a JPEG data URI."""
-    rgb_image = image[:, :, ::-1]
-    pil_image = Image.fromarray(rgb_image.astype(np.uint8))
-    buffer = BytesIO()
-    pil_image.save(buffer, format="JPEG", quality=85)
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{encoded}"
 
 
 def build_prompt(previous_level: Optional[str] = None) -> str:
@@ -89,11 +76,10 @@ def analyze_room_lighting(image: np.ndarray, input_data: Optional[Dict[str, Any]
             {"role": "system", "content": "Keep responses concise and audio-friendly."},
             {"role": "user", "content": prompt},
         ],
-        images=[image_to_data_uri(image)],
+        images=[image],
         metadata={
             "tool_name": TOOL_NAME,
             "route_text": "classify room lighting and report dark, dim, normal, or bright",
-            "previous_level": previous_level,
         },
     )
 
@@ -122,10 +108,10 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Any:
 
     try:
         analysis = analyze_room_lighting(image=image, input_data=input_data)
-    except Exception:
+    except Exception as exc:
         return {
-            "audio": {"type": "error", "text": "Lighting check failed."},
-            "text": "Lighting check failed.",
+            "audio": {"type": "error", "text": f"Lighting check failed: {type(exc).__name__}."},
+            "text": f"Lighting check failed: {type(exc).__name__}.",
         }
 
     level = analysis.get("level")
