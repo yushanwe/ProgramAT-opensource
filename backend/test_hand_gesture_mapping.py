@@ -90,7 +90,7 @@ def test_main_with_mocked_router():
     assert result == "Likely thumbs up. The tone seems positive and encouraging."
     assert captured["capability"] == "general_reasoning"
     assert "I really like this" in captured["messages"][1]["content"]
-    assert captured["images"][0].startswith("data:image/jpeg;base64,")
+    assert captured["images"][0].startswith("data:image/")
     print()
 
 

@@ -7,7 +7,7 @@ conversational meaning for blind or low vision users.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 from PIL import Image
@@ -122,7 +122,7 @@ def analyze_hand_gesture(
     }
 
 
-def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> str | Dict[str, Any]:
+def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Union[str, Dict[str, Any]]:
     """Entry point for the hand gesture mapping tool."""
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return {
