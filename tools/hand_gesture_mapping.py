@@ -76,6 +76,7 @@ def analyze_hand_gesture(
     image: np.ndarray,
     conversation_context: str = "",
     api_key: Optional[str] = None,
+    color_order: str = "bgr",
 ) -> Dict[str, Any]:
     """Run the routed gesture analysis."""
     processed_image = image
@@ -88,11 +89,14 @@ def analyze_hand_gesture(
             Image.fromarray(image).resize((new_width, new_height), Image.Resampling.LANCZOS)
         )
 
-    pil_image = (
-        Image.fromarray(processed_image)
-        if processed_image.ndim == 2
-        else Image.fromarray(processed_image[:, :, ::-1])
-    )
+    if processed_image.ndim == 2:
+        pil_image = Image.fromarray(processed_image)
+    elif processed_image.ndim == 3 and processed_image.shape[2] == 1:
+        pil_image = Image.fromarray(processed_image.squeeze(axis=2))
+    elif str(color_order).lower() == "rgb":
+        pil_image = Image.fromarray(processed_image)
+    else:
+        pil_image = Image.fromarray(processed_image[:, :, ::-1])
     image_data_uri = pil_image_to_data_uri(pil_image)
     prompt = build_gesture_prompt(conversation_context)
 
@@ -140,6 +144,7 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Unio
             image=image,
             conversation_context=extract_conversation_context(input_data),
             api_key=input_data.get("api_key"),
+            color_order=input_data.get("color_order", "bgr"),
         )
         return result["description"]
     except Exception as exc:
