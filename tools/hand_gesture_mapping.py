@@ -33,7 +33,12 @@ def extract_conversation_context(input_data: Optional[Dict[str, Any]]) -> str:
 
     for key in TRANSCRIPT_KEYS:
         raw_value = input_data.get(key)
-        context = " ".join(str(raw_value).split()).strip() if raw_value is not None else ""
+        if isinstance(raw_value, str):
+            context = " ".join(raw_value.split()).strip()
+        elif isinstance(raw_value, (list, tuple)):
+            context = " ".join(str(part).strip() for part in raw_value if str(part).strip())
+        else:
+            context = ""
         if context:
             return context
 
@@ -64,7 +69,12 @@ def build_gesture_prompt(conversation_context: str = "") -> str:
 
 def format_response(response: str) -> str:
     """Normalize model output for speech."""
-    formatted = " ".join(str(response).split()).strip()
+    if isinstance(response, str):
+        formatted = " ".join(response.split()).strip()
+    elif isinstance(response, (int, float, bool)):
+        formatted = str(response).strip()
+    else:
+        formatted = ""
     if not formatted:
         return "I could not confidently identify a hand gesture."
     if formatted[-1] not in ".!?":
