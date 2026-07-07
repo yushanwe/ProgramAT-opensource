@@ -79,24 +79,22 @@ def analyze_hand_gesture(
     color_order: str = "bgr",
 ) -> Dict[str, Any]:
     """Run the routed gesture analysis."""
-    processed_image = image
-    height, width = image.shape[:2]
+    if image.ndim == 2:
+        pil_image = Image.fromarray(image)
+    elif image.ndim == 3 and image.shape[2] == 1:
+        pil_image = Image.fromarray(image.squeeze(axis=2))
+    elif color_order.lower() == "rgb":
+        pil_image = Image.fromarray(image)
+    else:
+        pil_image = Image.fromarray(image[:, :, ::-1])
+
+    width, height = pil_image.size
     if width > 1024 or height > 1024:
         scale = min(1024 / width, 1024 / height)
         new_width = int(width * scale)
         new_height = int(height * scale)
-        processed_image = np.array(
-            Image.fromarray(image).resize((new_width, new_height), Image.Resampling.LANCZOS)
-        )
+        pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-    if processed_image.ndim == 2:
-        pil_image = Image.fromarray(processed_image)
-    elif processed_image.ndim == 3 and processed_image.shape[2] == 1:
-        pil_image = Image.fromarray(processed_image.squeeze(axis=2))
-    elif str(color_order).lower() == "rgb":
-        pil_image = Image.fromarray(processed_image)
-    else:
-        pil_image = Image.fromarray(processed_image[:, :, ::-1])
     image_data_uri = pil_image_to_data_uri(pil_image)
     prompt = build_gesture_prompt(conversation_context)
 
