@@ -26,42 +26,14 @@ TRANSCRIPT_KEYS = (
 )
 
 
-def resize_image_if_needed(image: np.ndarray, max_size: tuple[int, int] = (1024, 1024)) -> np.ndarray:
-    """Resize large images while preserving aspect ratio."""
-    max_width, max_height = max_size
-    height, width = image.shape[:2]
-
-    if width <= max_width and height <= max_height:
-        return image
-
-    scale = min(max_width / width, max_height / height)
-    new_width = int(width * scale)
-    new_height = int(height * scale)
-    resized = Image.fromarray(image).resize((new_width, new_height), Image.Resampling.LANCZOS)
-    return np.array(resized)
-
-
-def convert_cv2_to_pil(image: np.ndarray) -> Image.Image:
-    """Convert an OpenCV BGR image to a PIL RGB image."""
-    if image.ndim == 2:
-        return Image.fromarray(image)
-    return Image.fromarray(image[:, :, ::-1])
-
-
-def normalize_text(value: Any) -> str:
-    """Collapse whitespace and coerce values to plain text."""
-    if value is None:
-        return ""
-    return " ".join(str(value).split()).strip()
-
-
 def extract_conversation_context(input_data: Optional[Dict[str, Any]]) -> str:
     """Pull optional spoken context from common input keys."""
     if not isinstance(input_data, dict):
         return ""
 
     for key in TRANSCRIPT_KEYS:
-        context = normalize_text(input_data.get(key))
+        raw_value = input_data.get(key)
+        context = " ".join(str(raw_value).split()).strip() if raw_value is not None else ""
         if context:
             return context
 
@@ -92,7 +64,7 @@ def build_gesture_prompt(conversation_context: str = "") -> str:
 
 def format_response(response: str) -> str:
     """Normalize model output for speech."""
-    formatted = normalize_text(response)
+    formatted = " ".join(str(response).split()).strip()
     if not formatted:
         return "I could not confidently identify a hand gesture."
     if formatted[-1] not in ".!?":
@@ -106,8 +78,22 @@ def analyze_hand_gesture(
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the routed gesture analysis."""
-    processed_image = resize_image_if_needed(image)
-    image_data_uri = pil_image_to_data_uri(convert_cv2_to_pil(processed_image))
+    processed_image = image
+    height, width = image.shape[:2]
+    if width > 1024 or height > 1024:
+        scale = min(1024 / width, 1024 / height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        processed_image = np.array(
+            Image.fromarray(image).resize((new_width, new_height), Image.Resampling.LANCZOS)
+        )
+
+    pil_image = (
+        Image.fromarray(processed_image)
+        if processed_image.ndim == 2
+        else Image.fromarray(processed_image[:, :, ::-1])
+    )
+    image_data_uri = pil_image_to_data_uri(pil_image)
     prompt = build_gesture_prompt(conversation_context)
 
     metadata = {
@@ -173,10 +159,7 @@ __all__ = [
     "TRANSCRIPT_KEYS",
     "analyze_hand_gesture",
     "build_gesture_prompt",
-    "convert_cv2_to_pil",
     "extract_conversation_context",
     "format_response",
     "main",
-    "normalize_text",
-    "resize_image_if_needed",
 ]
