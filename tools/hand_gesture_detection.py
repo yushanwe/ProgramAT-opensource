@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -60,7 +61,12 @@ def _build_stage2_goal(gestures: str) -> str:
 
 def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Any:
     """Run two-stage gesture detection and meaning explanation."""
-    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+    if (
+        image is None
+        or not isinstance(image, np.ndarray)
+        or image.size <= 0
+        or any(dimension <= 0 for dimension in image.shape)
+    ):
         return {
             "audio": {
                 "type": "error",
@@ -118,12 +124,13 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> Any:
             return response
         return "I could not confidently identify a clear hand gesture right now."
     except Exception:
+        error_text = "I could not process hand gestures right now. Please try again."
         return {
             "audio": {
                 "type": "error",
-                "text": "I could not process hand gestures right now. Please try again.",
+                "text": error_text,
             },
-            "text": "I could not process hand gestures right now. Please try again.",
+            "text": error_text,
         }
 
 
