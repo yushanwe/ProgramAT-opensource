@@ -44,6 +44,7 @@ def main(image: Any, input_data: Any = None) -> Any:
     if not detections:
         return "Floor looks clear. No obstacles or clutter detected."
 
+    # Artifact field name may be 'label' or 'class_name' depending on backend implementation
     labels = [d.get("label") or d.get("class_name") or "object" for d in detections]
     unique_labels = list(dict.fromkeys(labels))  # preserve order, deduplicate
 
