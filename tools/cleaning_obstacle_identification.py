@@ -14,16 +14,8 @@ TOOL_NAME = "cleaning_obstacle_identification"
 TASK_CATEGORY = "object_detection_localization"
 
 FLOOR_OBSTACLE_LABELS = [
-    "bottle", "cup", "shoe", "book", "bag", "backpack", "suitcase",
-    "chair", "table", "couch", "bed", "toilet", "tv", "laptop",
-    "remote", "cell phone", "toy", "ball", "sports ball",
-    "umbrella", "handbag", "tie", "skis", "snowboard", "kite",
-    "baseball bat", "baseball glove", "skateboard", "surfboard",
-    "tennis racket", "wine glass", "fork", "knife", "spoon", "bowl",
-    "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
-    "hot dog", "pizza", "donut", "cake", "potted plant", "clock",
-    "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
-    "person", "dog", "cat",
+    "shoe", "bag", "backpack", "toy", "bottle", "book", "remote",
+    "suitcase", "sports ball", "potted plant", "dog", "cat", "person",
 ]
 
 
