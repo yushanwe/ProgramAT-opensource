@@ -135,7 +135,7 @@ def main(image: np.ndarray, input_data: Optional[Any] = None) -> Any:
 
         return response
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — per tools/CLAUDE.md tools must never raise; all errors must be caught and returned as audio
         error_msg = "Could not check for outlets right now."
         if is_streaming:
             return error_msg

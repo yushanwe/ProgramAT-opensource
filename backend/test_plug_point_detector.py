@@ -5,6 +5,7 @@ Tests the plug point detection tool with synthetic images.
 
 import sys
 import os
+import cv2
 import numpy as np
 import unittest
 from unittest.mock import patch, MagicMock
@@ -17,8 +18,14 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, 'tools'))
 
 # Stub out model_router_client before the tool module is imported so that no
 # live model or API key is needed during unit tests.
-_mock_router = MagicMock()
-sys.modules.setdefault('model_router_client', _mock_router)
+# setdefault leaves the real module in place when it is already present (e.g.
+# when the full test suite is run after tests that import the real router).
+_mock_router_module = MagicMock()
+_mock_router_module.copilot_llm_call = MagicMock(return_value={
+    "response": "", "artifact": {}, "implementation": "mock", "capability": "mock"
+})
+if 'model_router_client' not in sys.modules:
+    sys.modules['model_router_client'] = _mock_router_module
 
 from plug_point_detector import main, _truncate_to_words, _image_to_data_uri  # noqa: E402
 
@@ -33,9 +40,8 @@ def create_outlet_image(width: int = 640, height: int = 480) -> np.ndarray:
     """Create a test image with a white rectangle simulating an outlet."""
     image = np.ones((height, width, 3), dtype=np.uint8) * 180
     # Draw an outlet-like rectangle slightly left of centre
-    cv2_x, cv2_y = 260, 200
-    cv2_w, cv2_h = 60, 90
-    image[cv2_y:cv2_y + cv2_h, cv2_x:cv2_x + cv2_w] = [255, 255, 255]
+    x, y, w, h = 260, 200, 60, 90
+    cv2.rectangle(image, (x, y), (x + w, y + h), (255, 255, 255), -1)
     return image
 
 
@@ -43,9 +49,9 @@ def create_two_outlet_image(width: int = 640, height: int = 480) -> np.ndarray:
     """Create a test image with two white rectangles simulating two outlets."""
     image = np.ones((height, width, 3), dtype=np.uint8) * 180
     # Left outlet
-    image[200:290, 100:160] = [255, 255, 255]
+    cv2.rectangle(image, (100, 200), (160, 290), (255, 255, 255), -1)
     # Right outlet (slightly larger → nearer)
-    image[190:300, 480:560] = [240, 240, 240]
+    cv2.rectangle(image, (480, 190), (560, 300), (240, 240, 240), -1)
     return image
 
 
