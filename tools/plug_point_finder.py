@@ -127,9 +127,9 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     if not normalized:
         return None
 
-    direct = re.fullmatch(r"\d+", normalized)
+    direct = re.fullmatch(r"(\d+)[\.\!\?]?", normalized)
     if direct:
-        return _parse_positive_int(direct.group(0))
+        return _parse_positive_int(direct.group(1))
 
     patterns = [
         r"\b(\d+)\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
@@ -161,7 +161,7 @@ def _count_individual_sockets(image: Any, detections: List[Dict[str, Any]]) -> i
             },
         )
     except (RuntimeError, ValueError, TypeError):
-        LOGGER.debug("Plug point finder socket counting call failed", exc_info=True)
+        LOGGER.debug("Socket counting reasoning stage failed, falling back to detection count", exc_info=True)
         return detection_count
 
     artifact = stage_two.get("artifact") if isinstance(stage_two, dict) else None
