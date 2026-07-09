@@ -57,6 +57,9 @@ class TestPlugPointFinder(unittest.TestCase):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
 
         def fake_call(**kwargs):
+            capability = kwargs.get("capability")
+            if capability == "general_reasoning":
+                return {"response": "2"}
             return {
                 "response": "detected",
                 "artifact": {
@@ -70,6 +73,28 @@ class TestPlugPointFinder(unittest.TestCase):
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
         self.assertEqual(result, "2 plug points visible, closest one at 2 o'clock.")
+
+    def test_counts_individual_sockets_not_strips(self):
+        image = FakeImage(100, 100, mean_value=160, std_value=20)
+
+        def fake_call(**kwargs):
+            capability = kwargs.get("capability")
+            if capability == "object_detection_localization":
+                return {
+                    "response": "detected",
+                    "artifact": {
+                        "detections": [
+                            {"label": "power strip", "bbox": [40, 15, 85, 55]},
+                        ]
+                    },
+                }
+            if capability == "general_reasoning":
+                return {"response": "There are 3 visible sockets.", "artifact": {"socket_count": 3}}
+            raise AssertionError(f"Unexpected capability call: {capability}")
+
+        tool.copilot_llm_call = fake_call
+        result = tool.main(image, {})
+        self.assertEqual(result, "3 plug points visible, closest one at 1 o'clock.")
 
     def test_persistent_blocked_camera_warns(self):
         image = FakeImage(80, 80, mean_value=0, std_value=0)

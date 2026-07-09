@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from model_router_client import copilot_llm_call
@@ -113,6 +114,52 @@ def _build_output(count: int, direction: str) -> str:
     return f"{count} plug points visible, closest one at {direction}."
 
 
+def _parse_socket_count(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _count_individual_sockets(image: Any, detections: List[Dict[str, Any]]) -> int:
+    detection_count = len(detections)
+    if detection_count <= 0:
+        return 0
+
+    try:
+        stage_two = copilot_llm_call(
+            capability="general_reasoning",
+            goal="Count the number of individual electrical sockets visible in the image. Return only the total count.",
+            images=[image],
+            metadata={
+                "tool_name": TOOL_NAME,
+                "route_text": "count visible individual sockets instead of outlet strips",
+                "previous_stage_artifact": {"detections": detections},
+            },
+        )
+    except (RuntimeError, ValueError, TypeError):
+        LOGGER.debug("Plug point finder socket counting call failed", exc_info=True)
+        return detection_count
+
+    artifact = stage_two.get("artifact") if isinstance(stage_two, dict) else None
+    if isinstance(artifact, dict):
+        for key in ("socket_count", "count", "total"):
+            parsed = _parse_socket_count(artifact.get(key))
+            if parsed is not None:
+                return parsed
+
+    response_text = stage_two.get("response") if isinstance(stage_two, dict) else ""
+    if isinstance(response_text, str):
+        match = re.search(r"\b(\d+)\b", response_text)
+        if match:
+            parsed = _parse_socket_count(match.group(1))
+            if parsed is not None:
+                return parsed
+
+    return detection_count
+
+
 def main(image, input_data=None):
     params = input_data if isinstance(input_data, dict) else {}
     is_streaming = bool(params.get("is_streaming") or params.get("live_mode"))
@@ -155,7 +202,8 @@ def main(image, input_data=None):
     frame_width = int(image.shape[1]) if hasattr(image, "shape") and len(image.shape) >= 2 else 0
     closest = _closest_detection(detections)
     direction = _clock_direction_from_bbox(closest or {}, frame_width)
-    message = _build_output(len(detections), direction)
+    socket_count = _count_individual_sockets(image, detections)
+    message = _build_output(socket_count, direction)
 
     if is_streaming and len(message.split()) > 15:
         return _limit_words(message, max_words=15)
