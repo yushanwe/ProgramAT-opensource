@@ -27,7 +27,7 @@ def main(image, input_data=None):
     # envelope style, postage markings, etc.).
     stage1 = copilot_llm_call(
         capability="structured_visual_understanding",
-        goal="Determine if each mail item is important or junk",
+        goal="Extract visible mail characteristics such as sender, logos, text, and envelope style",
         messages=[
             {
                 "role": "system",
@@ -78,7 +78,6 @@ def main(image, input_data=None):
                 "content": f"Mail features observed: {visual_artifact}\n\nIs this important mail or junk mail?",
             },
         ],
-        images=[image],
         metadata={
             "tool_name": TOOL_NAME,
             "route_text": "classify mail as important or junk based on visual characteristics",
