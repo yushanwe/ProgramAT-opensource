@@ -55,9 +55,11 @@ class TestPlugPointFinder(unittest.TestCase):
 
     def test_reports_count_and_direction(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
+        called_capabilities = []
 
         def fake_call(**kwargs):
             capability = kwargs.get("capability")
+            called_capabilities.append(capability)
             if capability == "general_reasoning":
                 return {"response": "2"}
             return {
@@ -73,6 +75,7 @@ class TestPlugPointFinder(unittest.TestCase):
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
         self.assertEqual(result, "2 plug points visible, closest one at 2 o'clock.")
+        self.assertIn("general_reasoning", called_capabilities)
 
     def test_counts_individual_sockets_not_strips(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
