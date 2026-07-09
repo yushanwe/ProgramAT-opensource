@@ -9,12 +9,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 
-def mock_empty_detection_response(**kwargs):
-    return {"response": "", "artifact": {"detections": []}}
-
-
 mock_router_client = types.ModuleType("model_router_client")
-mock_router_client.copilot_llm_call = mock_empty_detection_response
+mock_router_client.copilot_llm_call = lambda **kwargs: {"response": "", "artifact": {"detections": []}}
 sys.modules.setdefault("model_router_client", mock_router_client)
 
 import plug_point_finder as tool
@@ -36,12 +32,12 @@ class FakeImage:
 
 class TestPlugPointFinder(unittest.TestCase):
     def setUp(self):
-        tool.reset_state()
+        tool._BLOCKED_FRAME_STREAK = 0
         self._original_call = tool.copilot_llm_call
 
     def tearDown(self):
         tool.copilot_llm_call = self._original_call
-        tool.reset_state()
+        tool._BLOCKED_FRAME_STREAK = 0
 
     def test_reports_no_plug_points(self):
         image = FakeImage(120, 160, mean_value=120, std_value=20)
@@ -55,13 +51,8 @@ class TestPlugPointFinder(unittest.TestCase):
 
     def test_reports_count_and_direction(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
-        called_capabilities = []
 
         def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            called_capabilities.append(capability)
-            if capability == "general_reasoning":
-                return {"response": "2"}
             return {
                 "response": "detected",
                 "artifact": {
@@ -74,187 +65,7 @@ class TestPlugPointFinder(unittest.TestCase):
 
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
-        self.assertEqual(result, "2 outlets visible, closest one at 2 o'clock.")
-        self.assertIn("general_reasoning", called_capabilities)
-
-    def test_counts_individual_sockets_not_strips(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "power strip", "bbox": [40, 15, 85, 55]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                return {"response": "There are 3 visible sockets.", "artifact": {"socket_count": 3}}
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "3 outlets visible, closest one at 1 o'clock.")
-
-    def test_falls_back_to_detection_count_when_socket_counting_fails(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "wall outlet", "bbox": [15, 20, 35, 55]},
-                            {"label": "wall outlet", "bbox": [55, 20, 75, 55]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                raise RuntimeError("temporary failure")
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "2 outlets visible, closest one at 10 o'clock.")
-
-    def test_ignores_non_count_numbers_in_socket_response(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "wall outlet", "bbox": [15, 20, 35, 55]},
-                            {"label": "wall outlet", "bbox": [55, 20, 75, 55]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                return {"response": "Closest appears at 2 o'clock."}
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "2 outlets visible, closest one at 10 o'clock.")
-
-    def test_parses_socket_count_even_when_response_includes_clock_position(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "wall outlet", "bbox": [40, 20, 80, 60]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                return {"response": "There are 4 sockets visible, closest at 2 o'clock."}
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "4 outlets visible, closest one straight ahead.")
-
-    def test_parses_socket_count_from_number_words(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "power strip", "bbox": [35, 20, 85, 60]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                return {"response": "Two outlets are visible on this strip."}
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "2 outlets visible, closest one straight ahead.")
-
-    def test_prefers_socket_count_when_response_mentions_one_outlet_plate(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "wall outlet", "bbox": [35, 20, 85, 60]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                return {"response": "I see one outlet plate with two sockets."}
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "2 outlets visible, closest one straight ahead.")
-
-    def test_sums_multiple_socket_mentions(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "wall outlet", "bbox": [5, 20, 35, 60]},
-                            {"label": "wall outlet", "bbox": [65, 20, 95, 60]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                return {"response": "I see 2 sockets on the left and 2 sockets on the right."}
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "4 outlets visible, closest one at 10 o'clock.")
-
-    def test_sums_multiple_plug_point_or_outlet_mentions(self):
-        image = FakeImage(100, 100, mean_value=160, std_value=20)
-
-        def fake_call(**kwargs):
-            capability = kwargs.get("capability")
-            if capability == "object_detection_localization":
-                return {
-                    "response": "detected",
-                    "artifact": {
-                        "detections": [
-                            {"label": "wall outlet", "bbox": [35, 20, 85, 60]},
-                        ]
-                    },
-                }
-            if capability == "general_reasoning":
-                return {"response": "There are 2 plug points and 1 outlet visible."}
-            raise AssertionError(f"Unexpected capability call: {capability}")
-
-        tool.copilot_llm_call = fake_call
-        result = tool.main(image, {})
-        self.assertEqual(result, "3 outlets visible, closest one straight ahead.")
+        self.assertEqual(result, "2 plug points visible, closest one at 2 o'clock.")
 
     def test_persistent_blocked_camera_warns(self):
         image = FakeImage(80, 80, mean_value=0, std_value=0)

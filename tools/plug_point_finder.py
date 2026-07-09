@@ -6,50 +6,13 @@ Finds visible electrical plug points, counts them, and gives directional cues.
 
 from __future__ import annotations
 
-import threading
-import logging
-import re
 from typing import Any, Dict, List, Optional
 
 from model_router_client import copilot_llm_call
 
 TOOL_NAME = "plug_point_finder"
-LOGGER = logging.getLogger(__name__)
-STRAIGHT_AHEAD_THRESHOLD = 0.11
-SLIGHT_SIDE_THRESHOLD = 0.20
-STRONG_SIDE_THRESHOLD = 0.34
-NUMBER_WORDS = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-}
-NUMBER_TOKEN_PATTERN = rf"(\d+|{'|'.join(re.escape(word) for word in NUMBER_WORDS)})"
 
-_THREAD_STATE = threading.local()
-
-
-def reset_state() -> None:
-    setattr(_THREAD_STATE, "blocked_frame_streak", 0)
-
-
-def _get_blocked_frame_streak() -> int:
-    return int(getattr(_THREAD_STATE, "blocked_frame_streak", 0))
-
-
-def _set_blocked_frame_streak(value: int) -> None:
-    parsed = int(value)
-    if parsed < 0:
-        raise ValueError("blocked_frame_streak cannot be negative")
-    setattr(_THREAD_STATE, "blocked_frame_streak", parsed)
+_BLOCKED_FRAME_STREAK = 0
 
 
 def _is_camera_blocked(image: Any) -> bool:
@@ -96,17 +59,17 @@ def _clock_direction_from_bbox(detection: Dict[str, Any], frame_width: int) -> s
     except (TypeError, ValueError):
         return "straight ahead"
     offset = (center_x - (frame_width / 2.0)) / frame_width
-    if abs(offset) <= STRAIGHT_AHEAD_THRESHOLD:
+    if abs(offset) <= 0.11:
         return "straight ahead"
-    if offset > STRONG_SIDE_THRESHOLD:
+    if offset > 0.34:
         return "3 o'clock"
-    if offset > SLIGHT_SIDE_THRESHOLD:
+    if offset > 0.2:
         return "2 o'clock"
     if offset > 0:
         return "1 o'clock"
-    if offset < -STRONG_SIDE_THRESHOLD:
+    if offset < -0.34:
         return "9 o'clock"
-    if offset < -SLIGHT_SIDE_THRESHOLD:
+    if offset < -0.2:
         return "10 o'clock"
     return "11 o'clock"
 
@@ -122,112 +85,15 @@ def _limit_words(text: str, max_words: int = 15) -> str:
 def _build_output(count: int, direction: str) -> str:
     if count == 1:
         if direction == "straight ahead":
-            return "One outlet visible, straight ahead."
-        return f"One outlet visible, closest at {direction}."
+            return "One plug point visible, straight ahead."
+        return f"One plug point visible, closest at {direction}."
     if direction == "straight ahead":
-        return f"{count} outlets visible, closest one straight ahead."
-    return f"{count} outlets visible, closest one at {direction}."
-
-
-def _parse_positive_int(value: Any) -> Optional[int]:
-    if isinstance(value, str):
-        normalized = value.strip().lower().rstrip(".!?")
-        if normalized in NUMBER_WORDS:
-            return NUMBER_WORDS[normalized]
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _patterns_for_terms(term_pattern: str) -> List[str]:
-    return [
-        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{term_pattern}\b",
-        rf"\b{term_pattern}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
-    ]
-
-
-def _collect_counts_from_patterns(patterns: List[str], text: str) -> List[int]:
-    counts: List[int] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            parsed = _parse_positive_int(match.group(1))
-            if parsed is not None:
-                counts.append(parsed)
-    return counts
-
-
-def _socket_count_from_response_text(text: str) -> Optional[int]:
-    normalized = text.strip().lower()
-    if not normalized:
-        return None
-
-    direct = re.fullmatch(rf"{NUMBER_TOKEN_PATTERN}[.!?]?", normalized)
-    if direct:
-        return _parse_positive_int(direct.group(1))
-
-    # Socket/receptacle mentions map to individual usable plug points.
-    # Plug-point/outlet mentions are kept as a fallback because they can describe plate-level counts.
-    # Within each tier, multiple mentions are summed to produce one total count.
-    high_priority_terms = r"(?:sockets?|receptacles?)"
-    fallback_terms = r"(?:plug\s+points?|plugs?|outlets?)"
-    high_priority_patterns = _patterns_for_terms(high_priority_terms)
-    fallback_patterns = _patterns_for_terms(fallback_terms)
-
-    high_priority_counts = _collect_counts_from_patterns(high_priority_patterns, normalized)
-    fallback_counts = _collect_counts_from_patterns(fallback_patterns, normalized)
-
-    if high_priority_counts:
-        return _aggregate_counts(high_priority_counts)
-    if fallback_counts:
-        return _aggregate_counts(fallback_counts)
-    return None
-
-
-def _aggregate_counts(counts: List[int]) -> int:
-    if len(counts) == 1:
-        return counts[0]
-    return sum(counts)
-
-
-def _count_individual_sockets(image: Any, detections: List[Dict[str, Any]]) -> int:
-    detection_count = len(detections)
-    if detection_count <= 0:
-        return 0
-
-    try:
-        stage_two = copilot_llm_call(
-            capability="general_reasoning",
-            goal="Count the number of individual electrical sockets visible in the image. Return only the total count.",
-            images=[image],
-            metadata={
-                "tool_name": TOOL_NAME,
-                "route_text": "count visible individual sockets instead of outlet strips",
-                "previous_stage_artifact": {"detections": detections},
-            },
-        )
-    except (RuntimeError, ValueError, TypeError):
-        LOGGER.debug("Socket counting reasoning stage failed, falling back to detection count", exc_info=True)
-        return detection_count
-
-    artifact = stage_two.get("artifact") if isinstance(stage_two, dict) else None
-    if isinstance(artifact, dict):
-        for key in ("socket_count", "count", "total"):
-            parsed = _parse_positive_int(artifact.get(key))
-            if parsed is not None:
-                return parsed
-
-    response_text = stage_two.get("response") if isinstance(stage_two, dict) else ""
-    if isinstance(response_text, str):
-        parsed = _socket_count_from_response_text(response_text)
-        if parsed is not None:
-            return parsed
-
-    return detection_count
+        return f"{count} plug points visible, closest one straight ahead."
+    return f"{count} plug points visible, closest one at {direction}."
 
 
 def main(image, input_data=None):
+    global _BLOCKED_FRAME_STREAK
     params = input_data if isinstance(input_data, dict) else {}
     is_streaming = bool(params.get("is_streaming") or params.get("live_mode"))
     blocked_frame_threshold = int(params.get("blocked_frame_threshold", 3))
@@ -236,15 +102,15 @@ def main(image, input_data=None):
         return {"audio": {"type": "error", "text": "No camera frame available."}, "text": "No camera frame available."}
 
     if _is_camera_blocked(image):
-        _set_blocked_frame_streak(_get_blocked_frame_streak() + 1)
-        if _get_blocked_frame_streak() >= blocked_frame_threshold:
+        _BLOCKED_FRAME_STREAK += 1
+        if _BLOCKED_FRAME_STREAK >= blocked_frame_threshold:
             warning_text = "Camera blocked, please clear the lens."
             return {
                 "audio": {"type": "warning", "text": warning_text, "interrupt": True},
                 "text": warning_text,
             }
         return ""
-    _set_blocked_frame_streak(0)
+    _BLOCKED_FRAME_STREAK = 0
 
     try:
         stage_one = copilot_llm_call(
@@ -257,8 +123,7 @@ def main(image, input_data=None):
                 "target_labels": ["electrical outlet", "wall outlet", "plug socket", "power socket"],
             },
         )
-    except (RuntimeError, ValueError, TypeError):
-        LOGGER.debug("Plug point finder detection call failed", exc_info=True)
+    except Exception:
         error_text = "I couldn't check for plug points right now."
         return {"audio": {"type": "error", "text": error_text}, "text": error_text}
 
@@ -269,9 +134,8 @@ def main(image, input_data=None):
     frame_width = int(image.shape[1]) if hasattr(image, "shape") and len(image.shape) >= 2 else 0
     closest = _closest_detection(detections)
     direction = _clock_direction_from_bbox(closest or {}, frame_width)
-    socket_count = _count_individual_sockets(image, detections)
-    message = _build_output(socket_count, direction)
+    message = _build_output(len(detections), direction)
 
-    if is_streaming and len(message.split()) > 15:
+    if is_streaming:
         return _limit_words(message, max_words=15)
     return message
