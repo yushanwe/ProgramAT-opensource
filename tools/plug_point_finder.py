@@ -157,6 +157,6 @@ def main(image, input_data=None):
     direction = _clock_direction_from_bbox(closest or {}, frame_width)
     message = _build_output(len(detections), direction)
 
-    if is_streaming:
+    if is_streaming and len(message.split()) > 15:
         return _limit_words(message, max_words=15)
     return message
