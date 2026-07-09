@@ -33,7 +33,6 @@ NUMBER_WORDS = {
     "twelve": 12,
 }
 NUMBER_TOKEN_PATTERN = rf"(\d+|{'|'.join(re.escape(word) for word in NUMBER_WORDS)})"
-HIGH_PRIORITY_PATTERN_COUNT = 2
 
 _THREAD_STATE = threading.local()
 
@@ -155,24 +154,29 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     # Plug-point/outlet mentions are kept as a fallback because they can describe plate-level counts.
     high_priority_terms = r"(?:sockets?|receptacles?)"
     fallback_terms = r"(?:plug\s+points?|plugs?|outlets?)"
-    patterns = (
+    high_priority_patterns = (
         rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{high_priority_terms}\b",
         rf"\b{high_priority_terms}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
+    )
+    fallback_patterns = (
         rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{fallback_terms}\b",
         rf"\b{fallback_terms}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
     )
 
     high_priority_counts: List[int] = []
     fallback_counts: List[int] = []
-    for idx, pattern in enumerate(patterns):
+    for pattern in high_priority_patterns:
         for match in re.finditer(pattern, normalized):
             parsed = _parse_positive_int(match.group(1))
             if parsed is None:
                 continue
-            if idx < HIGH_PRIORITY_PATTERN_COUNT:
-                high_priority_counts.append(parsed)
-            else:
-                fallback_counts.append(parsed)
+            high_priority_counts.append(parsed)
+    for pattern in fallback_patterns:
+        for match in re.finditer(pattern, normalized):
+            parsed = _parse_positive_int(match.group(1))
+            if parsed is None:
+                continue
+            fallback_counts.append(parsed)
 
     if high_priority_counts:
         return _sum_or_single(high_priority_counts)
@@ -181,9 +185,7 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     return None
 
 
-def _sum_or_single(counts: List[int]) -> Optional[int]:
-    if not counts:
-        return None
+def _sum_or_single(counts: List[int]) -> int:
     if len(counts) == 1:
         return counts[0]
     return sum(counts)
