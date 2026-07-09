@@ -30,6 +30,11 @@ def _to_data_uri(image: np.ndarray) -> str:
     return pil_image_to_data_uri(pil_image)
 
 
+def _get_artifact(result: dict) -> str:
+    """Extract the most useful text from a copilot_llm_call result."""
+    return result.get("artifact") or result.get("response", "")
+
+
 def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> str:
     """
     Classify mail in a photo as important or junk and return an audio-friendly result.
@@ -70,7 +75,7 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> str:
             "route_text": "identify personal mail and bills in a photo",
         },
     )
-    personal_mail_artifact = stage1.get("artifact") or stage1.get("response", "")
+    personal_mail_artifact = _get_artifact(stage1)
 
     # Stage 2 — Exclude advertisements
     stage2 = copilot_llm_call(
@@ -96,7 +101,7 @@ def main(image: np.ndarray, input_data: Optional[Dict[str, Any]] = None) -> str:
             "previous_stage_artifact": personal_mail_artifact,
         },
     )
-    ads_artifact = stage2.get("artifact") or stage2.get("response", "")
+    ads_artifact = _get_artifact(stage2)
 
     # Stage 3 — Categorize into 'important' or 'junk'
     stage3 = copilot_llm_call(
