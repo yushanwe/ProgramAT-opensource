@@ -114,12 +114,34 @@ def _build_output(count: int, direction: str) -> str:
     return f"{count} plug points visible, closest one at {direction}."
 
 
-def _parse_socket_count(value: Any) -> Optional[int]:
+def _parse_positive_int(value: Any) -> Optional[int]:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _socket_count_from_response_text(text: str) -> Optional[int]:
+    normalized = text.strip().lower()
+    if not normalized:
+        return None
+
+    direct = re.fullmatch(r"\d+", normalized)
+    if direct:
+        return _parse_positive_int(direct.group(0))
+
+    patterns = [
+        r"\b(\d+)\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
+        r"\b(?:plug\s+points?|plugs?|sockets?|outlets?)\D{0,20}\b(\d+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            parsed = _parse_positive_int(match.group(1))
+            if parsed is not None:
+                return parsed
+    return None
 
 
 def _count_individual_sockets(image: Any, detections: List[Dict[str, Any]]) -> int:
@@ -145,17 +167,15 @@ def _count_individual_sockets(image: Any, detections: List[Dict[str, Any]]) -> i
     artifact = stage_two.get("artifact") if isinstance(stage_two, dict) else None
     if isinstance(artifact, dict):
         for key in ("socket_count", "count", "total"):
-            parsed = _parse_socket_count(artifact.get(key))
+            parsed = _parse_positive_int(artifact.get(key))
             if parsed is not None:
                 return parsed
 
     response_text = stage_two.get("response") if isinstance(stage_two, dict) else ""
     if isinstance(response_text, str):
-        match = re.search(r"\b(\d+)\b", response_text)
-        if match:
-            parsed = _parse_socket_count(match.group(1))
-            if parsed is not None:
-                return parsed
+        parsed = _socket_count_from_response_text(response_text)
+        if parsed is not None:
+            return parsed
 
     return detection_count
 
