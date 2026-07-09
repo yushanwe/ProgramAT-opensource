@@ -32,6 +32,7 @@ NUMBER_WORDS = {
     "eleven": 11,
     "twelve": 12,
 }
+NUMBER_TOKEN_PATTERN = rf"(\d+|{'|'.join(re.escape(word) for word in NUMBER_WORDS)})"
 
 _THREAD_STATE = threading.local()
 
@@ -145,14 +146,13 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     if not normalized:
         return None
 
-    number_token = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
-    direct = re.fullmatch(rf"{number_token}[.!?]?", normalized)
+    direct = re.fullmatch(rf"{NUMBER_TOKEN_PATTERN}[.!?]?", normalized)
     if direct:
         return _parse_positive_int(direct.group(1))
 
     patterns = [
-        rf"\b{number_token}\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
-        rf"\b(?:plug\s+points?|plugs?|sockets?|outlets?)[\s:,\-]{{0,8}}{number_token}\b",
+        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
+        rf"\b(?:plug\s+points?|plugs?|sockets?|outlets?)[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, normalized)
