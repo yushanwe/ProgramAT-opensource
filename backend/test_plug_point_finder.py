@@ -96,6 +96,29 @@ class TestPlugPointFinder(unittest.TestCase):
         result = tool.main(image, {})
         self.assertEqual(result, "3 plug points visible, closest one at 1 o'clock.")
 
+    def test_falls_back_to_detection_count_when_socket_counting_fails(self):
+        image = FakeImage(100, 100, mean_value=160, std_value=20)
+
+        def fake_call(**kwargs):
+            capability = kwargs.get("capability")
+            if capability == "object_detection_localization":
+                return {
+                    "response": "detected",
+                    "artifact": {
+                        "detections": [
+                            {"label": "wall outlet", "bbox": [15, 20, 35, 55]},
+                            {"label": "wall outlet", "bbox": [55, 20, 75, 55]},
+                        ]
+                    },
+                }
+            if capability == "general_reasoning":
+                raise RuntimeError("temporary failure")
+            raise AssertionError(f"Unexpected capability call: {capability}")
+
+        tool.copilot_llm_call = fake_call
+        result = tool.main(image, {})
+        self.assertEqual(result, "2 plug points visible, closest one at 10 o'clock.")
+
     def test_persistent_blocked_camera_warns(self):
         image = FakeImage(80, 80, mean_value=0, std_value=0)
 
