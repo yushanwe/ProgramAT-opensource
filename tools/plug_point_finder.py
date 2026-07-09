@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from model_router_client import copilot_llm_call
 
@@ -83,7 +83,7 @@ def _detection_center_x(detection: Dict[str, Any]) -> Optional[float]:
 
 
 def _sort_detections_left_to_right(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def key_fn(index_and_detection) -> tuple[int, float]:
+    def key_fn(index_and_detection) -> Tuple[int, float]:
         index, detection = index_and_detection
         center_x = _detection_center_x(detection)
         if center_x is None:

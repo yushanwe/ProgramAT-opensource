@@ -88,6 +88,7 @@ class TestPlugPointFinder(unittest.TestCase):
         tool.copilot_llm_call = fake_call
         ordered = tool._sort_detections_left_to_right(detections)
         directions = [tool._clock_direction_from_bbox(detection, image.shape[1]) for detection in ordered]
+        self.assertEqual(directions, ["11 o'clock", "11 o'clock", "2 o'clock"])
         self.assertEqual(directions.count("11 o'clock"), 2)
         result = tool.main(image, {})
         self.assertEqual(result, "3 plug points visible: 2 at 11 o'clock and 2 o'clock.")
