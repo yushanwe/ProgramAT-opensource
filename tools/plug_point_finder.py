@@ -18,6 +18,15 @@ LOGGER = logging.getLogger(__name__)
 STRAIGHT_AHEAD_THRESHOLD = 0.11
 SLIGHT_SIDE_THRESHOLD = 0.20
 STRONG_SIDE_THRESHOLD = 0.34
+CLOCK_DIRECTIONS_ORDER = [
+    "9 o'clock",
+    "10 o'clock",
+    "11 o'clock",
+    "straight ahead",
+    "1 o'clock",
+    "2 o'clock",
+    "3 o'clock",
+]
 
 _THREAD_STATE = threading.local()
 
@@ -83,6 +92,8 @@ def _detection_center_x(detection: Dict[str, Any]) -> Optional[float]:
 
 
 def _sort_detections_left_to_right(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sort by horizontal position; keep invalid-bbox detections stable at the end."""
+
     def key_fn(item) -> Tuple[int, float]:
         index, detection = item
         center_x = _detection_center_x(detection)
@@ -141,18 +152,8 @@ def _format_direction_summary(directions: List[str]) -> str:
         return "straight ahead"
 
     direction_counts = Counter(directions)
-    ordered_directions = [
-        "9 o'clock",
-        "10 o'clock",
-        "11 o'clock",
-        "straight ahead",
-        "1 o'clock",
-        "2 o'clock",
-        "3 o'clock",
-    ]
-
     parts: List[str] = []
-    for direction in ordered_directions:
+    for direction in CLOCK_DIRECTIONS_ORDER:
         count = direction_counts.get(direction, 0)
         if count <= 0:
             continue
