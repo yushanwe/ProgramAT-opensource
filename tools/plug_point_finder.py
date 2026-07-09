@@ -6,13 +6,26 @@ Finds visible electrical plug points, counts them, and gives directional cues.
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, List, Optional
 
 from model_router_client import copilot_llm_call
 
 TOOL_NAME = "plug_point_finder"
 
-_BLOCKED_FRAME_STREAK = 0
+_THREAD_STATE = threading.local()
+
+
+def reset_state() -> None:
+    setattr(_THREAD_STATE, "blocked_frame_streak", 0)
+
+
+def _get_blocked_frame_streak() -> int:
+    return int(getattr(_THREAD_STATE, "blocked_frame_streak", 0))
+
+
+def _set_blocked_frame_streak(value: int) -> None:
+    setattr(_THREAD_STATE, "blocked_frame_streak", max(0, int(value)))
 
 
 def _is_camera_blocked(image: Any) -> bool:
@@ -93,7 +106,6 @@ def _build_output(count: int, direction: str) -> str:
 
 
 def main(image, input_data=None):
-    global _BLOCKED_FRAME_STREAK
     params = input_data if isinstance(input_data, dict) else {}
     is_streaming = bool(params.get("is_streaming") or params.get("live_mode"))
     blocked_frame_threshold = int(params.get("blocked_frame_threshold", 3))
@@ -102,15 +114,15 @@ def main(image, input_data=None):
         return {"audio": {"type": "error", "text": "No camera frame available."}, "text": "No camera frame available."}
 
     if _is_camera_blocked(image):
-        _BLOCKED_FRAME_STREAK += 1
-        if _BLOCKED_FRAME_STREAK >= blocked_frame_threshold:
+        _set_blocked_frame_streak(_get_blocked_frame_streak() + 1)
+        if _get_blocked_frame_streak() >= blocked_frame_threshold:
             warning_text = "Camera blocked, please clear the lens."
             return {
                 "audio": {"type": "warning", "text": warning_text, "interrupt": True},
                 "text": warning_text,
             }
         return ""
-    _BLOCKED_FRAME_STREAK = 0
+    _set_blocked_frame_streak(0)
 
     try:
         stage_one = copilot_llm_call(
@@ -123,7 +135,7 @@ def main(image, input_data=None):
                 "target_labels": ["electrical outlet", "wall outlet", "plug socket", "power socket"],
             },
         )
-    except Exception:
+    except (RuntimeError, ValueError, TypeError):
         error_text = "I couldn't check for plug points right now."
         return {"audio": {"type": "error", "text": error_text}, "text": error_text}
 

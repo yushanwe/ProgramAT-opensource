@@ -32,12 +32,12 @@ class FakeImage:
 
 class TestPlugPointFinder(unittest.TestCase):
     def setUp(self):
-        tool._BLOCKED_FRAME_STREAK = 0
+        tool.reset_state()
         self._original_call = tool.copilot_llm_call
 
     def tearDown(self):
         tool.copilot_llm_call = self._original_call
-        tool._BLOCKED_FRAME_STREAK = 0
+        tool.reset_state()
 
     def test_reports_no_plug_points(self):
         image = FakeImage(120, 160, mean_value=120, std_value=20)
