@@ -133,7 +133,7 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
 
     patterns = [
         r"\b(\d+)\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
-        r"\b(?:plug\s+points?|plugs?|sockets?|outlets?)\D{0,20}\b(\d+)\b",
+        r"\b(?:plug\s+points?|plugs?|sockets?|outlets?)[\s:,\-]{0,8}(\d+)\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, normalized)
