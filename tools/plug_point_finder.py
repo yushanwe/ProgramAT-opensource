@@ -25,7 +25,10 @@ def _get_blocked_frame_streak() -> int:
 
 
 def _set_blocked_frame_streak(value: int) -> None:
-    setattr(_THREAD_STATE, "blocked_frame_streak", max(0, int(value)))
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("blocked_frame_streak cannot be negative")
+    setattr(_THREAD_STATE, "blocked_frame_streak", parsed)
 
 
 def _is_camera_blocked(image: Any) -> bool:
