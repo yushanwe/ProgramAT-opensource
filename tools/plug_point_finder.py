@@ -33,6 +33,7 @@ NUMBER_WORDS = {
     "twelve": 12,
 }
 NUMBER_TOKEN_PATTERN = rf"(\d+|{'|'.join(re.escape(word) for word in NUMBER_WORDS)})"
+HIGH_PRIORITY_PATTERN_COUNT = 2
 
 _THREAD_STATE = threading.local()
 
@@ -150,6 +151,8 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     if direct:
         return _parse_positive_int(direct.group(1))
 
+    # Socket/receptacle mentions map to individual usable plug points.
+    # Plug-point/outlet mentions are kept as a fallback because they can describe plate-level counts.
     high_priority_terms = r"(?:sockets?|receptacles?)"
     fallback_terms = r"(?:plug\s+points?|plugs?|outlets?)"
     patterns = (
@@ -166,20 +169,24 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
             parsed = _parse_positive_int(match.group(1))
             if parsed is None:
                 continue
-            if idx < 2:
+            if idx < HIGH_PRIORITY_PATTERN_COUNT:
                 high_priority_counts.append(parsed)
             else:
                 fallback_counts.append(parsed)
 
     if high_priority_counts:
-        if len(high_priority_counts) == 1:
-            return high_priority_counts[0]
-        return sum(high_priority_counts)
+        return _sum_or_single(high_priority_counts)
     if fallback_counts:
-        if len(fallback_counts) == 1:
-            return fallback_counts[0]
-        return sum(fallback_counts)
+        return _sum_or_single(fallback_counts)
     return None
+
+
+def _sum_or_single(counts: List[int]) -> Optional[int]:
+    if not counts:
+        return None
+    if len(counts) == 1:
+        return counts[0]
+    return sum(counts)
 
 
 def _count_individual_sockets(image: Any, detections: List[Dict[str, Any]]) -> int:
