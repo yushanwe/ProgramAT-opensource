@@ -141,6 +141,23 @@ def _parse_positive_int(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _patterns_for_terms(term_pattern: str) -> List[str]:
+    return [
+        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{term_pattern}\b",
+        rf"\b{term_pattern}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
+    ]
+
+
+def _collect_counts_from_patterns(patterns: List[str], text: str) -> List[int]:
+    counts: List[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            parsed = _parse_positive_int(match.group(1))
+            if parsed is not None:
+                counts.append(parsed)
+    return counts
+
+
 def _socket_count_from_response_text(text: str) -> Optional[int]:
     normalized = text.strip().lower()
     if not normalized:
@@ -154,29 +171,11 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     # Plug-point/outlet mentions are kept as a fallback because they can describe plate-level counts.
     high_priority_terms = r"(?:sockets?|receptacles?)"
     fallback_terms = r"(?:plug\s+points?|plugs?|outlets?)"
-    high_priority_patterns = (
-        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{high_priority_terms}\b",
-        rf"\b{high_priority_terms}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
-    )
-    fallback_patterns = (
-        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{fallback_terms}\b",
-        rf"\b{fallback_terms}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
-    )
+    high_priority_patterns = _patterns_for_terms(high_priority_terms)
+    fallback_patterns = _patterns_for_terms(fallback_terms)
 
-    high_priority_counts: List[int] = []
-    fallback_counts: List[int] = []
-    for pattern in high_priority_patterns:
-        for match in re.finditer(pattern, normalized):
-            parsed = _parse_positive_int(match.group(1))
-            if parsed is None:
-                continue
-            high_priority_counts.append(parsed)
-    for pattern in fallback_patterns:
-        for match in re.finditer(pattern, normalized):
-            parsed = _parse_positive_int(match.group(1))
-            if parsed is None:
-                continue
-            fallback_counts.append(parsed)
+    high_priority_counts = _collect_counts_from_patterns(high_priority_patterns, normalized)
+    fallback_counts = _collect_counts_from_patterns(fallback_patterns, normalized)
 
     if high_priority_counts:
         return _sum_or_single(high_priority_counts)
