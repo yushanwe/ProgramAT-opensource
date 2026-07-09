@@ -7,11 +7,13 @@ Finds visible electrical plug points, counts them, and gives directional cues.
 from __future__ import annotations
 
 import threading
+import logging
 from typing import Any, Dict, List, Optional
 
 from model_router_client import copilot_llm_call
 
 TOOL_NAME = "plug_point_finder"
+LOGGER = logging.getLogger(__name__)
 
 _THREAD_STATE = threading.local()
 
@@ -139,6 +141,7 @@ def main(image, input_data=None):
             },
         )
     except (RuntimeError, ValueError, TypeError):
+        LOGGER.debug("Plug point finder detection call failed", exc_info=True)
         error_text = "I couldn't check for plug points right now."
         return {"audio": {"type": "error", "text": error_text}, "text": error_text}
 
