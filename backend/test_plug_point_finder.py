@@ -145,7 +145,7 @@ class TestPlugPointFinder(unittest.TestCase):
         result = tool.main(image, {})
         self.assertEqual(result, "2 plug points visible, closest one at 10 o'clock.")
 
-    def test_prefers_socket_count_when_response_includes_clock_position(self):
+    def test_parses_socket_count_even_when_response_includes_clock_position(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
 
         def fake_call(**kwargs):

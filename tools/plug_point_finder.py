@@ -127,7 +127,7 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     if not normalized:
         return None
 
-    direct = re.fullmatch(r"(\d+)[\.\!\?]?", normalized)
+    direct = re.fullmatch(r"(\d+)[.!?]?", normalized)
     if direct:
         return _parse_positive_int(direct.group(1))
 
