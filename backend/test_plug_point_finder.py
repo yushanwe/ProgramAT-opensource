@@ -74,7 +74,7 @@ class TestPlugPointFinder(unittest.TestCase):
 
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
-        self.assertEqual(result, "2 plug points visible, closest one at 2 o'clock.")
+        self.assertEqual(result, "2 outlets visible, closest one at 2 o'clock.")
         self.assertIn("general_reasoning", called_capabilities)
 
     def test_counts_individual_sockets_not_strips(self):
@@ -97,7 +97,7 @@ class TestPlugPointFinder(unittest.TestCase):
 
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
-        self.assertEqual(result, "3 plug points visible, closest one at 1 o'clock.")
+        self.assertEqual(result, "3 outlets visible, closest one at 1 o'clock.")
 
     def test_falls_back_to_detection_count_when_socket_counting_fails(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
@@ -120,7 +120,7 @@ class TestPlugPointFinder(unittest.TestCase):
 
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
-        self.assertEqual(result, "2 plug points visible, closest one at 10 o'clock.")
+        self.assertEqual(result, "2 outlets visible, closest one at 10 o'clock.")
 
     def test_ignores_non_count_numbers_in_socket_response(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
@@ -143,7 +143,7 @@ class TestPlugPointFinder(unittest.TestCase):
 
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
-        self.assertEqual(result, "2 plug points visible, closest one at 10 o'clock.")
+        self.assertEqual(result, "2 outlets visible, closest one at 10 o'clock.")
 
     def test_parses_socket_count_even_when_response_includes_clock_position(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
@@ -165,7 +165,29 @@ class TestPlugPointFinder(unittest.TestCase):
 
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
-        self.assertEqual(result, "4 plug points visible, closest one straight ahead.")
+        self.assertEqual(result, "4 outlets visible, closest one straight ahead.")
+
+    def test_parses_socket_count_from_number_words(self):
+        image = FakeImage(100, 100, mean_value=160, std_value=20)
+
+        def fake_call(**kwargs):
+            capability = kwargs.get("capability")
+            if capability == "object_detection_localization":
+                return {
+                    "response": "detected",
+                    "artifact": {
+                        "detections": [
+                            {"label": "power strip", "bbox": [35, 20, 85, 60]},
+                        ]
+                    },
+                }
+            if capability == "general_reasoning":
+                return {"response": "Two outlets are visible on this strip."}
+            raise AssertionError(f"Unexpected capability call: {capability}")
+
+        tool.copilot_llm_call = fake_call
+        result = tool.main(image, {})
+        self.assertEqual(result, "2 outlets visible, closest one straight ahead.")
 
     def test_persistent_blocked_camera_warns(self):
         image = FakeImage(80, 80, mean_value=0, std_value=0)

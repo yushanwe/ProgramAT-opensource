@@ -18,6 +18,20 @@ LOGGER = logging.getLogger(__name__)
 STRAIGHT_AHEAD_THRESHOLD = 0.11
 SLIGHT_SIDE_THRESHOLD = 0.20
 STRONG_SIDE_THRESHOLD = 0.34
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
 
 _THREAD_STATE = threading.local()
 
@@ -107,14 +121,18 @@ def _limit_words(text: str, max_words: int = 15) -> str:
 def _build_output(count: int, direction: str) -> str:
     if count == 1:
         if direction == "straight ahead":
-            return "One plug point visible, straight ahead."
-        return f"One plug point visible, closest at {direction}."
+            return "One outlet visible, straight ahead."
+        return f"One outlet visible, closest at {direction}."
     if direction == "straight ahead":
-        return f"{count} plug points visible, closest one straight ahead."
-    return f"{count} plug points visible, closest one at {direction}."
+        return f"{count} outlets visible, closest one straight ahead."
+    return f"{count} outlets visible, closest one at {direction}."
 
 
 def _parse_positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, str):
+        normalized = value.strip().lower().rstrip(".!?")
+        if normalized in NUMBER_WORDS:
+            return NUMBER_WORDS[normalized]
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -127,13 +145,14 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     if not normalized:
         return None
 
-    direct = re.fullmatch(r"(\d+)[.!?]?", normalized)
+    number_token = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    direct = re.fullmatch(rf"{number_token}[.!?]?", normalized)
     if direct:
         return _parse_positive_int(direct.group(1))
 
     patterns = [
-        r"\b(\d+)\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
-        r"\b(?:plug\s+points?|plugs?|sockets?|outlets?)[\s:,\-]{0,8}(\d+)\b",
+        rf"\b{number_token}\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
+        rf"\b(?:plug\s+points?|plugs?|sockets?|outlets?)[\s:,\-]{{0,8}}{number_token}\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, normalized)
