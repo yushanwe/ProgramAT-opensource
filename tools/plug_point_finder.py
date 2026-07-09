@@ -169,6 +169,7 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
 
     # Socket/receptacle mentions map to individual usable plug points.
     # Plug-point/outlet mentions are kept as a fallback because they can describe plate-level counts.
+    # Within each tier, multiple mentions are summed to produce one total count.
     high_priority_terms = r"(?:sockets?|receptacles?)"
     fallback_terms = r"(?:plug\s+points?|plugs?|outlets?)"
     high_priority_patterns = _patterns_for_terms(high_priority_terms)
@@ -178,13 +179,13 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     fallback_counts = _collect_counts_from_patterns(fallback_patterns, normalized)
 
     if high_priority_counts:
-        return _sum_or_single(high_priority_counts)
+        return _aggregate_counts(high_priority_counts)
     if fallback_counts:
-        return _sum_or_single(fallback_counts)
+        return _aggregate_counts(fallback_counts)
     return None
 
 
-def _sum_or_single(counts: List[int]) -> int:
+def _aggregate_counts(counts: List[int]) -> int:
     if len(counts) == 1:
         return counts[0]
     return sum(counts)
