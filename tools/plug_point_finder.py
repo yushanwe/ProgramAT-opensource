@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from model_router_client import copilot_llm_call
@@ -71,6 +72,24 @@ def _closest_detection(detections: List[Dict[str, Any]]) -> Optional[Dict[str, A
     return max(valid, key=_bbox_area)
 
 
+def _detection_center_x(detection: Dict[str, Any]) -> Optional[float]:
+    bbox = detection.get("bbox")
+    if not isinstance(bbox, list) or len(bbox) < 4:
+        return None
+    try:
+        return (float(bbox[0]) + float(bbox[2])) / 2.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _sort_detections_left_to_right(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def key_fn(detection: Dict[str, Any]) -> float:
+        center_x = _detection_center_x(detection)
+        return center_x if center_x is not None else float("inf")
+
+    return sorted(detections, key=key_fn)
+
+
 def _clock_direction_from_bbox(detection: Dict[str, Any], frame_width: int) -> str:
     bbox = detection.get("bbox")
     if not isinstance(bbox, list) or len(bbox) < 4 or frame_width <= 0:
@@ -103,14 +122,52 @@ def _limit_words(text: str, max_words: int = 15) -> str:
     return f"{shortened}."
 
 
-def _build_output(count: int, direction: str) -> str:
+def _join_with_and(parts: List[str]) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])}, and {parts[-1]}"
+
+
+def _format_direction_summary(directions: List[str]) -> str:
+    if not directions:
+        return "straight ahead"
+
+    direction_counts = Counter(directions)
+    ordered_directions = [
+        "9 o'clock",
+        "10 o'clock",
+        "11 o'clock",
+        "straight ahead",
+        "1 o'clock",
+        "2 o'clock",
+        "3 o'clock",
+    ]
+
+    parts: List[str] = []
+    for direction in ordered_directions:
+        count = direction_counts.get(direction, 0)
+        if count <= 0:
+            continue
+        if count == 1:
+            parts.append(direction)
+        elif direction == "straight ahead":
+            parts.append(f"{count} straight ahead")
+        else:
+            parts.append(f"{count} at {direction}")
+    return _join_with_and(parts)
+
+
+def _build_output(count: int, directions: List[str]) -> str:
+    direction_summary = _format_direction_summary(directions)
     if count == 1:
-        if direction == "straight ahead":
+        if direction_summary == "straight ahead":
             return "One plug point visible, straight ahead."
-        return f"One plug point visible, closest at {direction}."
-    if direction == "straight ahead":
-        return f"{count} plug points visible, closest one straight ahead."
-    return f"{count} plug points visible, closest one at {direction}."
+        return f"One plug point visible at {direction_summary}."
+    return f"{count} plug points visible: {direction_summary}."
 
 
 def main(image, input_data=None):
@@ -153,9 +210,9 @@ def main(image, input_data=None):
         return "No plug points found."
 
     frame_width = int(image.shape[1]) if hasattr(image, "shape") and len(image.shape) >= 2 else 0
-    closest = _closest_detection(detections)
-    direction = _clock_direction_from_bbox(closest or {}, frame_width)
-    message = _build_output(len(detections), direction)
+    ordered_detections = _sort_detections_left_to_right(detections)
+    directions = [_clock_direction_from_bbox(detection, frame_width) for detection in ordered_detections]
+    message = _build_output(len(detections), directions)
 
     if is_streaming and len(message.split()) > 15:
         return _limit_words(message, max_words=15)

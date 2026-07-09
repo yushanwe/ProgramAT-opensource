@@ -53,7 +53,7 @@ class TestPlugPointFinder(unittest.TestCase):
         result = tool.main(image, {})
         self.assertEqual(result, "No plug points found.")
 
-    def test_reports_count_and_direction(self):
+    def test_reports_count_and_direction_for_all_plug_points(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
 
         def fake_call(**kwargs):
@@ -69,7 +69,26 @@ class TestPlugPointFinder(unittest.TestCase):
 
         tool.copilot_llm_call = fake_call
         result = tool.main(image, {})
-        self.assertEqual(result, "2 plug points visible, closest one at 2 o'clock.")
+        self.assertEqual(result, "2 plug points visible: 9 o'clock and 2 o'clock.")
+
+    def test_reports_grouped_directions_for_multiple_plug_points(self):
+        image = FakeImage(100, 100, mean_value=160, std_value=20)
+
+        def fake_call(**kwargs):
+            return {
+                "response": "detected",
+                "artifact": {
+                    "detections": [
+                        {"label": "electrical outlet", "bbox": [26, 10, 46, 50]},
+                        {"label": "electrical outlet", "bbox": [28, 10, 48, 50]},
+                        {"label": "electrical outlet", "bbox": [65, 10, 85, 50]},
+                    ]
+                },
+            }
+
+        tool.copilot_llm_call = fake_call
+        result = tool.main(image, {})
+        self.assertEqual(result, "3 plug points visible: 2 at 11 o'clock and 2 o'clock.")
 
     def test_persistent_blocked_camera_warns(self):
         image = FakeImage(80, 80, mean_value=0, std_value=0)
