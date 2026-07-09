@@ -73,20 +73,22 @@ class TestPlugPointFinder(unittest.TestCase):
 
     def test_reports_grouped_directions_for_multiple_plug_points(self):
         image = FakeImage(100, 100, mean_value=160, std_value=20)
+        detections = [
+            {"label": "electrical outlet", "bbox": [26, 10, 46, 50]},
+            {"label": "electrical outlet", "bbox": [28, 10, 48, 50]},
+            {"label": "electrical outlet", "bbox": [65, 10, 85, 50]},
+        ]
 
         def fake_call(**kwargs):
             return {
                 "response": "detected",
-                "artifact": {
-                    "detections": [
-                        {"label": "electrical outlet", "bbox": [26, 10, 46, 50]},
-                        {"label": "electrical outlet", "bbox": [28, 10, 48, 50]},
-                        {"label": "electrical outlet", "bbox": [65, 10, 85, 50]},
-                    ]
-                },
+                "artifact": {"detections": detections},
             }
 
         tool.copilot_llm_call = fake_call
+        ordered = tool._sort_detections_left_to_right(detections)
+        directions = [tool._clock_direction_from_bbox(detection, image.shape[1]) for detection in ordered]
+        self.assertEqual(directions.count("11 o'clock"), 2)
         result = tool.main(image, {})
         self.assertEqual(result, "3 plug points visible: 2 at 11 o'clock and 2 o'clock.")
 

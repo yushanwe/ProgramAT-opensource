@@ -83,11 +83,15 @@ def _detection_center_x(detection: Dict[str, Any]) -> Optional[float]:
 
 
 def _sort_detections_left_to_right(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def key_fn(detection: Dict[str, Any]) -> float:
+    def key_fn(index_and_detection) -> tuple[int, float]:
+        index, detection = index_and_detection
         center_x = _detection_center_x(detection)
-        return center_x if center_x is not None else float("inf")
+        if center_x is None:
+            return (1, float(index))
+        return (0, center_x)
 
-    return sorted(detections, key=key_fn)
+    indexed = list(enumerate(detections))
+    return [detection for _, detection in sorted(indexed, key=key_fn)]
 
 
 def _clock_direction_from_bbox(detection: Dict[str, Any], frame_width: int) -> str:
