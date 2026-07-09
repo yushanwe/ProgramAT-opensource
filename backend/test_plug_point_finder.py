@@ -9,12 +9,12 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 
-def default_router_call(**kwargs):
+def mock_empty_detection_response(**kwargs):
     return {"response": "", "artifact": {"detections": []}}
 
 
 mock_router_client = types.ModuleType("model_router_client")
-mock_router_client.copilot_llm_call = default_router_call
+mock_router_client.copilot_llm_call = mock_empty_detection_response
 sys.modules.setdefault("model_router_client", mock_router_client)
 
 import plug_point_finder as tool

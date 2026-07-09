@@ -14,6 +14,9 @@ from model_router_client import copilot_llm_call
 
 TOOL_NAME = "plug_point_finder"
 LOGGER = logging.getLogger(__name__)
+STRAIGHT_AHEAD_THRESHOLD = 0.11
+SLIGHT_SIDE_THRESHOLD = 0.20
+STRONG_SIDE_THRESHOLD = 0.34
 
 _THREAD_STATE = threading.local()
 
@@ -77,17 +80,17 @@ def _clock_direction_from_bbox(detection: Dict[str, Any], frame_width: int) -> s
     except (TypeError, ValueError):
         return "straight ahead"
     offset = (center_x - (frame_width / 2.0)) / frame_width
-    if abs(offset) <= 0.11:
+    if abs(offset) <= STRAIGHT_AHEAD_THRESHOLD:
         return "straight ahead"
-    if offset > 0.34:
+    if offset > STRONG_SIDE_THRESHOLD:
         return "3 o'clock"
-    if offset > 0.2:
+    if offset > SLIGHT_SIDE_THRESHOLD:
         return "2 o'clock"
     if offset > 0:
         return "1 o'clock"
-    if offset < -0.34:
+    if offset < -STRONG_SIDE_THRESHOLD:
         return "9 o'clock"
-    if offset < -0.2:
+    if offset < -SLIGHT_SIDE_THRESHOLD:
         return "10 o'clock"
     return "11 o'clock"
 
