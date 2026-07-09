@@ -83,8 +83,8 @@ def _detection_center_x(detection: Dict[str, Any]) -> Optional[float]:
 
 
 def _sort_detections_left_to_right(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def key_fn(index_and_detection) -> Tuple[int, float]:
-        index, detection = index_and_detection
+    def key_fn(item) -> Tuple[int, float]:
+        index, detection = item
         center_x = _detection_center_x(detection)
         if center_x is None:
             return (1, float(index))
