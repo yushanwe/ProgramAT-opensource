@@ -150,16 +150,31 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
     if direct:
         return _parse_positive_int(direct.group(1))
 
-    patterns = [
-        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?(?:plug\s+points?|plugs?|sockets?|outlets?)\b",
-        rf"\b(?:plug\s+points?|plugs?|sockets?|outlets?)[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, normalized)
-        if match:
+    high_priority_terms = r"(?:sockets?|receptacles?)"
+    fallback_terms = r"(?:plug\s+points?|plugs?|outlets?)"
+    patterns = (
+        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{high_priority_terms}\b",
+        rf"\b{high_priority_terms}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
+        rf"\b{NUMBER_TOKEN_PATTERN}\s+(?:individual\s+)?{fallback_terms}\b",
+        rf"\b{fallback_terms}[\s:,\-]{{0,8}}{NUMBER_TOKEN_PATTERN}\b",
+    )
+
+    high_priority_counts: List[int] = []
+    fallback_counts: List[int] = []
+    for idx, pattern in enumerate(patterns):
+        for match in re.finditer(pattern, normalized):
             parsed = _parse_positive_int(match.group(1))
-            if parsed is not None:
-                return parsed
+            if parsed is None:
+                continue
+            if idx < 2:
+                high_priority_counts.append(parsed)
+            else:
+                fallback_counts.append(parsed)
+
+    if high_priority_counts:
+        return max(high_priority_counts)
+    if fallback_counts:
+        return max(fallback_counts)
     return None
 
 
