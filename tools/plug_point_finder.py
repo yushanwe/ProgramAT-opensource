@@ -172,9 +172,13 @@ def _socket_count_from_response_text(text: str) -> Optional[int]:
                 fallback_counts.append(parsed)
 
     if high_priority_counts:
-        return max(high_priority_counts)
+        if len(high_priority_counts) == 1:
+            return high_priority_counts[0]
+        return sum(high_priority_counts)
     if fallback_counts:
-        return max(fallback_counts)
+        if len(fallback_counts) == 1:
+            return fallback_counts[0]
+        return sum(fallback_counts)
     return None
 
 

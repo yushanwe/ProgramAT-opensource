@@ -211,6 +211,51 @@ class TestPlugPointFinder(unittest.TestCase):
         result = tool.main(image, {})
         self.assertEqual(result, "2 outlets visible, closest one straight ahead.")
 
+    def test_sums_multiple_socket_mentions(self):
+        image = FakeImage(100, 100, mean_value=160, std_value=20)
+
+        def fake_call(**kwargs):
+            capability = kwargs.get("capability")
+            if capability == "object_detection_localization":
+                return {
+                    "response": "detected",
+                    "artifact": {
+                        "detections": [
+                            {"label": "wall outlet", "bbox": [5, 20, 35, 60]},
+                            {"label": "wall outlet", "bbox": [65, 20, 95, 60]},
+                        ]
+                    },
+                }
+            if capability == "general_reasoning":
+                return {"response": "I see 2 sockets on the left and 2 sockets on the right."}
+            raise AssertionError(f"Unexpected capability call: {capability}")
+
+        tool.copilot_llm_call = fake_call
+        result = tool.main(image, {})
+        self.assertEqual(result, "4 outlets visible, closest one at 10 o'clock.")
+
+    def test_sums_multiple_plug_point_or_outlet_mentions(self):
+        image = FakeImage(100, 100, mean_value=160, std_value=20)
+
+        def fake_call(**kwargs):
+            capability = kwargs.get("capability")
+            if capability == "object_detection_localization":
+                return {
+                    "response": "detected",
+                    "artifact": {
+                        "detections": [
+                            {"label": "wall outlet", "bbox": [35, 20, 85, 60]},
+                        ]
+                    },
+                }
+            if capability == "general_reasoning":
+                return {"response": "There are 2 plug points and 1 outlet visible."}
+            raise AssertionError(f"Unexpected capability call: {capability}")
+
+        tool.copilot_llm_call = fake_call
+        result = tool.main(image, {})
+        self.assertEqual(result, "3 outlets visible, closest one straight ahead.")
+
     def test_persistent_blocked_camera_warns(self):
         image = FakeImage(80, 80, mean_value=0, std_value=0)
 
