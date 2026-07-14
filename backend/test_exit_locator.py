@@ -78,12 +78,12 @@ def test_main_returns_string_type():
     print()
 
 
-def test_live_api(api_key_env='GEMINI_API_KEY'):
+def test_live_api(env_var='GEMINI_API_KEY'):
     """Integration test — skipped when no API key is present."""
     print("Testing main() with live VLM API...")
-    env_configured = bool(os.environ.get(api_key_env))
+    env_configured = bool(os.environ.get(env_var))
     if not env_configured:
-        print(f"  ⚠️  {api_key_env} not set — skipping live API test")
+        print(f"  ⚠️  {env_var} not set — skipping live API test")
         print("  Set the environment variable to run an end-to-end test.")
         print()
         return
