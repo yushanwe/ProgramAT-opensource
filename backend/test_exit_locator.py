@@ -21,7 +21,7 @@ def create_test_image():
     image[100:380, 270:370] = [80, 60, 40]  # dark brown door
 
     # Draw a green exit sign above the door
-    image[80:100, 265:375] = [0, 200, 0]  # green bar (exit sign colour)
+    image[80:100, 265:375] = [0, 200, 0]  # green bar (exit sign color)
 
     return image
 
@@ -81,8 +81,8 @@ def test_main_returns_string_type():
 def test_live_api(api_key_env='GEMINI_API_KEY'):
     """Integration test — skipped when no API key is present."""
     print("Testing main() with live VLM API...")
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
+    env_configured = bool(os.environ.get(api_key_env))
+    if not env_configured:
         print(f"  ⚠️  {api_key_env} not set — skipping live API test")
         print("  Set the environment variable to run an end-to-end test.")
         print()
