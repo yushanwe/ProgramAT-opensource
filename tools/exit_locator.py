@@ -13,8 +13,10 @@ TOOL_PROMPT = (
     "You are an assistive navigation assistant for a blind user in an unfamiliar indoor space. "
     "Examine this image and locate the nearest visible exit door or emergency exit sign. "
     "Describe what you see, then give clear, step-by-step spoken directions to reach that exit safely. "
-    "Use simple language and clock-face positions (e.g. 12 o'clock straight ahead, 3 o'clock to the right) "
-    "to indicate direction. Keep the total response under 60 words and audio-friendly."
+    "Use simple language and clock-face positions to indicate direction. "
+    "Only use positions 1, 2, 3 (right side) or 9, 10, 11, 12 (left side and straight ahead), "
+    "as other positions would be behind the camera. "
+    "Keep the total response under 60 words and audio-friendly."
 )
 
 

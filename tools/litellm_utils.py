@@ -8,6 +8,8 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+import model_router  # noqa: E402  (path insertion must precede this import)
+
 
 def extract_text(response) -> str:
     """Extract text content from a LiteLLM response object."""
@@ -51,8 +53,6 @@ def call_take_photo_baseline_vlm(image, prompt: str) -> str:
     Returns:
         Audio-friendly text response from the model.
     """
-    import model_router  # available via _BACKEND_DIR on sys.path
-
     result = model_router.copilot_llm_call(
         capability="general_reasoning",
         messages=[{"role": "user", "content": prompt}],
