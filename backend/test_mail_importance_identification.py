@@ -13,18 +13,18 @@ import mail_importance_identification
 
 class TestMailImportanceIdentification(unittest.TestCase):
     def test_main_delegates_to_take_photo_baseline_helper(self):
-        image = object()
+        mock_image = object()
 
         with patch.object(
             mail_importance_identification,
             'call_take_photo_baseline_vlm',
             return_value='Important: utility bill.',
         ) as mock_call:
-            result = mail_importance_identification.main(image, {})
+            result = mail_importance_identification.main(mock_image, {})
 
         self.assertEqual(result, 'Important: utility bill.')
         mock_call.assert_called_once_with(
-            image=image,
+            image=mock_image,
             prompt=mail_importance_identification.TOOL_PROMPT,
         )
 

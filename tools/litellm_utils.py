@@ -1,5 +1,6 @@
 import io
 import base64
+import inspect
 import logging
 
 try:
@@ -42,7 +43,9 @@ def _image_to_data_uri(image) -> str:
     if isinstance(image, str):
         return image
     if Image is None:
-        raise ImportError('Pillow is required for take-photo image conversion')
+        raise ImportError(
+            'Pillow is required for take-photo image conversion. Install with: pip install Pillow'
+        )
     if isinstance(image, Image.Image):
         return pil_image_to_data_uri(image.convert('RGB'))
     if image is None:
@@ -60,7 +63,7 @@ def _image_to_data_uri(image) -> str:
     return pil_image_to_data_uri(pil_image)
 
 
-def call_take_photo_baseline_vlm(image, prompt: str):
+def call_take_photo_baseline_vlm(image, prompt: str, tool_name: str | None = None):
     """Run a single routed take-photo reasoning call and return spoken text."""
     if image is None:
         return {
@@ -71,6 +74,11 @@ def call_take_photo_baseline_vlm(image, prompt: str):
     try:
         from model_router_client import copilot_llm_call
 
+        if tool_name is None:
+            caller_frame = inspect.currentframe().f_back
+            caller_module = inspect.getmodule(caller_frame) if caller_frame else None
+            tool_name = getattr(caller_module, '__name__', 'take_photo_baseline_vlm')
+
         result = copilot_llm_call(
             capability='general_reasoning',
             messages=[
@@ -79,7 +87,7 @@ def call_take_photo_baseline_vlm(image, prompt: str):
             ],
             images=[_image_to_data_uri(image)],
             metadata={
-                'tool_name': 'take_photo_baseline_vlm',
+                'tool_name': tool_name,
                 'route_text': 'baseline take-photo tool response',
             },
         )
