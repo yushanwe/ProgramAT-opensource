@@ -14,7 +14,7 @@ TOOL_PROMPT = (
     "Examine this image and locate the nearest visible exit door or emergency exit sign. "
     "Describe what you see, then give clear, step-by-step spoken directions to reach that exit safely. "
     "Use simple language and clock-face positions to indicate direction: "
-    "12 o'clock means straight ahead, 1-3 o'clock means to the right, 9-12 o'clock means to the left or straight ahead. "
+    "12 o'clock is straight ahead, 1-3 o'clock is to the right, 9-11 o'clock is to the left. "
     "Only use positions 1-3 and 9-12; positions 4-8 would be behind the camera. "
     "Keep the total response under 60 words and audio-friendly."
 )
