@@ -1,6 +1,12 @@
 import io
+import sys
 import base64
+from pathlib import Path
 from PIL import Image
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent / "backend"
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
 
 
 def extract_text(response) -> str:
@@ -27,3 +33,30 @@ def pil_image_to_data_uri(pil_image: Image.Image, quality: int = 85) -> str:
     pil_image.save(buffer, format='JPEG', quality=quality)
     image_base64 = base64.b64encode(buffer.getvalue()).decode('ascii')
     return f'data:image/jpeg;base64,{image_base64}'
+
+
+def call_take_photo_baseline_vlm(image, prompt: str) -> str:
+    """Send a single image with a prompt to the baseline VLM via the capability router.
+
+    This is the standard entry point for take-photo tools. It routes the image
+    and prompt through the ``general_reasoning`` capability and returns the
+    model's text response directly.
+
+    Args:
+        image: The camera frame.  Accepts any image type supported by
+            ``copilot_llm_call`` (numpy array, PIL Image, base64 data URI,
+            or raw bytes).
+        prompt: The task-specific instruction to send to the model.
+
+    Returns:
+        Audio-friendly text response from the model.
+    """
+    import model_router  # available via _BACKEND_DIR on sys.path
+
+    result = model_router.copilot_llm_call(
+        capability="general_reasoning",
+        messages=[{"role": "user", "content": prompt}],
+        images=[image],
+        metadata={"tool_name": "take_photo_baseline"},
+    )
+    return result.get("response", "")
