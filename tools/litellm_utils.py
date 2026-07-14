@@ -1,10 +1,14 @@
 import io
 import base64
+import logging
 
 try:
     from PIL import Image
 except ImportError:  # pragma: no cover - optional dependency in lightweight test envs
     Image = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def extract_text(response) -> str:
@@ -43,6 +47,8 @@ def _image_to_data_uri(image) -> str:
         return pil_image_to_data_uri(image.convert('RGB'))
     if image is None:
         raise ValueError('No image available')
+    if not hasattr(image, 'shape') or not hasattr(image, '__getitem__'):
+        raise TypeError('Unsupported image type for take-photo conversion')
 
     if getattr(image, 'ndim', 0) == 2:
         pil_image = Image.fromarray(image).convert('RGB')
@@ -79,6 +85,7 @@ def call_take_photo_baseline_vlm(image, prompt: str):
         )
         return result['response']
     except Exception:
+        logger.exception('Take-photo baseline VLM call failed')
         return {
             'audio': {'type': 'error', 'text': 'I could not analyze that photo.'},
             'text': 'I could not analyze that photo.',
