@@ -27,14 +27,6 @@ def create_test_image():
 
 class TestFindNearestExit(unittest.TestCase):
 
-    def _make_llm_result(self, response_text, artifact=None):
-        result = MagicMock()
-        result.__getitem__ = lambda self, key: {
-            "response": response_text,
-            "artifact": artifact or {"detections": [{"label": "exit door", "position": "ahead"}]},
-        }[key]
-        return result
-
     def test_main_returns_navigation_response(self):
         """main() returns the Stage 2 navigation response as a string."""
         image = create_test_image()
