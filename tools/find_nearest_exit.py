@@ -22,10 +22,6 @@ import numpy as np
 from model_router_client import copilot_llm_call
 
 TOOL_NAME = "find_nearest_exit"
-TOOL_PROMPT = (
-    "Locate the nearest exit door in the image and provide step-by-step directions "
-    "to help a blind user reach it safely."
-)
 
 
 def main(image: np.ndarray, input_data: dict) -> str:
@@ -43,19 +39,22 @@ def main(image: np.ndarray, input_data: dict) -> str:
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return "No camera image available. Please point the camera at your surroundings."
 
-    # Stage 1: Locate the nearest exit door.
-    stage1 = copilot_llm_call(
-        capability="object_detection_localization",
-        images=[image],
-        goal="Locate the nearest exit door.",
-    )
+    try:
+        # Stage 1: Locate the nearest exit door.
+        stage1 = copilot_llm_call(
+            capability="object_detection_localization",
+            images=[image],
+            goal="Locate the nearest exit door.",
+        )
 
-    # Stage 2: Generate spoken directions to the exit using the detection result.
-    stage2 = copilot_llm_call(
-        capability="navigation",
-        images=[image],
-        metadata={"previous_stage_artifact": stage1["artifact"]},
-        goal="Guide me to the exit.",
-    )
+        # Stage 2: Generate spoken directions to the exit using the detection result.
+        stage2 = copilot_llm_call(
+            capability="navigation",
+            images=[image],
+            metadata={"previous_stage_artifact": stage1["artifact"]},
+            goal="Guide me to the exit.",
+        )
+    except Exception:
+        return "Unable to locate an exit right now. Please try again or ask someone nearby for help."
 
     return stage2["response"]

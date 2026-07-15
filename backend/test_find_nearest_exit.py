@@ -115,10 +115,13 @@ class TestFindNearestExit(unittest.TestCase):
         """TOOL_NAME constant matches expected value."""
         self.assertEqual(find_nearest_exit.TOOL_NAME, "find_nearest_exit")
 
-    def test_tool_prompt_constant_is_non_empty(self):
-        """TOOL_PROMPT constant is a non-empty string."""
-        self.assertIsInstance(find_nearest_exit.TOOL_PROMPT, str)
-        self.assertTrue(find_nearest_exit.TOOL_PROMPT.strip())
+    def test_llm_call_failure_returns_audio_friendly_error(self):
+        """main() returns an audio-friendly error string when copilot_llm_call raises."""
+        image = create_test_image()
+        with patch.object(find_nearest_exit, "copilot_llm_call", side_effect=RuntimeError("network error")):
+            result = main(image, {})
+        self.assertIsInstance(result, str)
+        self.assertTrue(len(result) > 0)
 
 
 def run_all_tests():
