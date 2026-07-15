@@ -24,14 +24,12 @@ assignees: ''
 ## Mode
 <!-- Enter exactly: take-photo or streaming. -->
 
-## Runtime prompt
-<!-- The exact prompt copied into TOOL_PROMPT. -->
-
-For a take-photo tool, copy the Runtime prompt above verbatim into `TOOL_PROMPT`;
-do not author, summarize, or improve it. Call
-`call_take_photo_baseline_vlm(image=image, prompt=TOOL_PROMPT)` from
-`litellm_utils`. Return that answer directly. The tool must make no other model
-or specialist calls.
+For take-photo tools, follow the generated `Task Stages` exactly. Implement one
+ordered `copilot_llm_call(...)` per stage using its declared capability and goal.
+Pass the original image to each visual stage. Pass useful earlier `artifact`
+values explicitly through `metadata={"previous_stage_artifact": ...}` and/or the
+next stage's messages. Return only the final stage's `response`. Do not fuse the
+stages into one prompt, select models, add retries, or add evaluators.
 
 Tools belong in `tools/`, must be Python, and must expose `main(image,
 input_data)`. Return concise audio-friendly text. Do not connect to the backend
