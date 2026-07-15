@@ -27,8 +27,6 @@ class TestHandGestureDetection(unittest.TestCase):
     def test_passes_tool_prompt_verbatim(self):
         with patch.object(litellm_utils, "call_model", return_value=self._make_response("ok")) as mock_call:
             hand_gesture_detection.main(b"image", {})
-        _, kwargs = mock_call.call_args
-        messages = kwargs.get("messages") or mock_call.call_args[0][1]
         prompt_sent = mock_call.call_args[1]["messages"][0]["content"]
         self.assertEqual(prompt_sent, hand_gesture_detection.TOOL_PROMPT)
 
