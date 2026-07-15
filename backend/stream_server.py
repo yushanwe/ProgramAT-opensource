@@ -11,12 +11,15 @@ python stream_server.py
 """
 
 import asyncio
+import ast
 import websockets
 import json
 import base64
 import io
 import logging
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +30,7 @@ from aiohttp import web, WSMsgType
 from google.cloud import secretmanager
 from github import Github
 import os
+import yaml
 from dotenv import load_dotenv
 try:
     import litellm
@@ -40,7 +44,23 @@ from module_manager import get_module_manager
 import copilot_db
 from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
+from webrtc_handler import webrtc_offer_handler, cleanup_webrtc_peers
+from video_summarizer import summarize_video
+from nvidia_hosted_client import (
+    NvidiaHostedClient,
+    RollingFrameBuffer,
+    TimedFrame,
+    build_multi_image_request,
+    build_video_request,
+    encode_frames_as_mp4,
+    normalize_image_data_uri,
+    uniformly_sample_frames,
+)
+from nvidia_rtvi_client import NvidiaRtviClient
+from rtsp_publisher import RtspPublisher, RtspPublisherConfig, safe_rtsp_path
 import re
+import tempfile
+import secrets
 import traceback
 from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +78,22 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+TAKE_PHOTO_PLANNING_MODE = os.environ.get(
+    'TAKE_PHOTO_PLANNING_MODE', 'no_planner'
+).strip().lower()
+SUPPORTED_TAKE_PHOTO_PLANNING_MODES = {
+    'no_planner', 'fused_prompt', 'separate_steps',
+}
+if TAKE_PHOTO_PLANNING_MODE not in SUPPORTED_TAKE_PHOTO_PLANNING_MODES:
+    raise ValueError(
+        f"Unsupported TAKE_PHOTO_PLANNING_MODE={TAKE_PHOTO_PLANNING_MODE!r}; "
+        f"expected one of {sorted(SUPPORTED_TAKE_PHOTO_PLANNING_MODES)}"
+    )
+
+BRAINSTORMING_ENABLED = os.environ.get(
+    'BRAINSTORMING_ENABLED', 'false'
+).strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
 def _normalize_custom_gpt_value(value) -> str:
@@ -499,6 +535,13 @@ last_text = {'content': None, 'timestamp': None, 'task': None, 'prev_raw': None}
 # Incomplete issue tracking for GitHub issue creation
 incomplete_issue = {'data': None, 'missing_fields': [], 'timestamp': None}
 
+# Ideation turn state — set after all fields are filled, before issue creation.
+# WebSocket path: keyed fields below; HTTP path uses pending_ideation_http dict.
+pending_ideation = {'active': False, 'parsed_data': None, 'video_summary': ''}
+
+# HTTP ideation tokens: token -> {'parsed_data': dict, 'video_summary': str, 'created_at': datetime}
+pending_ideation_http: dict = {}
+
 # Issue iteration tracking - for updating existing issues
 selected_issue = {'number': None, 'title': None, 'mode': 'create'}  # mode can be 'create' or 'update'
 issue_cache = {'issues': [], 'last_fetch': None, 'cache_duration': 300}  # Cache for 5 minutes
@@ -518,9 +561,825 @@ LATEST_META_FRAME_FILENAME = 'latest_meta_frame.jpg'
 # Format: {client_id: {'tool': {...}, 'last_run': timestamp, 'throttle_ms': 1000}}
 active_streaming_tools = {}
 
+# Tracks the asyncio.Task currently running a streaming tool for each client.
+# Cancelled on stop or when a new tool starts to prevent stale results arriving
+# after the tool has been swapped out.
+active_streaming_tasks: dict = {}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+_configured_nvidia_streaming_mode = os.getenv('NVIDIA_STREAMING_MODE', '').strip().lower()
+if _configured_nvidia_streaming_mode:
+    NVIDIA_STREAMING_MODE = _configured_nvidia_streaming_mode
+elif _env_flag('NVIDIA_RTVI_STREAMING_ENABLED'):
+    # Backwards compatibility for the previously implemented RTVI flag.
+    NVIDIA_STREAMING_MODE = 'rtvi'
+else:
+    NVIDIA_STREAMING_MODE = 'disabled'
+NVIDIA_STREAMING_MODES = {'disabled', 'original', 'rtvi', 'hosted_multiframe'}
+if NVIDIA_STREAMING_MODE not in NVIDIA_STREAMING_MODES:
+    raise ValueError(
+        f"NVIDIA_STREAMING_MODE must be one of {sorted(NVIDIA_STREAMING_MODES)}, "
+        f"got {NVIDIA_STREAMING_MODE!r}"
+    )
+NVIDIA_RTVI_STREAMING_ENABLED = NVIDIA_STREAMING_MODE == 'rtvi'
+NVIDIA_RTVI_BASE_URL = os.getenv('NVIDIA_RTVI_BASE_URL', 'http://localhost:8000').rstrip('/')
+NVIDIA_RTVI_MODEL = os.getenv('NVIDIA_RTVI_MODEL', '').strip()
+NVIDIA_RTVI_CHUNK_DURATION_SECONDS = float(
+    os.getenv('NVIDIA_RTVI_CHUNK_DURATION_SECONDS', '2')
+)
+NVIDIA_RTVI_CHUNK_OVERLAP_SECONDS = float(
+    os.getenv('NVIDIA_RTVI_CHUNK_OVERLAP_SECONDS', '0')
+)
+NVIDIA_RTVI_REQUEST_TIMEOUT_SECONDS = float(
+    os.getenv('NVIDIA_RTVI_REQUEST_TIMEOUT_SECONDS', '30')
+)
+PROGRAMAT_RTSP_PUBLIC_BASE_URL = os.getenv(
+    'PROGRAMAT_RTSP_PUBLIC_BASE_URL', 'rtsp://localhost:8554/programat'
+).rstrip('/')
+PROGRAMAT_RTSP_FPS = float(os.getenv('PROGRAMAT_RTSP_FPS', '5'))
+PROGRAMAT_RTSP_WIDTH = int(os.getenv('PROGRAMAT_RTSP_WIDTH')) if os.getenv('PROGRAMAT_RTSP_WIDTH') else None
+PROGRAMAT_RTSP_HEIGHT = int(os.getenv('PROGRAMAT_RTSP_HEIGHT')) if os.getenv('PROGRAMAT_RTSP_HEIGHT') else None
+PROGRAMAT_FFMPEG_BINARY = os.getenv('PROGRAMAT_FFMPEG_BINARY', 'ffmpeg')
+
+NVIDIA_HOSTED_API_BASE_URL = os.getenv(
+    'NVIDIA_HOSTED_API_BASE_URL', 'https://integrate.api.nvidia.com/v1'
+).rstrip('/')
+NVIDIA_HOSTED_API_KEY = os.getenv('NVIDIA_HOSTED_API_KEY', '').strip()
+NVIDIA_HOSTED_MODEL = os.getenv('NVIDIA_HOSTED_MODEL', '').strip()
+NVIDIA_HOSTED_WINDOW_SECONDS = float(os.getenv('NVIDIA_HOSTED_WINDOW_SECONDS', '2'))
+NVIDIA_HOSTED_SAMPLE_FRAMES = int(os.getenv('NVIDIA_HOSTED_SAMPLE_FRAMES', '6'))
+NVIDIA_HOSTED_REQUEST_INTERVAL_SECONDS = float(
+    os.getenv('NVIDIA_HOSTED_REQUEST_INTERVAL_SECONDS', '1.5')
+)
+NVIDIA_HOSTED_MAX_IN_FLIGHT = int(os.getenv('NVIDIA_HOSTED_MAX_IN_FLIGHT', '1'))
+NVIDIA_HOSTED_REQUEST_TIMEOUT_SECONDS = float(
+    os.getenv('NVIDIA_HOSTED_REQUEST_TIMEOUT_SECONDS', '60')
+)
+NVIDIA_HOSTED_MAX_TOKENS = int(os.getenv('NVIDIA_HOSTED_MAX_TOKENS', '80'))
+
+rtvi_client = NvidiaRtviClient(
+    NVIDIA_RTVI_BASE_URL,
+    NVIDIA_RTVI_REQUEST_TIMEOUT_SECONDS,
+)
+hosted_nvidia_client = NvidiaHostedClient(
+    NVIDIA_HOSTED_API_BASE_URL,
+    NVIDIA_HOSTED_API_KEY,
+    NVIDIA_HOSTED_REQUEST_TIMEOUT_SECONDS,
+)
+
+# Experimental sessions are separate from active_streaming_tools so enabling RTVI
+# cannot accidentally enter the CLIP/router/cascade path.
+active_rtvi_sessions: dict[str, Dict[str, Any]] = {}
+active_hosted_nvidia_sessions: dict[str, Dict[str, Any]] = {}
+
+
+def _hosted_safe_error(error: Exception) -> str:
+    """Keep hosted HTTP diagnostics while preventing media payload logging."""
+    return re.sub(
+        r'data:(?:image|video)/[^;,\s]+;base64,[A-Za-z0-9+/=]+',
+        '<base64 media omitted>',
+        str(error),
+    )
+
+
+def _rtvi_prompt(data: Dict[str, Any]) -> str:
+    """Select an existing direct task prompt without invoking an LLM rewriter."""
+    for key in ('gpt_query', 'task', 'input', 'system_instruction', 'tool_name'):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return ' '.join(value.split())[:2000]
+    return 'Describe the current scene concisely.'
+
+
+async def _send_rtvi_error(websocket, client_id: str, session: Dict[str, Any], error: Exception) -> None:
+    if active_rtvi_sessions.get(client_id) is not session:
+        return
+    message = f"NVIDIA RTVI streaming error: {error}"
+    logger.error("[NVIDIA RTVI] session error client=%s error=%s", client_id, error)
+    try:
+        await websocket.send(json.dumps({
+            'type': 'tool_stream_result',
+            'tool_name': session['tool_name'],
+            'result': message,
+            'status': 'error',
+            'error': str(error),
+            'mode': 'nvidia_rtvi',
+            'audio': {
+                'type': 'speech',
+                'text': message,
+                'rate': 1.0,
+                'interrupt': False,
+            },
+            'execution_id': session.get('output_sequence', 0) + 1,
+            'timestamp': datetime.now().isoformat(),
+        }))
+    except Exception as send_error:
+        logger.warning(
+            "[NVIDIA RTVI] could not report error to client=%s error=%s",
+            client_id,
+            send_error,
+        )
+
+
+async def _run_rtvi_caption_session(websocket, client_id: str, session: Dict[str, Any]) -> None:
+    try:
+        await session['publisher'].wait_for_first_frame(
+            timeout=NVIDIA_RTVI_REQUEST_TIMEOUT_SECONDS
+        )
+        if active_rtvi_sessions.get(client_id) is not session:
+            return
+        model = NVIDIA_RTVI_MODEL or await rtvi_client.discover_model()
+        session['model'] = model
+        stream_id = await rtvi_client.register_stream(
+            session['rtsp_url'],
+            f"ProgramAT streaming session {session['session_id']}",
+        )
+        session['rtvi_stream_id'] = stream_id
+        logger.info(
+            "[NVIDIA RTVI] stream registered client=%s session=%s stream_id=%s model=%s",
+            client_id,
+            session['session_id'],
+            stream_id,
+            model,
+        )
+        logger.info(
+            "[NVIDIA RTVI] caption request started client=%s stream_id=%s chunk_duration=%s overlap=%s",
+            client_id,
+            stream_id,
+            NVIDIA_RTVI_CHUNK_DURATION_SECONDS,
+            NVIDIA_RTVI_CHUNK_OVERLAP_SECONDS,
+        )
+        async for caption in rtvi_client.stream_captions(
+            stream_id=stream_id,
+            prompt=session['prompt'],
+            model=model,
+            chunk_duration=NVIDIA_RTVI_CHUNK_DURATION_SECONDS,
+            chunk_overlap_duration=NVIDIA_RTVI_CHUNK_OVERLAP_SECONDS,
+        ):
+            event_received_at = time.perf_counter()
+            if active_rtvi_sessions.get(client_id) is not session:
+                return
+            if caption.chunk_id is not None:
+                if caption.chunk_id in session['forwarded_chunk_ids']:
+                    logger.debug(
+                        "[NVIDIA RTVI] duplicate chunk ignored client=%s chunk_id=%s",
+                        client_id,
+                        caption.chunk_id,
+                    )
+                    continue
+                session['forwarded_chunk_ids'].add(caption.chunk_id)
+            session['output_sequence'] += 1
+            if session['first_result_at'] is None:
+                session['first_result_at'] = event_received_at
+                logger.info(
+                    "[NVIDIA RTVI] first result client=%s elapsed_ms=%.1f",
+                    client_id,
+                    (event_received_at - session['started_at']) * 1000,
+                )
+            logger.info(
+                "[NVIDIA RTVI] result client=%s chunk_id=%s start=%s end=%s",
+                client_id,
+                caption.chunk_id,
+                caption.start_time,
+                caption.end_time,
+            )
+            response_data = {
+                'type': 'tool_stream_result',
+                'tool_name': session['tool_name'],
+                'result': caption.content,
+                'audio': {
+                    'type': 'speech',
+                    'text': caption.content,
+                    'rate': 1.0,
+                    'interrupt': False,
+                },
+                'mode': 'nvidia_rtvi',
+                'execution_id': session['output_sequence'],
+                'rtvi_chunk_id': caption.chunk_id,
+                'rtvi_start_time': caption.start_time,
+                'rtvi_end_time': caption.end_time,
+                'timestamp': datetime.now().isoformat(),
+            }
+            await websocket.send(json.dumps(response_data))
+            logger.info(
+                "[NVIDIA RTVI] result forwarded client=%s chunk_id=%s forward_latency_ms=%.1f",
+                client_id,
+                caption.chunk_id,
+                (time.perf_counter() - event_received_at) * 1000,
+            )
+        logger.info("[NVIDIA RTVI] caption SSE completed client=%s stream_id=%s", client_id, stream_id)
+        await _cleanup_rtvi_session(client_id, reason='caption_stream_completed')
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await _send_rtvi_error(websocket, client_id, session, exc)
+        await _cleanup_rtvi_session(client_id, reason='caption_stream_error')
+
+
+async def _start_rtvi_session(websocket, client_id: str, data: Dict[str, Any]) -> None:
+    await _cleanup_rtvi_session(client_id, reason='replaced')
+    session_id = f"{safe_rtsp_path(client_id)}-{secrets.token_hex(8)}"
+    publisher = RtspPublisher(
+        session_id,
+        RtspPublisherConfig(
+            public_base_url=PROGRAMAT_RTSP_PUBLIC_BASE_URL,
+            fps=PROGRAMAT_RTSP_FPS,
+            width=PROGRAMAT_RTSP_WIDTH,
+            height=PROGRAMAT_RTSP_HEIGHT,
+            ffmpeg_binary=PROGRAMAT_FFMPEG_BINARY,
+        ),
+    )
+    await publisher.start()
+    session = {
+        'session_id': session_id,
+        'tool_name': data.get('tool_name', 'unknown'),
+        'prompt': _rtvi_prompt(data),
+        'rtsp_url': publisher.rtsp_url,
+        'publisher': publisher,
+        'rtvi_stream_id': None,
+        'caption_task': None,
+        'started_at': time.perf_counter(),
+        'first_result_at': None,
+        'forwarded_chunk_ids': set(),
+        'output_sequence': 0,
+    }
+    active_rtvi_sessions[client_id] = session
+    if publisher.writer_task is not None:
+        publisher.writer_task.add_done_callback(
+            lambda task: asyncio.create_task(
+                _handle_rtvi_publisher_finished(websocket, client_id, session, task)
+            )
+        )
+    logger.info(
+        "[NVIDIA RTVI] session started client=%s session=%s rtsp_url=%s",
+        client_id,
+        session_id,
+        publisher.rtsp_url,
+    )
+    await websocket.send(json.dumps({
+        'type': 'streaming_started',
+        'tool_name': session['tool_name'],
+        'mode': 'nvidia_rtvi',
+        'rtsp_url': publisher.rtsp_url,
+        'timestamp': datetime.now().isoformat(),
+    }))
+
+
+async def _handle_rtvi_publisher_finished(
+    websocket,
+    client_id: str,
+    session: Dict[str, Any],
+    task: asyncio.Task,
+) -> None:
+    if task.cancelled() or active_rtvi_sessions.get(client_id) is not session:
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is None:
+        error = RuntimeError('FFmpeg publisher stopped unexpectedly')
+    await _send_rtvi_error(websocket, client_id, session, error)
+    await _cleanup_rtvi_session(client_id, reason='publisher_failure')
+
+
+async def _offer_rtvi_frame(websocket, client_id: str, frame: str) -> None:
+    session = active_rtvi_sessions.get(client_id)
+    if session is None:
+        return
+    try:
+        session['publisher'].offer_frame(frame)
+        if session['caption_task'] is None:
+            task = asyncio.create_task(_run_rtvi_caption_session(websocket, client_id, session))
+            session['caption_task'] = task
+    except Exception as exc:
+        await _send_rtvi_error(websocket, client_id, session, exc)
+        await _cleanup_rtvi_session(client_id, reason='frame_publish_error')
+
+
+async def _cleanup_rtvi_session(client_id: str, reason: str) -> None:
+    session = active_rtvi_sessions.pop(client_id, None)
+    if session is None:
+        return
+    logger.info(
+        "[NVIDIA RTVI] session cleanup started client=%s session=%s reason=%s",
+        client_id,
+        session['session_id'],
+        reason,
+    )
+    caption_task = session.get('caption_task')
+    current_task = asyncio.current_task()
+    if caption_task is not None and caption_task is not current_task and not caption_task.done():
+        caption_task.cancel()
+        await asyncio.gather(caption_task, return_exceptions=True)
+    stream_id = session.get('rtvi_stream_id')
+    if stream_id:
+        await rtvi_client.cleanup_stream(stream_id)
+    await session['publisher'].stop()
+    logger.info(
+        "[NVIDIA RTVI] session cleanup finished client=%s session=%s reason=%s",
+        client_id,
+        session['session_id'],
+        reason,
+    )
+
+
+async def _send_hosted_nvidia_error(
+    websocket,
+    client_id: str,
+    session: Dict[str, Any],
+    error: Exception,
+) -> None:
+    if active_hosted_nvidia_sessions.get(client_id) is not session:
+        return
+    safe_error = _hosted_safe_error(error)
+    message = f"NVIDIA hosted multiframe streaming error: {safe_error}"
+    logger.error(
+        "[NVIDIA Hosted] session error client=%s generation=%s error=%s",
+        client_id,
+        session['generation_token'],
+        safe_error,
+    )
+    try:
+        await websocket.send(json.dumps({
+            'type': 'tool_stream_result',
+            'tool_name': session['tool_name'],
+            'result': message,
+            'status': 'error',
+            'error': safe_error,
+            'mode': 'hosted_multiframe',
+            'execution_id': session.get('clip_sequence', 0) + 1,
+            'timestamp': datetime.now().isoformat(),
+        }))
+    except Exception as send_error:
+        logger.warning(
+            "[NVIDIA Hosted] could not report error client=%s error=%s",
+            client_id,
+            send_error,
+        )
+
+
+async def _run_hosted_nvidia_clip(
+    websocket,
+    client_id: str,
+    session: Dict[str, Any],
+    clip_sequence: int,
+    frames: List[TimedFrame],
+) -> None:
+    request_started = time.perf_counter()
+    encoding_started = request_started
+    try:
+        model = session['model']
+        if model.supports_video:
+            if len(frames) > 1 and frames[-1].timestamp > frames[0].timestamp:
+                fps = (len(frames) - 1) / (frames[-1].timestamp - frames[0].timestamp)
+            else:
+                fps = max(1.0, len(frames) / NVIDIA_HOSTED_WINDOW_SECONDS)
+            video_data_uri = await asyncio.to_thread(encode_frames_as_mp4, frames, fps)
+            request = build_video_request(
+                model.id,
+                session['prompt'],
+                video_data_uri,
+                NVIDIA_HOSTED_MAX_TOKENS,
+            )
+            input_format = 'native_video_mp4'
+        else:
+            normalized_uris = await asyncio.gather(*(
+                asyncio.to_thread(normalize_image_data_uri, frame.image_data_uri)
+                for frame in frames
+            ))
+            encoded_frames = [
+                TimedFrame(frame.timestamp, data_uri)
+                for frame, data_uri in zip(frames, normalized_uris)
+            ]
+            request = build_multi_image_request(
+                model.id,
+                session['prompt'],
+                encoded_frames,
+                NVIDIA_HOSTED_MAX_TOKENS,
+            )
+            input_format = 'ordered_image_url'
+        encoding_latency_ms = (time.perf_counter() - encoding_started) * 1000
+        api_started = time.perf_counter()
+        content = await hosted_nvidia_client.chat_completions(request)
+        api_latency_ms = (time.perf_counter() - api_started) * 1000
+        current = active_hosted_nvidia_sessions.get(client_id)
+        if current is not session:
+            logger.info(
+                "[NVIDIA Hosted] stale result dropped client=%s clip=%s reason=session_stopped_or_replaced",
+                client_id,
+                clip_sequence,
+            )
+            return
+        if clip_sequence <= session['latest_forwarded_clip']:
+            logger.info(
+                "[NVIDIA Hosted] stale result dropped client=%s clip=%s latest_forwarded=%s",
+                client_id,
+                clip_sequence,
+                session['latest_forwarded_clip'],
+            )
+            return
+        session['latest_forwarded_clip'] = clip_sequence
+        end_to_end_ms = (time.time() - frames[0].timestamp) * 1000
+        logger.info(
+            "[NVIDIA Hosted] result client=%s generation=%s clip=%s format=%s "
+            "frame_count=%s oldest_ts=%.6f newest_ts=%.6f encoding_ms=%.1f "
+            "api_ms=%.1f end_to_end_ms=%.1f",
+            client_id,
+            session['generation_token'],
+            clip_sequence,
+            input_format,
+            len(frames),
+            frames[0].timestamp,
+            frames[-1].timestamp,
+            encoding_latency_ms,
+            api_latency_ms,
+            end_to_end_ms,
+        )
+        await websocket.send(json.dumps({
+            'type': 'tool_stream_result',
+            'tool_name': session['tool_name'],
+            'result': content,
+            'audio': {
+                'type': 'speech',
+                'text': content,
+                'rate': 1.0,
+                'interrupt': False,
+            },
+            'mode': 'hosted_multiframe',
+            'execution_id': clip_sequence,
+            'clip_sequence': clip_sequence,
+            'frame_count': len(frames),
+            'input_format': input_format,
+            'timestamp': datetime.now().isoformat(),
+        }))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        safe_error = _hosted_safe_error(exc)
+        logger.error(
+            "[NVIDIA Hosted] request failed client=%s clip=%s latency_ms=%.1f error=%s",
+            client_id,
+            clip_sequence,
+            (time.perf_counter() - request_started) * 1000,
+            safe_error,
+        )
+        await _send_hosted_nvidia_error(websocket, client_id, session, exc)
+        await _cleanup_hosted_nvidia_session(client_id, reason='request_error')
+
+
+async def _hosted_nvidia_scheduler(
+    websocket,
+    client_id: str,
+    session: Dict[str, Any],
+) -> None:
+    try:
+        model = await hosted_nvidia_client.select_model(NVIDIA_HOSTED_MODEL)
+        if active_hosted_nvidia_sessions.get(client_id) is not session:
+            return
+        session['model'] = model
+        session['input_format'] = (
+            'native_video_mp4' if model.supports_video else 'ordered_image_url'
+        )
+        logger.info(
+            "[NVIDIA Hosted] session ready client=%s generation=%s model=%s format=%s",
+            client_id,
+            session['generation_token'],
+            model.id,
+            session['input_format'],
+        )
+        while active_hosted_nvidia_sessions.get(client_id) is session:
+            await asyncio.sleep(NVIDIA_HOSTED_REQUEST_INTERVAL_SECONDS)
+            request_task = session.get('request_task')
+            if request_task is not None and not request_task.done():
+                session['skipped_intervals'] += 1
+                logger.info(
+                    "[NVIDIA Hosted] interval skipped client=%s reason=request_in_flight skipped=%s",
+                    client_id,
+                    session['skipped_intervals'],
+                )
+                continue
+            available = session['frame_buffer'].snapshot(time.time())
+            if not available:
+                session['skipped_intervals'] += 1
+                logger.info(
+                    "[NVIDIA Hosted] interval skipped client=%s reason=no_frames skipped=%s",
+                    client_id,
+                    session['skipped_intervals'],
+                )
+                continue
+            frames = uniformly_sample_frames(available, NVIDIA_HOSTED_SAMPLE_FRAMES)
+            session['clip_sequence'] += 1
+            clip_sequence = session['clip_sequence']
+            logger.info(
+                "[NVIDIA Hosted] request started client=%s generation=%s clip=%s "
+                "frame_count=%s oldest_ts=%.6f newest_ts=%.6f",
+                client_id,
+                session['generation_token'],
+                clip_sequence,
+                len(frames),
+                frames[0].timestamp,
+                frames[-1].timestamp,
+            )
+            session['request_task'] = asyncio.create_task(
+                _run_hosted_nvidia_clip(
+                    websocket, client_id, session, clip_sequence, frames
+                )
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await _send_hosted_nvidia_error(websocket, client_id, session, exc)
+        await _cleanup_hosted_nvidia_session(client_id, reason='scheduler_error')
+
+
+async def _start_hosted_nvidia_session(
+    websocket,
+    client_id: str,
+    data: Dict[str, Any],
+) -> None:
+    if NVIDIA_HOSTED_MAX_IN_FLIGHT != 1:
+        raise ValueError('NVIDIA_HOSTED_MAX_IN_FLIGHT must be 1 for hosted_multiframe')
+    if not NVIDIA_HOSTED_API_KEY:
+        raise ValueError('NVIDIA_HOSTED_API_KEY is required for hosted_multiframe')
+    await _cleanup_hosted_nvidia_session(client_id, reason='replaced')
+    max_buffer_frames = max(
+        NVIDIA_HOSTED_SAMPLE_FRAMES * 4,
+        int(NVIDIA_HOSTED_WINDOW_SECONDS * 30),
+    )
+    session = {
+        'generation_token': secrets.token_hex(16),
+        'tool_name': data.get('tool_name', 'unknown'),
+        'prompt': _rtvi_prompt(data),
+        'frame_buffer': RollingFrameBuffer(
+            NVIDIA_HOSTED_WINDOW_SECONDS,
+            max_buffer_frames,
+        ),
+        'scheduler_task': None,
+        'request_task': None,
+        'model': None,
+        'input_format': None,
+        'clip_sequence': 0,
+        'latest_forwarded_clip': 0,
+        'skipped_intervals': 0,
+    }
+    active_hosted_nvidia_sessions[client_id] = session
+    session['scheduler_task'] = asyncio.create_task(
+        _hosted_nvidia_scheduler(websocket, client_id, session)
+    )
+    logger.info(
+        "[NVIDIA Hosted] session started client=%s generation=%s mode=hosted_multiframe "
+        "window_seconds=%s sample_frames=%s interval_seconds=%s",
+        client_id,
+        session['generation_token'],
+        NVIDIA_HOSTED_WINDOW_SECONDS,
+        NVIDIA_HOSTED_SAMPLE_FRAMES,
+        NVIDIA_HOSTED_REQUEST_INTERVAL_SECONDS,
+    )
+    await websocket.send(json.dumps({
+        'type': 'streaming_started',
+        'tool_name': session['tool_name'],
+        'mode': 'hosted_multiframe',
+        'timestamp': datetime.now().isoformat(),
+    }))
+
+
+async def _offer_hosted_nvidia_frame(
+    client_id: str,
+    image_base64: str,
+    timestamp: float,
+) -> None:
+    session = active_hosted_nvidia_sessions.get(client_id)
+    if session is None:
+        return
+    session['frame_buffer'].add(image_base64, timestamp)
+
+
+async def _cleanup_hosted_nvidia_session(client_id: str, reason: str) -> None:
+    session = active_hosted_nvidia_sessions.pop(client_id, None)
+    if session is None:
+        return
+    logger.info(
+        "[NVIDIA Hosted] cleanup started client=%s generation=%s reason=%s",
+        client_id,
+        session['generation_token'],
+        reason,
+    )
+    current_task = asyncio.current_task()
+    tasks = [session.get('scheduler_task'), session.get('request_task')]
+    tasks_to_wait = []
+    for task in tasks:
+        if task is not None and task is not current_task and not task.done():
+            task.cancel()
+            tasks_to_wait.append(task)
+    if tasks_to_wait:
+        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    session['frame_buffer'].clear()
+    logger.info(
+        "[NVIDIA Hosted] cleanup finished client=%s generation=%s reason=%s skipped_intervals=%s",
+        client_id,
+        session['generation_token'],
+        reason,
+        session['skipped_intervals'],
+    )
+
+
+async def _dispatch_active_streaming_frame(
+    websocket,
+    client_id: str,
+    image,
+    image_base64: str,
+    frame_timestamp: float | None = None,
+) -> asyncio.Task | None:
+    """Select exactly one streaming pipeline for an incoming client frame."""
+    if NVIDIA_STREAMING_MODE == 'rtvi':
+        if client_id in active_rtvi_sessions:
+            await _offer_rtvi_frame(websocket, client_id, image_base64)
+        return None
+    if NVIDIA_STREAMING_MODE == 'hosted_multiframe':
+        if client_id in active_hosted_nvidia_sessions:
+            await _offer_hosted_nvidia_frame(
+                client_id,
+                image_base64,
+                frame_timestamp if frame_timestamp is not None else time.time(),
+            )
+        return None
+    if image is None or client_id not in active_streaming_tools:
+        return None
+    task = asyncio.create_task(
+        schedule_streaming_frame(websocket, client_id, image, image_base64)
+    )
+    active_streaming_tasks[client_id] = task
+    task.add_done_callback(_log_streaming_task_error)
+    return task
+
+EXECUTION_POLICY_PATH = Path(__file__).resolve().parent / 'execution_policy.yaml'
+_clip_encoders = {}
+_clip_encoder_load_lock = threading.Lock()
+_clip_ready_models = set()
+
+
+def load_streaming_frame_selector_config(path=EXECUTION_POLICY_PATH) -> Dict[str, Any]:
+    """Load and validate streaming-only frame selector configuration."""
+    with Path(path).open('r', encoding='utf-8') as handle:
+        root = yaml.safe_load(handle) or {}
+    selector = (root.get('streaming') or {}).get('frame_selector') or {}
+    if selector.get('implementation') != 'clip':
+        raise ValueError("streaming.frame_selector.implementation must be 'clip'")
+    model = str(selector.get('model') or '').strip()
+    threshold = float(selector.get('similarity_threshold'))
+    last_sent_threshold = float(os.getenv(
+        'STREAMING_MAX_SIMILARITY_TO_LAST_SENT',
+        os.getenv(
+            'MAX_SIMILARITY_TO_LAST_SENT',
+            selector.get(
+                'max_similarity_to_last_sent', STREAMING_MAX_SIMILARITY_TO_LAST_SENT
+            ),
+        ),
+    ))
+    max_skip_frames = int(selector.get('max_skip_frames'))
+    if not model:
+        raise ValueError('streaming.frame_selector.model is required')
+    if not -1.0 <= threshold <= 1.0:
+        raise ValueError('streaming.frame_selector.similarity_threshold must be between -1 and 1')
+    if not -1.0 <= last_sent_threshold <= 1.0:
+        raise ValueError(
+            'streaming.frame_selector.max_similarity_to_last_sent must be between -1 and 1'
+        )
+    if max_skip_frames < 0:
+        raise ValueError('streaming.frame_selector.max_skip_frames must be non-negative')
+    return {
+        'implementation': 'clip',
+        'model': model,
+        'similarity_threshold': threshold,
+        'max_similarity_to_last_sent': last_sent_threshold,
+        'max_skip_frames': max_skip_frames,
+    }
+
+
+class ClipFrameEncoder:
+    """Lazy HuggingFace CLIP image encoder shared across streaming sessions."""
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self._model = None
+        self._processor = None
+
+    def _load(self):
+        if self._model is not None:
+            return
+        with _clip_encoder_load_lock:
+            if self._model is not None:
+                return
+            transformer_logger = logging.getLogger('transformers')
+            hub_logger = logging.getLogger('huggingface_hub')
+            previous_levels = (transformer_logger.level, hub_logger.level)
+            transformer_logger.setLevel(logging.ERROR)
+            hub_logger.setLevel(logging.ERROR)
+            try:
+                from transformers import CLIPModel, CLIPProcessor
+                self._processor = CLIPProcessor.from_pretrained(self.model_name)
+                self._model = CLIPModel.from_pretrained(self.model_name)
+            finally:
+                transformer_logger.setLevel(previous_levels[0])
+                hub_logger.setLevel(previous_levels[1])
+            self._model.eval()
+
+    @staticmethod
+    def _image(frame):
+        if isinstance(frame, str):
+            encoded = frame.split(',', 1)[1] if frame.startswith('data:') else frame
+            return Image.open(io.BytesIO(base64.b64decode(encoded))).convert('RGB')
+        if isinstance(frame, Image.Image):
+            return frame.convert('RGB')
+        if isinstance(frame, np.ndarray):
+            if frame.ndim == 3 and frame.shape[2] == 3:
+                return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            return Image.fromarray(frame).convert('RGB')
+        raise TypeError(f'Unsupported frame type: {type(frame).__name__}')
+
+    def encode(self, frame) -> np.ndarray:
+        self._load()
+        import torch
+        inputs = self._processor(images=self._image(frame), return_tensors='pt')
+        with torch.inference_mode():
+            output = self._model.get_image_features(**inputs)
+        embedding = _clip_embedding_tensor(output)
+        vector = _normalize_streaming_embedding(
+            embedding.detach().cpu().numpy().astype(np.float32)
+        )
+        return vector
+
+
+def _clip_embedding_tensor(output):
+    """Extract a tensor from old and new Transformers CLIP output shapes."""
+    if hasattr(output, 'detach'):
+        return output
+    for attribute in ('image_embeds', 'pooler_output'):
+        embedding = getattr(output, attribute, None)
+        if embedding is not None and hasattr(embedding, 'detach'):
+            return embedding
+    hidden_state = getattr(output, 'last_hidden_state', None)
+    if hidden_state is not None and hasattr(hidden_state, 'detach'):
+        return hidden_state[:, 0, :]
+    raise TypeError(
+        f'CLIP image features returned unsupported output type {type(output).__name__}'
+    )
+
+
+def _normalize_streaming_embedding(embedding) -> np.ndarray:
+    """Pool token embeddings into one normalized vector for cosine similarity."""
+    vector = np.asarray(embedding, dtype=np.float32)
+    if vector.ndim == 0:
+        raise ValueError('CLIP returned a scalar embedding')
+    if vector.ndim > 1:
+        feature_axis = vector.ndim - 1
+        vector = vector.mean(axis=tuple(range(feature_axis)))
+    vector = vector.reshape(-1)
+    norm = float(np.linalg.norm(vector))
+    if norm == 0:
+        raise ValueError('CLIP returned a zero-length embedding')
+    return vector / norm
+
+
+def encode_streaming_frame(frame, selector_config: Dict[str, Any]) -> np.ndarray:
+    model_name = selector_config['model']
+    with _clip_encoder_load_lock:
+        encoder = _clip_encoders.get(model_name)
+        if encoder is None:
+            encoder = ClipFrameEncoder(model_name)
+            _clip_encoders[model_name] = encoder
+    return encoder.encode(frame)
+
+
+def warm_streaming_frame_selector() -> None:
+    """Load CLIP and run one inference before the server accepts streaming clients."""
+    selector_config = load_streaming_frame_selector_config()
+    model_name = selector_config['model']
+    if model_name in _clip_ready_models:
+        return
+    started = time.perf_counter()
+    encode_streaming_frame(Image.new('RGB', (32, 32), 'black'), selector_config)
+    _clip_ready_models.add(model_name)
+    logger.info(
+        "[Streaming] CLIP ready latency_ms=%.1f",
+        (time.perf_counter() - started) * 1000,
+    )
+
 # Conversation images - stores images for chat follow-up questions
 # Format: {conversation_id: PIL.Image}
 conversation_images = {}
+
+# Brainstorm history - stores Q&A pairs for iterative brainstorming
+# Format: {conversation_id: [{"question": str, "answer": str}, ...]}
+brainstorm_history = {}
 
 # YOLO model cache for tool executions - shared across all tool runs
 # This prevents reloading models on every frame, enabling true real-time performance
@@ -538,26 +1397,832 @@ pending_copilot_issues = {}
 TEMPLATE_DIR = Path(__file__).parent.parent / '.github' / 'ISSUE_TEMPLATE'
 
 
-def _response_field_only(result: Any) -> Any:
-    """Unwrap an atomic capability result before constructing the mobile payload."""
-    if isinstance(result, dict) and {'response', 'implementation', 'capability'} <= set(result):
-        return result['response']
-    if type(result).__name__ == 'ImplementationResult' and hasattr(result, 'response'):
-        return result.response
-    return result
+def _response_field_only(result: Any) -> str:
+    """Extract user-facing text without stringifying internal execution objects."""
+    value = result
+    seen = set()
+    while True:
+        if value is None:
+            return ''
+        if isinstance(value, str):
+            text = value.strip()
+            parsed = None
+            if len(text) <= 1_000_000 and text.startswith('{') and text.endswith('}'):
+                for parser in (json.loads, ast.literal_eval):
+                    try:
+                        candidate = parser(text)
+                    except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(candidate, dict) and 'response' in candidate:
+                        parsed = candidate
+                        break
+            if parsed is None:
+                return value
+            logger.debug("Unwrapped serialized execution result at mobile boundary")
+            value = parsed
+            continue
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+
+        identity = id(value)
+        if identity in seen:
+            logger.debug("Cycle found while extracting user-facing response: %r", result)
+            return ''
+        seen.add(identity)
+
+        if isinstance(value, dict):
+            next_value = None
+            for key in ('response', 'text', 'result', 'answer', 'description', 'message', 'content'):
+                if key in value and value[key] is not None:
+                    next_value = value[key]
+                    break
+            if next_value is None:
+                audio = value.get('audio')
+                if isinstance(audio, dict):
+                    next_value = audio.get('text')
+            if next_value is None:
+                logger.debug("No user-facing response field in execution result: %r", value)
+                return ''
+            value = next_value
+            continue
+
+        if hasattr(value, 'response'):
+            value = value.response
+            continue
+        if hasattr(value, 'text'):
+            value = value.text
+            continue
+        if hasattr(value, 'choices'):
+            try:
+                return extract_text(value)
+            except Exception:
+                logger.debug("Could not extract model response text", exc_info=True)
+                return ''
+
+        logger.debug("Unsupported execution result type at mobile boundary: %r", value)
+        return ''
+
+
+def _build_mobile_tool_response(
+    message_type: str,
+    tool_name: str,
+    result: Any,
+    timestamp: datetime,
+    printed_output: str = '',
+) -> Dict[str, Any]:
+    """Build a mobile payload containing user-facing text and no execution metadata."""
+    response_text = _response_field_only(result) or "Tool executed (no output)"
+    audio = {'type': 'speech', 'rate': 1.0, 'interrupt': False}
+    if isinstance(result, dict) and isinstance(result.get('audio'), dict):
+        audio.update({
+            key: result['audio'][key]
+            for key in ('type', 'rate', 'interrupt')
+            if key in result['audio']
+        })
+    audio['text'] = response_text
+
+    if printed_output.strip():
+        logger.debug("[%s stdout]\n%s", tool_name, printed_output.strip())
+    logger.debug("[%s internal execution result] %r", tool_name, result)
+    return {
+        'type': message_type,
+        'tool_name': tool_name,
+        'status': 'success',
+        'result': response_text,
+        'audio': audio,
+        'timestamp': timestamp.isoformat(),
+    }
 
 
 def _log_final_tool_response(_tool_name: str, response_data: Dict[str, Any]) -> None:
     """Log only the exact text selected for speech by the mobile client."""
     audio = response_data.get('audio')
-    spoken = audio.get('text') if isinstance(audio, dict) and audio.get('text') else response_data.get('result', '')
+    spoken_value = audio.get('text') if isinstance(audio, dict) and audio.get('text') else response_data.get('result', '')
+    spoken = _response_field_only(spoken_value)
+    logger.debug("[%s mobile response payload] %r", _tool_name, response_data)
     logger.info("[FINAL SPOKEN RESPONSE]\n%s", spoken)
 
 
-async def run_streaming_tools(websocket, client_id: str, image, image_base64: str): 
+def _single_stage_tool_result(
+    tool_name: str, task: str, image, streaming: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
+):
+    """Return a direct default-model result when planning is disabled."""
+    config = load_global_execution_config()
+    if config['planner_enabled']:
+        return None
+    request_text = str(task or '').strip() or str(tool_name).replace('_', ' ')
+    logger.info("[Execution Policy] planner disabled -> single-stage execution")
+    call_metadata = dict(metadata or {})
+    call_metadata.update({'streaming': streaming, 'tool_name': tool_name})
+    return single_stage_llm_call(
+        task=request_text,
+        images=[image],
+        metadata=call_metadata,
+    )
+
+
+def _take_photo_tool_prompt(tool_name: str, task: str, tool_code: str) -> str:
+    """Read a generated TOOL_PROMPT without executing the tool; support old tools via task metadata."""
+    try:
+        tree = ast.parse(tool_code or '')
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == 'TOOL_PROMPT' for target in targets):
+                value = ast.literal_eval(node.value)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    except (SyntaxError, ValueError, TypeError):
+        logger.debug("Could not extract TOOL_PROMPT from %s", tool_name, exc_info=True)
+    return str(task or '').strip() or str(tool_name).replace('_', ' ')
+
+
+def _run_take_photo_single_vlm(tool_name: str, task: str, tool_code: str, image) -> str:
+    """Execute E1/P1 or E1/P2 with exactly one direct Gemini Flash Lite inference."""
+    prompt = _take_photo_tool_prompt(tool_name, task, tool_code)
+    logger.info(
+        "[Take Photo E1] planning_mode=%s model=Gemini Flash Lite model_id=%s total_model_calls=1 "
+        "runtime_planner_calls=0 router_calls=0 cascade_calls=0 evaluator_calls=0",
+        TAKE_PHOTO_PLANNING_MODE,
+        TAKE_PHOTO_BASELINE_MODEL,
+    )
+    return call_take_photo_baseline_vlm(image=image, prompt=prompt)
+
+
+def _streaming_embedding_similarity(
+    first: Optional[np.ndarray], second: Optional[np.ndarray]
+) -> Optional[float]:
+    if first is None or second is None:
+        return None
+    try:
+        similarity = float(np.dot(
+            _normalize_streaming_embedding(first),
+            _normalize_streaming_embedding(second),
+        ))
+    except Exception:
+        return None
+    return similarity if np.isfinite(similarity) else None
+
+
+def _cancel_streaming_debounce(tool_config: Dict[str, Any]) -> None:
+    debounce_task = tool_config.get('debounce_task')
+    if debounce_task is not None and not debounce_task.done():
+        debounce_task.cancel()
+
+
+def _start_streaming_debounce(
+    websocket,
+    client_id: str,
+    tool_config: Dict[str, Any],
+    state_id: int,
+    delay_seconds: Optional[float] = None,
+) -> None:
+    _cancel_streaming_debounce(tool_config)
+    if delay_seconds is None:
+        delay_seconds = float(tool_config.get(
+            'stability_debounce_seconds', STREAMING_STABILITY_DEBOUNCE_SECONDS
+        ))
+    tool_config['debounce_task'] = asyncio.create_task(
+        _streaming_debounce_worker(
+            websocket, client_id, tool_config, state_id, delay_seconds
+        )
+    )
+
+
+async def _streaming_debounce_worker(
+    websocket,
+    client_id: str,
+    tool_config: Dict[str, Any],
+    state_id: int,
+    delay_seconds: float,
+) -> None:
+    try:
+        await asyncio.sleep(delay_seconds)
+        state = tool_config.get('active_visual_state')
+        if state is None or state['state_id'] != state_id:
+            return
+        stable_ms = (
+            asyncio.get_running_loop().time() - state['started_at']
+        ) * 1000
+        logger.info(
+            "[Streaming] visual_state_stable state_id=%s sequence=%s stable_ms=%.1f "
+            "stability_threshold_ms=%.1f confirmation_count=%d "
+            "min_stable_confirmations=%d embedding_source=%s",
+            state['state_id'],
+            state['sequence'],
+            stable_ms,
+            float(tool_config.get(
+                'stability_debounce_seconds', STREAMING_STABILITY_DEBOUNCE_SECONDS
+            )) * 1000,
+            state.get('confirmation_count', 1),
+            int(tool_config.get(
+                'min_stable_confirmations', STREAMING_MIN_STABLE_CONFIRMATIONS
+            )),
+            tool_config['frame_selector_config']['implementation'],
+        )
+        await _try_send_visual_state(websocket, client_id, tool_config, state, 'active')
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if active_streaming_tools.get(client_id) is tool_config:
+            if tool_config.get('debounce_task') is asyncio.current_task():
+                tool_config['debounce_task'] = None
+
+
+async def _send_visual_state(
+    websocket,
+    client_id: str,
+    tool_config: Dict[str, Any],
+    state: Dict[str, Any],
+) -> None:
+    try:
+        tool_config['in_flight_state_embedding'] = state.get('embedding')
+        tool_config['in_flight_state_id'] = state.get('state_id')
+        logger.info(
+            "[Streaming] visual_state_sent state_id=%s sequence=%s age_ms=%.1f",
+            state['state_id'],
+            state['sequence'],
+            (asyncio.get_running_loop().time() - state['last_seen_at']) * 1000,
+        )
+        processed = await run_streaming_tools(
+            websocket, client_id, state['image'], state['image_base64']
+        )
+        if active_streaming_tools.get(client_id) is not tool_config:
+            return
+        if processed:
+            tool_config['last_sent_at'] = asyncio.get_running_loop().time()
+            tool_config['last_sent_sequence'] = state['sequence']
+            tool_config['last_sent_result'] = processed
+            tool_config['consecutive_skipped_frames'] = 0
+            if state.get('embedding') is not None:
+                tool_config['last_processed_embedding'] = state['embedding']
+                tool_config['last_processed_sequence'] = state['sequence']
+                tool_config['last_sent_embedding'] = state['embedding']
+        elif not processed:
+            logger.warning(
+                "[Streaming] cascade produced no response; similarity reference unchanged"
+            )
+    finally:
+        if active_streaming_tools.get(client_id) is tool_config:
+            if tool_config.get('cascade_task') is asyncio.current_task():
+                tool_config['cascade_task'] = None
+            tool_config['in_flight_state_embedding'] = None
+            tool_config['in_flight_state_id'] = None
+            await _try_send_deferred_visual_state_after_in_flight(
+                websocket, client_id, tool_config
+            )
+
+
+def _streaming_model_busy(tool_config: Dict[str, Any]) -> bool:
+    execution_lock = tool_config.setdefault('execution_lock', asyncio.Lock())
+    cascade_task = tool_config.get('cascade_task')
+    return execution_lock.locked() or (
+        cascade_task is not None and not cascade_task.done()
+    )
+
+
+def _optional_state(tool_config: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
+    state = tool_config.get(key)
+    return state if isinstance(state, dict) else None
+
+
+def _streaming_state_age_seconds(state: Dict[str, Any], now: float) -> float:
+    return now - state['last_seen_at']
+
+
+def _seconds_since_last_sent(tool_config: Dict[str, Any], now: float) -> Optional[float]:
+    last_sent_at = tool_config.get('last_sent_at')
+    if last_sent_at is None:
+        return None
+    return max(0.0, now - float(last_sent_at))
+
+
+def _log_visual_state_decision(
+    tool_config: Dict[str, Any],
+    state: Dict[str, Any],
+    decision: str,
+    source: str,
+    now: float,
+    similarity_to_last_sent: Optional[float],
+    similarity_to_in_flight: Optional[float],
+) -> None:
+    stable_for = now - state['started_at']
+    age = _streaming_state_age_seconds(state, now)
+    debounce_ms = float(tool_config.get(
+        'stability_debounce_seconds', STREAMING_STABILITY_DEBOUNCE_SECONDS
+    )) * 1000
+    seconds_since_last_sent = _seconds_since_last_sent(tool_config, now)
+    forced_interval_seconds = float(tool_config.get(
+        'forced_key_frame_interval_seconds', FORCED_KEY_FRAME_INTERVAL_SECONDS
+    ))
+    logger.info(
+        "[Streaming] decision=%s source=%s state_id=%s sequence=%s age_ms=%.1f "
+        "stable_ms=%.1f confirmation_count=%d min_stable_confirmations=%d "
+        "similarity_to_active_state=%s similarity_to_last_sent=%s "
+        "similarity_to_in_flight=%s stability_threshold=%.3f "
+        "max_similarity_to_last_sent=%.3f seconds_since_last_sent=%s "
+        "forced_interval_seconds=%.1f debounce_ms=%.1f debounce_zero=%s "
+        "model_busy=%s deferred_state_exists=%s final_decision_reason=%s",
+        decision,
+        source,
+        state.get('state_id'),
+        state.get('sequence'),
+        age * 1000,
+        stable_for * 1000,
+        int(state.get('confirmation_count', 1)),
+        int(tool_config.get(
+            'min_stable_confirmations', STREAMING_MIN_STABLE_CONFIRMATIONS
+        )),
+        "n/a" if state.get('similarity_to_active_state') is None else (
+            f"{state.get('similarity_to_active_state'):.3f}"
+        ),
+        "n/a" if similarity_to_last_sent is None else (
+            f"{similarity_to_last_sent:.3f}"
+        ),
+        "n/a" if similarity_to_in_flight is None else (
+            f"{similarity_to_in_flight:.3f}"
+        ),
+        tool_config['frame_selector_config']['similarity_threshold'],
+        float(tool_config['frame_selector_config'].get(
+            'max_similarity_to_last_sent',
+            tool_config['frame_selector_config']['similarity_threshold'],
+        )),
+        "n/a" if seconds_since_last_sent is None else f"{seconds_since_last_sent:.3f}",
+        forced_interval_seconds,
+        debounce_ms,
+        str(debounce_ms == 0).lower(),
+        str(_streaming_model_busy(tool_config)).lower(),
+        str(tool_config.get('deferred_visual_state') is not None).lower(),
+        decision,
+    )
+
+
+def _log_streaming_task_error(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exception = task.exception()
+    if exception is not None:
+        logger.error(
+            "Streaming tool task error",
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+
+
+async def _try_send_visual_state(
+    websocket,
+    client_id: str,
+    tool_config: Dict[str, Any],
+    state: Dict[str, Any],
+    source: str,
+) -> bool:
+    if active_streaming_tools.get(client_id) is not tool_config:
+        return False
+    if state is None:
+        return False
+
+    now = asyncio.get_running_loop().time()
+    max_age_seconds = float(tool_config.get(
+        'candidate_max_age_seconds', STREAMING_CANDIDATE_MAX_AGE_SECONDS
+    ))
+    age = _streaming_state_age_seconds(state, now)
+    stable_for = now - state['started_at']
+    debounce_seconds = float(tool_config.get(
+        'stability_debounce_seconds', STREAMING_STABILITY_DEBOUNCE_SECONDS
+    ))
+    confirmation_count = int(state.get('confirmation_count', 1))
+    min_confirmations = int(tool_config.get(
+        'min_stable_confirmations', STREAMING_MIN_STABLE_CONFIRMATIONS
+    ))
+    state_embedding = state.get('embedding')
+    last_sent_embedding = tool_config.get('last_sent_embedding')
+    in_flight_embedding = tool_config.get('in_flight_state_embedding')
+    difference_threshold = float(tool_config['frame_selector_config'].get(
+        'max_similarity_to_last_sent',
+        tool_config['frame_selector_config']['similarity_threshold'],
+    ))
+    last_sent_similarity = _streaming_embedding_similarity(state_embedding, last_sent_embedding)
+    in_flight_similarity = _streaming_embedding_similarity(state_embedding, in_flight_embedding)
+    seconds_since_last_sent = _seconds_since_last_sent(tool_config, now)
+    forced_interval_seconds = float(tool_config.get(
+        'forced_key_frame_interval_seconds', FORCED_KEY_FRAME_INTERVAL_SECONDS
+    ))
+    forced_interval_elapsed = bool(
+        seconds_since_last_sent is not None
+        and seconds_since_last_sent >= forced_interval_seconds
+    )
+    clip_gating_failed = bool(
+        state_embedding is None
+        or (
+            last_sent_embedding is not None
+            and last_sent_similarity is None
+        )
+    )
+    logger.info(
+        "[Streaming] key_frame_check source=%s state_id=%s sequence=%s age_ms=%.1f "
+        "stable_ms=%.1f confirmation_count=%d min_stable_confirmations=%d "
+        "similarity_to_active_state=%s similarity_to_last_sent=%s "
+        "similarity_to_in_flight=%s max_similarity_to_last_sent=%.3f "
+        "seconds_since_last_sent=%s forced_interval_seconds=%.1f debounce_ms=%.1f "
+        "debounce_zero=%s",
+        source, state['state_id'], state['sequence'], age * 1000,
+        stable_for * 1000, confirmation_count, min_confirmations,
+        "n/a" if state.get('similarity_to_active_state') is None else (
+            f"{state.get('similarity_to_active_state'):.3f}"
+        ),
+        "n/a" if last_sent_similarity is None else f"{last_sent_similarity:.3f}",
+        "n/a" if in_flight_similarity is None else f"{in_flight_similarity:.3f}",
+        difference_threshold,
+        "n/a" if seconds_since_last_sent is None else f"{seconds_since_last_sent:.3f}",
+        forced_interval_seconds,
+        debounce_seconds * 1000,
+        str(debounce_seconds == 0).lower(),
+    )
+    if state.get('sent'):
+        _log_visual_state_decision(
+            tool_config, state, 'visual_state_already_sent_skip', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        return False
+    if state_embedding is None:
+        logger.info("[Streaming] clip_gating_failed_open reason=embedding_unavailable")
+        _log_visual_state_decision(
+            tool_config, state, 'clip_gating_failed_open', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+    if age > max_age_seconds:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_stale', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        if tool_config.get('active_visual_state') is state:
+            tool_config['active_visual_state'] = None
+        if tool_config.get('deferred_visual_state') is state:
+            tool_config['deferred_visual_state'] = None
+        return
+    if stable_for < debounce_seconds:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_not_stable', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        if source == 'active':
+            debounce_task = tool_config.get('debounce_task')
+            if debounce_task is None or debounce_task.done():
+                _start_streaming_debounce(
+                    websocket,
+                    client_id,
+                    tool_config,
+                    state['state_id'],
+                    debounce_seconds - stable_for,
+                )
+        return False
+
+    if debounce_seconds > 0 and confirmation_count < min_confirmations:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_not_enough_confirmations', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        return False
+    if clip_gating_failed and state_embedding is not None:
+        logger.info("[Streaming] clip_gating_failed_open reason=invalid_similarity")
+        _log_visual_state_decision(
+            tool_config, state, 'clip_gating_failed_open', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+    elif forced_interval_elapsed:
+        _log_visual_state_decision(
+            tool_config, state, 'forced_key_frame_interval_elapsed', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+    elif last_sent_similarity is not None and last_sent_similarity >= difference_threshold:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_too_similar_to_last_sent', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        if tool_config.get('deferred_visual_state') is state:
+            tool_config['deferred_visual_state'] = None
+        else:
+            deferred_state = _optional_state(tool_config, 'deferred_visual_state')
+            if (
+                deferred_state is not None
+                and deferred_state.get('state_id') == state.get('state_id')
+            ):
+                tool_config['deferred_visual_state'] = None
+        if tool_config.get('active_visual_state') is state:
+            state['sent'] = True
+        return False
+
+    if _streaming_model_busy(tool_config):
+        _store_deferred_visual_state(tool_config, state, now)
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_model_busy', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        return False
+
+    # Re-run final gates immediately before dispatch.
+    now = asyncio.get_running_loop().time()
+    if _streaming_model_busy(tool_config):
+        _store_deferred_visual_state(tool_config, state, now)
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_model_busy', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        return False
+    if _streaming_state_age_seconds(state, now) > max_age_seconds:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_stale', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        return False
+    if now - state['started_at'] < debounce_seconds:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_not_stable', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        return False
+    if debounce_seconds > 0 and int(state.get('confirmation_count', 1)) < min_confirmations:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_not_enough_confirmations', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        return False
+    last_sent_similarity = _streaming_embedding_similarity(
+        state.get('embedding'), tool_config.get('last_sent_embedding')
+    )
+    in_flight_similarity = _streaming_embedding_similarity(
+        state.get('embedding'), tool_config.get('in_flight_state_embedding')
+    )
+    seconds_since_last_sent = _seconds_since_last_sent(tool_config, now)
+    forced_interval_elapsed = bool(
+        seconds_since_last_sent is not None
+        and seconds_since_last_sent >= forced_interval_seconds
+    )
+    clip_gating_failed = bool(
+        state.get('embedding') is None
+        or (
+            tool_config.get('last_sent_embedding') is not None
+            and last_sent_similarity is None
+        )
+    )
+    if clip_gating_failed:
+        logger.info("[Streaming] clip_gating_failed_open reason=final_gate")
+        _log_visual_state_decision(
+            tool_config, state, 'clip_gating_failed_open', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+    elif forced_interval_elapsed:
+        _log_visual_state_decision(
+            tool_config, state, 'forced_key_frame_interval_elapsed', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+    elif last_sent_similarity is not None and last_sent_similarity >= difference_threshold:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_too_similar_to_last_sent', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        deferred_state = _optional_state(tool_config, 'deferred_visual_state')
+        if (
+            deferred_state is not None
+            and deferred_state.get('state_id') == state.get('state_id')
+        ):
+            tool_config['deferred_visual_state'] = None
+        if tool_config.get('active_visual_state') is state:
+            state['sent'] = True
+        return False
+
+    state['sent'] = True
+    if tool_config.get('deferred_visual_state') is state:
+        tool_config['deferred_visual_state'] = None
+    if source == 'deferred':
+        logger.info(
+            "[Streaming] deferred_state_sent_after_in_flight_finished "
+            "state_id=%s sequence=%s",
+            state['state_id'],
+            state['sequence'],
+        )
+    _log_visual_state_decision(
+        tool_config, state, 'sent_key_frame', source,
+        now, last_sent_similarity, in_flight_similarity,
+    )
+    task = asyncio.create_task(
+        _send_visual_state(websocket, client_id, tool_config, state)
+    )
+    tool_config['cascade_task'] = task
+    return True
+
+
+def _clone_visual_state_for_deferred(state: Dict[str, Any]) -> Dict[str, Any]:
+    clone = dict(state)
+    clone['sent'] = False
+    return clone
+
+
+def _store_deferred_visual_state(
+    tool_config: Dict[str, Any],
+    state: Dict[str, Any],
+    now: float,
+) -> None:
+    current = _optional_state(tool_config, 'deferred_visual_state')
+    if current is not None and current.get('state_id') == state.get('state_id'):
+        current.update({
+            'sequence': state['sequence'],
+            'image': state['image'],
+            'image_base64': state['image_base64'],
+            'embedding': state['embedding'],
+            'last_seen_at': state['last_seen_at'],
+            'confirmation_count': state.get('confirmation_count', 1),
+            'similarity_to_active_state': state.get('similarity_to_active_state'),
+        })
+        logger.info(
+            "[Streaming] deferred_state_updated_same_state state_id=%s sequence=%s "
+            "stable_ms=%.1f confirmation_count=%d",
+            current['state_id'],
+            current['sequence'],
+            (now - current['started_at']) * 1000,
+            int(current.get('confirmation_count', 1)),
+        )
+        return
+    deferred = _clone_visual_state_for_deferred(state)
+    tool_config['deferred_visual_state'] = deferred
+    event = (
+        'deferred_state_replaced_by_newer_stable_state'
+        if current is not None else 'deferred_state_created_while_busy'
+    )
+    logger.info(
+        "[Streaming] %s state_id=%s sequence=%s previous_state_id=%s "
+        "stable_ms=%.1f confirmation_count=%d",
+        event,
+        deferred['state_id'],
+        deferred['sequence'],
+        current.get('state_id') if current is not None else 'none',
+        (now - deferred['started_at']) * 1000,
+        int(deferred.get('confirmation_count', 1)),
+    )
+
+
+async def _try_send_deferred_visual_state_after_in_flight(
+    websocket,
+    client_id: str,
+    tool_config: Dict[str, Any],
+) -> None:
+    deferred = _optional_state(tool_config, 'deferred_visual_state')
+    if deferred is None:
+        return
+    active_state = _optional_state(tool_config, 'active_visual_state')
+    if (
+        active_state is not None
+        and active_state.get('state_id') != deferred.get('state_id')
+    ):
+        tool_config['deferred_visual_state'] = None
+        logger.info(
+            "[Streaming] deferred_state_dropped_after_in_flight_finished "
+            "state_id=%s sequence=%s reason=replaced_by_current_active_state "
+            "active_state_id=%s active_sequence=%s",
+            deferred.get('state_id'),
+            deferred.get('sequence'),
+            active_state.get('state_id'),
+            active_state.get('sequence'),
+        )
+        return
+    sent = await _try_send_visual_state(
+        websocket, client_id, tool_config, deferred, 'deferred'
+    )
+    if not sent and _optional_state(tool_config, 'deferred_visual_state') is not deferred:
+        logger.info(
+            "[Streaming] deferred_state_dropped_after_in_flight_finished "
+            "state_id=%s sequence=%s",
+            deferred.get('state_id'),
+            deferred.get('sequence'),
+        )
+
+
+async def _encode_streaming_candidate(tool_config: Dict[str, Any], frame):
+    """Compute CLIP immediately and return a latest-frame candidate."""
+    sequence, image, image_base64 = frame
+    selector_config = tool_config.get('frame_selector_config')
+    if selector_config is None:
+        selector_config = load_streaming_frame_selector_config()
+        tool_config['frame_selector_config'] = selector_config
+    try:
+        embedding = await asyncio.to_thread(
+            encode_streaming_frame, image_base64, selector_config
+        )
+        embedding = _normalize_streaming_embedding(embedding)
+        logger.info(
+            "[Streaming] embedding_ready sequence=%s gating_enabled=true "
+            "embedding_source=%s dimensions=%d",
+            sequence, selector_config['implementation'], embedding.size,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Streaming] embedding_ready sequence=%s gating_enabled=true "
+            "embedding_source=%s success=false error=%s",
+            sequence, selector_config['implementation'], exc,
+        )
+        embedding = None
+
+    if sequence <= tool_config.get('latest_selector_sequence', 0):
+        return None
+    tool_config['latest_selector_sequence'] = sequence
+    return {
+        'sequence': sequence,
+        'image': image,
+        'image_base64': image_base64,
+        'embedding': embedding,
+        'received_at': asyncio.get_running_loop().time(),
+    }
+
+
+async def schedule_streaming_frame(websocket, client_id: str, image, image_base64: str) -> None:
+    """Run conservative CLIP duplicate gating before dispatching a streaming frame."""
+    tool_config = active_streaming_tools.get(client_id)
+    if not tool_config or tool_config.get('gemini_live'):
+        return
+
+    sequence = tool_config.get('frame_sequence', 0) + 1
+    tool_config['frame_sequence'] = sequence
+    frame = await _encode_streaming_candidate(
+        tool_config, (sequence, image, image_base64)
+    )
+    if active_streaming_tools.get(client_id) is not tool_config or frame is None:
+        return
+
+    now = frame.get('received_at') or asyncio.get_running_loop().time()
+    state_id = tool_config.get('visual_state_id', 0) + 1
+    tool_config['visual_state_id'] = state_id
+    state = {
+        'state_id': state_id,
+        'sequence': sequence,
+        'image': frame['image'],
+        'image_base64': frame['image_base64'],
+        'embedding': frame.get('embedding'),
+        'started_at': now,
+        'last_seen_at': now,
+        'confirmation_count': 1,
+        'sent': False,
+        'similarity_to_active_state': None,
+    }
+    tool_config['active_visual_state'] = state
+    logger.info(
+        "[Streaming] visual_state_created state_id=%s sequence=%s "
+        "debounce_ms=%.1f similarity_enabled=true embedding_available=%s",
+        state_id,
+        sequence,
+        float(tool_config.get(
+            'stability_debounce_seconds', STREAMING_STABILITY_DEBOUNCE_SECONDS
+        )) * 1000,
+        str(state.get('embedding') is not None).lower(),
+    )
+    debounce_seconds = float(tool_config.get(
+        'stability_debounce_seconds', STREAMING_STABILITY_DEBOUNCE_SECONDS
+    ))
+    if debounce_seconds <= 0:
+        _cancel_streaming_debounce(tool_config)
+        await _try_send_visual_state(websocket, client_id, tool_config, state, 'active')
+        return
+    _start_streaming_debounce(websocket, client_id, tool_config, state_id)
+
+
+async def run_streaming_tools(websocket, client_id: str, image, image_base64: str):
+    """Execute at most one streaming tool body per client at a time."""
+    tool_config = active_streaming_tools.get(client_id)
+    if not tool_config:
+        logger.warning("[Streaming] no active tool for client=%s", client_id)
+        return False
+    execution_lock = tool_config.setdefault('execution_lock', asyncio.Lock())
+    if execution_lock.locked():
+        logger.info("[Streaming] skipped frame (already running) client=%s", client_id)
+        return False
+
+    execution_id = tool_config.get('execution_sequence', 0) + 1
+    tool_config['execution_sequence'] = execution_id
+    async with execution_lock:
+        logger.info("[Streaming] execution started client=%s execution=%s", client_id, execution_id)
+        context_token = STREAMING_EXECUTION_CONTEXT.set(True)
+        try:
+            logger.info("[Streaming] routing started client=%s execution=%s", client_id, execution_id)
+            logger.info(
+                "[Streaming] planner selected pre-generated tool stages client=%s execution=%s",
+                client_id,
+                execution_id,
+            )
+            tool_config['current_execution_id'] = execution_id
+            return bool(await _execute_streaming_tools_unlocked(
+                websocket, client_id, image, image_base64
+            ))
+        finally:
+            STREAMING_EXECUTION_CONTEXT.reset(context_token)
+            tool_config.pop('current_execution_id', None)
+            tool_config['last_execution_completed_at'] = asyncio.get_running_loop().time()
+            logger.info("[Streaming] execution finished client=%s execution=%s", client_id, execution_id)
+
+
+async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, image_base64: str):
     """
     Run all active streaming tools for this client on the current frame.
-    Respects throttle settings to avoid overwhelming the client.
+    Called only by the key-frame scheduler's single-flight worker.
     """
     global active_streaming_tools
     
@@ -565,30 +2230,23 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
     
     if client_id not in active_streaming_tools:
         logger.warning(f"Client {client_id} not in active_streaming_tools")
-        return
+        return False
     
     tool_config = active_streaming_tools[client_id]
+    # Snapshot generation at dispatch time so we can discard results that
+    # arrive after a stop/restart replaced the tool config.
+    dispatched_generation = tool_config.get('generation', 0)
     now = datetime.now()
-    
+
     # Gemini Live tools handle their own query loop — don't exec code here
     if tool_config.get('gemini_live'):
-        return
+        return False
     
     # Check if tool is installing modules (skip execution during installation)
     if tool_config.get('installing_module'):
-        return  # Skip this frame, module installation in progress
+        return False  # Skip this frame, module installation in progress
     
-    # Check if enough time has passed since last run (throttling)
-    last_run = tool_config.get('last_run')
-    throttle_ms = tool_config.get('throttle_ms', 500)  # Reduce to 500ms for better responsiveness
-    
-    if last_run:
-        elapsed_ms = (now - last_run).total_seconds() * 1000
-        if elapsed_ms < throttle_ms:
-            logger.debug(f"Throttling {tool_name} for {client_id} - only {elapsed_ms:.0f}ms since last run")
-            return  # Skip this frame, too soon
-    
-    # Update last run time
+    # Record execution time for observability; admission is owned by the key-frame selector.
     tool_config['last_run'] = now
     
     # Get tool info
@@ -629,7 +2287,6 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
             'exec_globals_base': {
                 '__builtins__': __builtins__,
                 '__file__': str(Path(__file__).parent.parent / 'tools' / 'dynamic_tool.py'),
-                'copilot_llm_call': tool_copilot_llm_call,
                 'yolo_model_cache': yolo_model_cache,
                 **common_modules
             }
@@ -638,10 +2295,65 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
     # Get cached environment
     exec_env = tool_config['exec_env']
     parsed_input = exec_env['parsed_input']  # Make it available as local variable
+
+    def streaming_cancelled() -> bool:
+        current = active_streaming_tools.get(client_id)
+        return current is not tool_config or current.get('generation', 0) != dispatched_generation
+
+    encoded_payload = (image_base64 or '').split(',', 1)[-1]
+    encoded_length = len(encoded_payload)
+    original_payload_bytes = max(0, (encoded_length * 3) // 4 - encoded_payload.count('='))
+
+    def streaming_copilot_llm_call(*args, **kwargs):
+        metadata = dict(kwargs.get('metadata') or {})
+        metadata['streaming'] = True
+        metadata.setdefault('tool_name', tool_name)
+        metadata['streaming_execution_id'] = tool_config.get('current_execution_id')
+        metadata['streaming_original_payload_bytes'] = original_payload_bytes
+        metadata['streaming_original_image'] = image_base64
+        metadata['_streaming_cancelled'] = streaming_cancelled
+        kwargs['metadata'] = metadata
+        if not kwargs.get('images'):
+            kwargs['images'] = [image]
+        return tool_copilot_llm_call(*args, **kwargs)
+
+    exec_env['exec_globals_base']['copilot_llm_call'] = streaming_copilot_llm_call
+
+    try:
+        single_stage_result = await asyncio.to_thread(
+            _single_stage_tool_result,
+            tool_name,
+            tool.get('task', ''),
+            image,
+            True,
+            {
+                'streaming_execution_id': tool_config.get('current_execution_id'),
+                'tool_name': tool_name,
+                'streaming_original_payload_bytes': original_payload_bytes,
+                'streaming_original_image': image_base64,
+                '_streaming_cancelled': streaming_cancelled,
+            },
+        )
+    except StreamingExecutionCancelled:
+        logger.info("[Streaming] single-stage execution cancelled client=%s", client_id)
+        return False
+    if single_stage_result is not None:
+        if streaming_cancelled():
+            logger.info("[Streaming] result discarded after stop client=%s", client_id)
+            return False
+        response_data = _build_mobile_tool_response(
+            'tool_stream_result', tool_name, single_stage_result, now
+        )
+        execution_id = tool_config.get('current_execution_id')
+        response_data['execution_id'] = execution_id
+        _log_final_tool_response(tool_name, response_data)
+        await websocket.send(json.dumps(response_data))
+        return True
     
     # Execute the tool (Python only for now)
     if tool_language == 'python' and tool_code:
         logger.info(f"Starting execution of streaming tool {tool_name} for {client_id}")
+        image_context_token = None
         try:
             # Use cached environment with frame-specific data
             exec_globals = {
@@ -657,54 +2369,88 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
             stdout_capture.seek(0)
             stdout_capture.truncate(0)
             
-            # Capture stdout to get print() output
+            # Run exec + function call in a thread so blocking LLM/CV calls
+            # inside the tool don't stall the event loop (which would cause
+            # the aiohttp heartbeat to miss and the app to declare disconnect).
             import sys
-            old_stdout = sys.stdout
-            
-            # Retry loop for automatic module installation
+            import inspect
+            import io as _io
+
+            def _run_tool_in_thread():
+                _capture = _io.StringIO()
+                _old = sys.stdout
+                sys.stdout = _capture
+                try:
+                    exec(tool_code, exec_globals, exec_locals)
+                finally:
+                    sys.stdout = _old
+
+                exec_globals.update(exec_locals)
+
+                _result = None
+                if 'main' in exec_locals and callable(exec_locals['main']):
+                    sig = inspect.signature(exec_locals['main'])
+                    if len(sig.parameters) == 2:
+                        _result = exec_locals['main'](image, parsed_input)
+                    else:
+                        logger.warning(f"main() has {len(sig.parameters)} params, expected 2")
+                elif 'run' in exec_locals and callable(exec_locals['run']):
+                    sig = inspect.signature(exec_locals['run'])
+                    if len(sig.parameters) == 2:
+                        _result = exec_locals['run'](image, parsed_input)
+                    else:
+                        logger.warning(f"run() has {len(sig.parameters)} params, expected 2")
+                elif 'process_image' in exec_locals and callable(exec_locals['process_image']):
+                    sig = inspect.signature(exec_locals['process_image'])
+                    if len(sig.parameters) == 2:
+                        _result = exec_locals['process_image'](image, parsed_input)
+                    else:
+                        logger.info(f"Skipping process_image() - has {len(sig.parameters)} params (likely a helper function)")
+                elif 'process_frame_for_text' in exec_locals and callable(exec_locals['process_frame_for_text']):
+                    if 'initialize_verbalizer' in exec_locals and 'get_verbalizer' in exec_locals:
+                        verbalizer = exec_locals['get_verbalizer']()
+                        if not verbalizer and GEMINI_API_KEY:
+                            exec_locals['initialize_verbalizer'](GEMINI_API_KEY)
+                    _result = exec_locals['process_frame_for_text'](image_base64)
+                elif 'result' in exec_locals:
+                    _result = exec_locals['result']
+                else:
+                    available_funcs = [n for n, o in exec_locals.items() if callable(o) and not n.startswith('_')]
+                    available_classes = [n for n, o in exec_locals.items() if isinstance(o, type) and not n.startswith('_')]
+                    if available_funcs or available_classes:
+                        _result = f"Tool loaded successfully.\n\nAvailable functions: {', '.join(available_funcs) if available_funcs else 'none'}\nAvailable classes: {', '.join(available_classes) if available_classes else 'none'}\n\nNote: This tool is a library. To use it, you may need to call one of these functions."
+
+                return _capture.getvalue(), _result
+
             retry_count = 0
             max_retries = 3
-            
+            image_context_token = TOOL_EXECUTION_IMAGES.set([image])
+            printed_output = ''
+            result = None
+
             while retry_count < max_retries:
                 try:
                     logger.info(f"Executing {tool_name} code for {client_id}, attempt {retry_count + 1}")
-                    # Redirect stdout to capture print statements
-                    sys.stdout = stdout_capture
-                    try:
-                        # Execute tool code
-                        logger.info(f"About to exec() tool code for {client_id}")
-                        exec(tool_code, exec_globals, exec_locals)
-                        logger.info(f"Successfully exec()d tool code for {client_id}")
-                    finally:
-                        sys.stdout = old_stdout
-                    break  # Success, exit retry loop
+                    printed_output, result = await asyncio.to_thread(_run_tool_in_thread)
+                    logger.info(f"Tool {tool_name} completed for {client_id}: {type(result)}")
+                    break
                 except (ImportError, ModuleNotFoundError) as e:
-                    sys.stdout = old_stdout  # Restore stdout for logging
                     error_msg = str(e)
                     logger.warning(f"Module error in streaming {tool_name}: {error_msg}")
-                    
-                    # PAUSE STREAMING: Mark as installing
+
                     tool_config['installing_module'] = True
-                    
-                    # Notify client that streaming is paused for installation
                     await websocket.send(json.dumps({
                         'type': 'module_installing',
                         'tool_name': tool_name,
                         'message': f"Pausing streaming to install required module...",
                         'timestamp': datetime.now().isoformat()
                     }))
-                    
-                    # Install the module synchronously (just like one-shot mode)
-                    # This will block, but streaming is already paused
-                    installed_module = module_mgr.install_from_error(error_msg)
-                    
-                    # RESUME STREAMING: Clear installing flag
+
+                    installed_module = await asyncio.to_thread(module_mgr.install_from_error, error_msg)
                     tool_config['installing_module'] = False
-                    
+
                     if installed_module:
                         logger.info(f"Installed {installed_module}, resuming streaming execution...")
-                        
-                        # Notify client that streaming is resuming
                         await websocket.send(json.dumps({
                             'type': 'module_installed',
                             'tool_name': tool_name,
@@ -712,13 +2458,10 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
                             'message': f"Successfully installed {installed_module}. Resuming streaming...",
                             'timestamp': datetime.now().isoformat()
                         }))
-                        
-                        # Reload common modules to include newly installed one
                         common_modules = module_mgr.get_common_modules()
                         exec_globals.update(common_modules)
                         retry_count += 1
                     else:
-                        # Could not identify/install module
                         await websocket.send(json.dumps({
                             'type': 'module_install_failed',
                             'tool_name': tool_name,
@@ -728,8 +2471,6 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
                         }))
                         raise
                 except Exception:
-                    # Non-module errors should be raised immediately
-                    sys.stdout = old_stdout  # Restore stdout before raising
                     raise
             
             # Get captured print output
@@ -751,7 +2492,7 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
                     logger.info(f"Calling main() function for {tool_name} on {client_id}")
                     sig = inspect.signature(exec_locals['main'])
                     if len(sig.parameters) == 2:  # Should take (image, input_data)
-                        result = exec_locals['main'](image, parsed_input)
+                        result = await asyncio.to_thread(exec_locals['main'], image, parsed_input)
                         logger.info(f"main() returned result for {tool_name}: {type(result)}")
                     else:
                         logger.warning(f"main() has {len(sig.parameters)} params, expected 2")
@@ -763,7 +2504,7 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
                 try:
                     sig = inspect.signature(exec_locals['run'])
                     if len(sig.parameters) == 2:
-                        result = exec_locals['run'](image, parsed_input)
+                        result = await asyncio.to_thread(exec_locals['run'], image, parsed_input)
                     else:
                         logger.warning(f"run() has {len(sig.parameters)} params, expected 2")
                 except Exception as e:
@@ -775,7 +2516,7 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
                     sig = inspect.signature(exec_locals['process_image'])
                     # Only call if it takes 2 params (entry point), not 1 (helper function)
                     if len(sig.parameters) == 2:
-                        result = exec_locals['process_image'](image, parsed_input)
+                        result = await asyncio.to_thread(exec_locals['process_image'], image, parsed_input)
                     else:
                         logger.info(f"Skipping process_image() - has {len(sig.parameters)} params (likely a helper function)")
                 except Exception as e:
@@ -789,7 +2530,9 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
                         verbalizer = exec_locals['get_verbalizer']()
                         if not verbalizer and GEMINI_API_KEY:
                             exec_locals['initialize_verbalizer'](GEMINI_API_KEY)
-                    result = exec_locals['process_frame_for_text'](image_base64)
+                    result = await asyncio.to_thread(
+                        exec_locals['process_frame_for_text'], image_base64
+                    )
                 except Exception as e:
                     logger.error(f"Error calling process_frame_for_text(): {e}")
             
@@ -807,64 +2550,47 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
                     result = f"Tool loaded successfully.\n\nAvailable functions: {', '.join(available_funcs) if available_funcs else 'none'}\nAvailable classes: {', '.join(available_classes) if available_classes else 'none'}\n\nNote: This tool is a library. To use it, you may need to call one of these functions."
                 else:
                     result = None
+            TOOL_EXECUTION_IMAGES.reset(image_context_token)
+            image_context_token = None
             
-            # Combine printed output with result
-            result = _response_field_only(result)
-            # Check if result is advanced format with audio config
-            if isinstance(result, dict) and ('audio' in result or 'text' in result):
-                # Preserve audio configuration
-                response_data = {
-                    'type': 'tool_stream_result',
-                    'tool_name': tool_name,
-                    'status': 'success',
-                    'result': result.get('text', ''),
-                    'timestamp': now.isoformat()
-                }
-                
-                # Add audio configuration if provided
-                if 'audio' in result:
-                    response_data['audio'] = result['audio']
-                
-                # Prepend printed output if any
-                if printed_output.strip():
-                    response_data['result'] = printed_output.strip() + '\n' + response_data['result']
-                    if 'audio' in response_data and 'text' in response_data['audio']:
-                        response_data['audio']['text'] = printed_output.strip() + '. ' + response_data['audio']['text']
-                
-                _log_final_tool_response(tool_name, response_data)
-                await websocket.send(json.dumps(response_data))
-                logger.info(f"Sent tool_stream_result to {client_id} for {tool_name}")
-            else:
-                # Simple string format - add default audio
-                output_parts = []
-                if printed_output.strip():
-                    output_parts.append(printed_output.strip())
-                if result is not None:
-                    output_parts.append(str(result))
-                
-                final_result = '\n'.join(output_parts) if output_parts else "Tool executed (no output)"
-                
-                # Send result back to client
-                response_data = {
-                    'type': 'tool_stream_result',
-                    'tool_name': tool_name,
-                    'status': 'success',
-                    'result': final_result,
-                    'audio': {
-                        'type': 'speech',
-                        'text': final_result,
-                        'rate': 1.0,
-                        'interrupt': False
-                    },
-                    'timestamp': now.isoformat()
-                }
-                _log_final_tool_response(tool_name, response_data)
-                await websocket.send(json.dumps(response_data))
+            response_data = _build_mobile_tool_response(
+                'tool_stream_result', tool_name, result, now, printed_output
+            )
+            if streaming_cancelled():
+                logger.info("[Streaming] result discarded after stop client=%s", client_id)
+                return False
+            execution_id = tool_config.get('current_execution_id')
+            response_data['execution_id'] = execution_id
+            _log_final_tool_response(tool_name, response_data)
+            logger.info(
+                "[Streaming] final response generated client=%s execution=%s text=%r",
+                client_id,
+                execution_id,
+                response_data['result'],
+            )
+            await websocket.send(json.dumps(response_data))
+            logger.info(
+                "[Streaming] websocket result sent client=%s execution=%s type=tool_stream_result tool=%s",
+                client_id,
+                execution_id,
+                tool_name,
+            )
+            return True
             
+        except StreamingExecutionCancelled:
+            if image_context_token is not None:
+                TOOL_EXECUTION_IMAGES.reset(image_context_token)
+            logger.info("[Streaming] cascade execution cancelled client=%s", client_id)
+            return False
         except Exception as e:
+            if image_context_token is not None:
+                TOOL_EXECUTION_IMAGES.reset(image_context_token)
             logger.error(f"Error in streaming tool {tool_name}: {e}")
             # Don't send errors for streaming (would be too noisy)
             # Just log them for debugging
+            return False
+
+    return False
 
 
 # =============================================================================
@@ -3143,7 +4869,7 @@ def should_mention_copilot(text: str) -> bool:
         if keyword in text_lower:
             return True
     
-    # Default to mentioning copilot if unsure (better to over-mention than under-mention)
+    # Default: always mention @copilot so it stays aware of issue updates.
     return True
 
 
@@ -3210,32 +4936,9 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 'pr_number': pr_number,
                 'pr_url': pr_url
             }
-            await broadcast_to_connected_clients(success_data)
-            
-            # If we mentioned @copilot, start polling for the Copilot session
-            if mention_copilot and connected_clients:
-                # Get the first connected client's websocket and derive its ID
-                for ws in connected_clients:
-                    try:
-                        ws_client_id = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
-                        
-                        if pr_number:
-                            # If there's already a PR, poll that specific PR for a session
-                            logger.info(f"@copilot mentioned on PR #{pr_number}, starting direct session polling")
-                            asyncio.create_task(
-                                poll_for_copilot_session_on_pr(pr_number, ws, ws_client_id)
-                            )
-                            logger.info(f"Started Copilot session polling for PR #{pr_number}")
-                        else:
-                            # If there's no PR yet, wait for Copilot to create one
-                            logger.info(f"@copilot mentioned on issue #{issue_number}, waiting for PR creation")
-                            asyncio.create_task(
-                                poll_for_copilot_session(issue_number, ws, ws_client_id)
-                            )
-                            logger.info(f"Started Copilot session polling for issue #{issue_number}")
-                        break  # Only start one polling task
-                    except Exception as e:
-                        logger.error(f"Error starting Copilot poll for @copilot comment: {e}")
+            await _broadcast_ws(success_data)
+            # @copilot was mentioned in the comment — no automatic log streaming.
+            # Copilot session logs are only streamed when the user explicitly requests them.
         
     except Exception as e:
         import traceback
@@ -3267,51 +4970,69 @@ Fields previously missing: {existing_data.get('missing_fields', [])}
 Merge the new transcript into those issue fields.
 """
 
-    return f"""Parse the following voice transcript and extract information for a visual assistive technology (AT) tool request.
+    fused_field = ""
+    if globals().get('TAKE_PHOTO_PLANNING_MODE', 'no_planner') == 'fused_prompt':
+        fused_field = "- fused_vlm_prompt: one self-contained runtime VLM prompt preserving every explicit user constraint"
+
+    return f"""Parse the following voice transcript for a visual assistive technology tool request.
 
 CRITICAL: Do not make up, infer, or extrapolate content that was not explicitly provided. Leave unmentioned fields empty.
 
-Extract only these issue fields:
-- title: concise summary, maximum 100 characters
-- description: description of the desired visual assistive technology
-- problem: problem it solves
-- solution: proposed solution
-- implementation_details: requested implementation details
-- example_usage: concrete example and expected behavior
-- alternatives: alternatives considered
-- live_mode: exactly "yes", "no", or empty when not explicitly stated
-- live_query: repeated live-mode query, otherwise empty
-- additional: other context
+Extract only these user-facing fields:
+- title: tool name, maximum 100 characters
+- description: the task the tool performs
+- example_usage: expected output
+- additional: constraints and examples
+- execution_mode: exactly "take-photo", "streaming", or empty when unstated
 - missing_fields: only missing important fields
+{fused_field}
 
 Only block creation when the core task is genuinely unclear.
-- Core context: problem or description.
-- Core goal: example_usage or another clear task goal in solution/description.
-- Derive a concise title, description, and solution from an explicit problem or example when possible without inventing new requirements.
-- implementation_details, alternatives, and additional are optional.
-- live_mode is optional when not explicitly stated.
-- If live_mode is "yes" and live_query is empty, include "live_query" in missing_fields.
-- If live_mode is "no", live_query is optional and must not be included in missing_fields.
-- Do not return stages; task decomposition is handled separately.
+- Tool name, task, and expected output are the core fields.
+- Constraints/examples and execution_mode may be empty when unstated.
+- Do not return any planning fields.
 
 Return ONLY this JSON object:
 {{
   "type": "visual AT",
   "title": "...",
   "description": "...",
-  "problem": "...",
-  "solution": "...",
-  "implementation_details": "...",
   "example_usage": "...",
-  "alternatives": "...",
-  "live_mode": "...",
-  "live_query": "...",
   "additional": "...",
+  "execution_mode": "...",
+  {('"fused_vlm_prompt": "...",' if fused_field else '')}
   "missing_fields": []
 }}
 {context_info}
 Transcript: {transcript}
 """
+
+
+def _is_explicit_streaming_request(transcript: str) -> bool:
+    text = str(transcript or '').lower()
+    return any(marker in text for marker in ('streaming', 'stream continuously', 'live mode'))
+
+
+def _parse_no_planner_request(transcript: str, existing_data: Optional[dict] = None) -> dict:
+    """Persist an E1/P1 request verbatim without invoking an LLM."""
+    existing_prompts = list((existing_data or {}).get('original_prompts') or [])
+    prompt_parts = [entry.split('] ', 1)[-1] for entry in existing_prompts]
+    prompt_parts.append(str(transcript or '').strip())
+    raw_prompt = '\n'.join(part for part in prompt_parts if part).strip()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return {
+        'type': 'visual AT',
+        'title': raw_prompt[:100],
+        'description': raw_prompt,
+        'example_usage': raw_prompt,
+        'additional': '',
+        'execution_mode': 'take-photo',
+        'custom_gpt': 'no',
+        'gpt_query': '',
+        'missing_fields': [] if raw_prompt else ['description', 'example_usage'],
+        'runtime_prompt': raw_prompt,
+        'original_prompts': existing_prompts + [f"[{timestamp}] {transcript}"],
+    }
 
 
 def _stage_decomposition_input(transcript: str, existing_data: Optional[dict] = None) -> str:
@@ -3335,7 +5056,9 @@ def _normalize_issue_creation_requirements(
 ) -> Dict[str, Any]:
     normalized = dict(parsed_data)
     explicit_custom_gpt = _explicit_custom_gpt_value(transcript)
-    parsed_custom_gpt = _normalize_custom_gpt_value(
+    execution_mode = str(normalized.get('execution_mode') or '').strip().lower()
+    mode_custom_gpt = 'yes' if execution_mode == 'streaming' else ('no' if execution_mode == 'take-photo' else '')
+    parsed_custom_gpt = mode_custom_gpt or _normalize_custom_gpt_value(
         normalized.get('custom_gpt') or normalized.get('live_mode')
     )
     custom_gpt = explicit_custom_gpt or parsed_custom_gpt
@@ -3344,13 +5067,8 @@ def _normalize_issue_creation_requirements(
     normalized['custom_gpt'] = custom_gpt
     normalized['gpt_query'] = '' if custom_gpt == 'no' else gpt_query
 
-    has_context = bool(str(normalized.get('problem') or normalized.get('description') or '').strip())
-    has_goal = bool(str(
-        normalized.get('example_usage')
-        or normalized.get('solution')
-        or normalized.get('description')
-        or ''
-    ).strip())
+    has_context = bool(str(normalized.get('description') or '').strip())
+    has_goal = bool(str(normalized.get('example_usage') or '').strip())
 
     missing_fields = []
     if not has_context:
@@ -3374,16 +5092,11 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
     Returns:
         Dictionary with parsed fields including 'missing_fields' list
     """
-    try:
-        try:
-            capability_names = sorted(load_capability_profiles())
-        except Exception:
-            capability_names = [
-                'general_reasoning', 'ocr', 'object_detection_localization',
-                'structured_visual_understanding', 'spatial_reasoning',
-                'navigation', 'camera_motion', 'temporal_reasoning',
-            ]
+    if TAKE_PHOTO_PLANNING_MODE == 'no_planner' and not _is_explicit_streaming_request(transcript):
+        logger.info("Take-photo planning_mode=no_planner; persisting raw request without parser or planner")
+        return _parse_no_planner_request(transcript, existing_data)
 
+    try:
         issue_prompt = _build_issue_extraction_prompt(transcript, existing_data)
         issue_response = system_llm_call(
             messages=[{'role': 'user', 'content': issue_prompt}],
@@ -3395,6 +5108,36 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
             "Issue extraction output=%s",
             json.dumps(issue_data, ensure_ascii=False),
         )
+
+        execution_mode = str(issue_data.get('execution_mode') or '').strip().lower()
+        if TAKE_PHOTO_PLANNING_MODE == 'fused_prompt' and execution_mode != 'streaming':
+            parsed_data = _normalize_issue_creation_requirements(issue_data, transcript)
+            parsed_data['stages'] = []
+            parsed_data['runtime_prompt'] = str(parsed_data.pop('fused_vlm_prompt', '')).strip()
+            existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            parsed_data['original_prompts'] = existing_prompts + [f"[{timestamp}] {transcript}"]
+            logger.info("Take-photo planning_mode=fused_prompt; persisted fused prompt and skipped stage decomposition")
+            return parsed_data
+
+        planner_enabled = load_global_execution_config()['planner_enabled']
+        if not planner_enabled:
+            parsed_data = _normalize_issue_creation_requirements(issue_data, transcript)
+            parsed_data['stages'] = []
+            existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            parsed_data['original_prompts'] = existing_prompts + [f"[{timestamp}] {transcript}"]
+            logger.info("Model routing disabled; skipping stage decomposition")
+            return parsed_data
+
+        try:
+            capability_names = sorted(load_capability_profiles())
+        except Exception:
+            capability_names = [
+                'general_reasoning', 'ocr', 'object_detection_localization',
+                'structured_visual_understanding', 'spatial_reasoning',
+                'navigation', 'camera_motion', 'temporal_reasoning',
+            ]
 
         decomposition_input = _stage_decomposition_input(transcript, existing_data)
         decomposition_prompt = build_stage_decomposition_prompt(decomposition_input)
@@ -3417,6 +5160,7 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
         normalized_decomposition = normalize_stage_plan(
             decomposition_data,
             capability_names,
+            source_task=decomposition_input,
         )
         parsed_data = _merge_issue_and_stage_outputs(issue_data, normalized_decomposition)
         logger.info(
@@ -3502,6 +5246,19 @@ def fill_template(template_content: str, parsed_data: dict) -> str:
         elif value is None:
             return ''
         return str(value)
+
+    filled = filled.replace('<!-- A short Python-friendly name for the tool. -->',
+                            ensure_string(parsed_data.get('title', '')))
+    filled = filled.replace('<!-- What should the tool determine from the camera image? -->',
+                            ensure_string(parsed_data.get('description', '')))
+    filled = filled.replace('<!-- What should the spoken answer contain? -->',
+                            ensure_string(parsed_data.get('example_usage', '')))
+    filled = filled.replace('<!-- Important constraints, edge cases, and example inputs or answers. -->',
+                            ensure_string(parsed_data.get('additional', '')))
+    filled = filled.replace('<!-- Enter exactly: take-photo or streaming. -->',
+                            ensure_string(parsed_data.get('execution_mode', '')))
+    filled = filled.replace('<!-- The exact prompt copied into TOOL_PROMPT. -->',
+                            ensure_string(parsed_data.get('runtime_prompt', '')))
     
     # Inject original prompts into the ORIGINAL_PROMPTS comment block
     original_prompts = parsed_data.get('original_prompts', [])
@@ -3559,6 +5316,9 @@ def merge_parsed_data(existing_data: dict, new_data: dict) -> dict:
             continue  # Don't merge missing_fields, we'll recalculate
         if key == 'original_prompts':
             continue  # Already handled above
+        if key == 'stages':
+            merged[key] = value
+            continue
         
         # Update if new value is non-empty
         if value:
@@ -3614,26 +5374,87 @@ def generate_feedback_message(missing_fields: list, issue_type: str) -> str:
     return f"I need {friendly_name}."
 
 
+async def generate_ideation_question(parsed_data: dict, video_summary: str, brainstorm_context: list = None) -> str:
+    """
+    Ask the system LLM (Gemini) to generate one open-ended ideation question based on
+    the filled issue fields and optional video summary. The question is meant to help
+    the user think through an edge case, environmental constraint, or failure behavior
+    they may not have considered.
+
+    Args:
+        parsed_data: The parsed issue data
+        video_summary: Optional video summary
+        brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
+
+    Returns a plain question string, or a sensible fallback on any error.
+    """
+    title = parsed_data.get('title', '')
+    description = parsed_data.get('description', '')
+    solution = parsed_data.get('solution', '')
+    example_usage = parsed_data.get('example_usage', '')
+
+    video_section = ''
+    if video_summary:
+        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
+
+    brainstorm_section = ''
+    if brainstorm_context:
+        brainstorm_pairs = []
+        for qa_pair in brainstorm_context:
+            q = qa_pair.get('question', '').strip()
+            a = qa_pair.get('answer', '').strip()
+            if q and a:
+                brainstorm_pairs.append(f"Q: {q}\nA: {a}")
+        if brainstorm_pairs:
+            brainstorm_section = "\n\nPrevious brainstorming rounds:\n" + "\n\n".join(brainstorm_pairs)
+
+    prompt = (
+        "You are helping a blind or low-vision user design a camera-based assistive tool. "
+        "They have described the tool they want. Your job is to ask them ONE concise, "
+        "open-ended question that helps them think more deeply about their idea — "
+        "such as an edge case, an environmental condition, or how the tool should behave "
+        "when something goes wrong. Do not ask about things already answered below or in previous rounds. "
+        "Return only the question itself, nothing else.\n\n"
+        f"Tool title: {title}\n"
+        f"Description: {description}\n"
+        f"Proposed solution: {solution}\n"
+        f"Example usage: {example_usage}"
+        f"{video_section}"
+        f"{brainstorm_section}"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            system_llm_call,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        question = extract_text(response).strip()
+        if question:
+            return question
+    except Exception:
+        logger.warning("generate_ideation_question failed", exc_info=True)
+
+    return "Is there anything specific about how the tool should behave in difficult conditions, like low lighting or a cluttered background?"
+
+
 def _log_to_all_sessions(level: str, message: str):
     """Helper to log a message to all active session logs."""
     for session_log in active_session_loggers.values():
         session_log.log(level, message)
 
 
-async def broadcast_to_connected_clients(payload: dict):
-    """Broadcast JSON to aiohttp/websockets-compatible client adapters."""
+async def _broadcast_ws(data: dict) -> None:
+    """Broadcast a JSON payload to every connected AiohttpWebSocketAdapter client."""
     if not connected_clients:
         return
-
-    message = json.dumps(payload)
-    send_tasks = []
+    msg = json.dumps(data)
+    coros = []
     for client in list(connected_clients):
         send = getattr(client, 'send', None)
         if callable(send):
-            send_tasks.append(send(message))
-
-    if send_tasks:
-        results = await asyncio.gather(*send_tasks, return_exceptions=True)
+            coros.append(send(msg))
+    if coros:
+        results = await asyncio.gather(*coros, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
                 logger.warning(f"Failed to broadcast to client: {result}")
@@ -3687,7 +5508,11 @@ async def create_github_issue(text: str):
                 f"score={selection.get('confidence'):.2f}"
             )
         else:
-            selection = parse_issue_selection(text.strip(), available_issues)
+            if TAKE_PHOTO_PLANNING_MODE in {'no_planner', 'fused_prompt'} and not _is_explicit_streaming_request(text):
+                selection = {'mode': 'create', 'issue_number': None, 'issue_title': None}
+                logger.info("Take-photo planning_mode=%s; skipping AI issue selection", TAKE_PHOTO_PLANNING_MODE)
+            else:
+                selection = parse_issue_selection(text.strip(), available_issues)
         
         # Handle list mode
         if selection.get('mode') == 'list':
@@ -3701,7 +5526,7 @@ async def create_github_issue(text: str):
                     'message': issue_list_msg,
                     'issues': available_issues[:10]
                 }
-                await broadcast_to_connected_clients(list_data)
+                await _broadcast_ws(list_data)
             return
         
         # Handle update mode selection
@@ -3722,7 +5547,7 @@ async def create_github_issue(text: str):
                     'duplicate_match': selection.get('match_reason') == 'duplicate_similarity',
                     'confidence': selection.get('confidence'),
                 }
-                await broadcast_to_connected_clients(confirm_data)
+                await _broadcast_ws(confirm_data)
             
             logger.info(f"Switched to update mode for issue #{selected_issue['number']}")
             return
@@ -3765,7 +5590,7 @@ async def create_github_issue(text: str):
                 f"Issue creation stopped because stage decomposition failed: {error_message}",
             )
             if connected_clients:
-                await broadcast_to_connected_clients({
+                await _broadcast_ws({
                     'type': 'issue_creation_error',
                     'message': 'I could not decompose the task, so no incomplete issue was created. Please try again.',
                 })
@@ -3790,18 +5615,49 @@ async def create_github_issue(text: str):
                     'message': feedback_msg,
                     'missing_fields': missing_fields
                 }
-                await broadcast_to_connected_clients(feedback_data)
+                await _broadcast_ws(feedback_data)
             
             # Don't create issue yet, wait for more info
             logger.info("Issue incomplete, waiting for user to provide more details")
             return
         
-        # All required fields are filled! Clear incomplete state and create issue
-        logger.info("All required fields filled, creating issue")
+        # All required fields are filled! Clear incomplete state.
+        logger.info("All required fields filled")
         incomplete_issue['data'] = None
         incomplete_issue['missing_fields'] = []
         incomplete_issue['timestamp'] = None
-        
+
+        if BRAINSTORMING_ENABLED and not (
+            TAKE_PHOTO_PLANNING_MODE in {'no_planner', 'fused_prompt'} and parsed_data.get('runtime_prompt')
+        ):
+            # Send one open-ended question, then fold the answer into the issue.
+            if not pending_ideation['active']:
+                logger.info("Sending ideation question before issue creation")
+                _log_to_all_sessions("INFO", "Sending ideation question")
+                question = await generate_ideation_question(parsed_data, '')
+                pending_ideation['active'] = True
+                pending_ideation['parsed_data'] = parsed_data
+                pending_ideation['video_summary'] = ''
+                await _broadcast_ws({'type': 'ideation_question', 'message': question})
+                return
+
+            logger.info("Received ideation answer, proceeding to issue creation")
+            _log_to_all_sessions("INFO", "Received ideation answer")
+            parsed_data = pending_ideation['parsed_data']
+            ideation_answer = text.strip()
+            if ideation_answer:
+                parsed_data['additional'] = (
+                    (parsed_data.get('additional') or '') + '\n\nUser ideation response: ' + ideation_answer
+                ).strip()
+            pending_ideation['active'] = False
+            pending_ideation['parsed_data'] = None
+            pending_ideation['video_summary'] = ''
+        else:
+            logger.info("Brainstorming disabled; proceeding directly to issue creation")
+
+        logger.info("Creating issue after ideation turn")
+        _log_to_all_sessions("INFO", "Creating issue after ideation turn")
+
         # Use visual AT template
         template_file = TEMPLATE_DIR / 'visual_at.md'
         
@@ -3886,7 +5742,7 @@ async def create_github_issue(text: str):
                 'issue_number': issue.number,
                 'issue_url': issue.html_url
             }
-            await broadcast_to_connected_clients(success_data)
+            await _broadcast_ws(success_data)
             
             # Start polling for Copilot session for each connected client
             for ws in connected_clients:
@@ -3916,10 +5772,13 @@ async def create_github_issue(text: str):
         _log_to_all_sessions("ERROR", tb)
         logger.error(f"Failed to create GitHub issue: {e}")
         logger.error(tb)
-        # Clear incomplete state on error
+        # Clear incomplete + ideation state on error
         incomplete_issue['data'] = None
         incomplete_issue['missing_fields'] = []
         incomplete_issue['timestamp'] = None
+        pending_ideation['active'] = False
+        pending_ideation['parsed_data'] = None
+        pending_ideation['video_summary'] = ''
 
 
 async def monitor_text_pause():
@@ -4040,14 +5899,7 @@ def get_latest_meta_frame_image() -> np.ndarray | None:
 
 
 def format_door_detection_result(result) -> str:
-    if isinstance(result, dict):
-        for key in ('text', 'result', 'message'):
-            value = result.get(key)
-            if value:
-                return str(value)
-        return str(result)
-
-    return str(result)
+    return _response_field_only(result)
 
 
 class AiohttpWebSocketAdapter:
@@ -4143,6 +5995,451 @@ async def test_door_recognition(request: web.Request):
             },
             status=500,
         )
+
+
+# =============================================================================
+# Creation Submit Endpoint
+# =============================================================================
+
+async def handle_creation_submit(request: web.Request) -> web.Response:
+    """
+    POST /submit-creation
+    Accepts multipart/form-data with:
+      - 'metadata'  (JSON string): must include 'text'; optionally 'ideation_answer'
+                    and 'token' for the second call of the ideation round-trip.
+      - 'video'     (bytes, optional): mp4/mov to summarize via Gemini Files API
+
+    Two-shape protocol:
+      Shape A (first call)  — no token in metadata:
+        Parses transcript + video, generates ideation question.
+        Returns: {status: 'ideation', question, token}
+
+      Shape B (second call) — token + ideation_answer in metadata:
+        Looks up stored parsed_data, folds in the answer, creates GitHub issue.
+        Returns: {status: 'created', issue_number, issue_url, video_summary}
+    """
+    if not GITHUB_TOKEN:
+        return web.json_response({'status': 'error', 'error': 'GitHub not configured'}, status=503)
+
+    # --- Purge stale HTTP ideation tokens (older than 10 min) ---
+    now = datetime.now()
+    stale = [t for t, v in pending_ideation_http.items()
+             if (now - v['created_at']).total_seconds() > 600]
+    for t in stale:
+        pending_ideation_http.pop(t, None)
+
+    # --- Parse multipart ---
+    text = ''
+    video_bytes = None
+    video_suffix = '.mp4'
+    ideation_answer = ''
+    token = ''
+    choice = ''  # 'keep_brainstorming' or 'start_building'
+
+    try:
+        reader = await request.multipart()
+        async for part in reader:
+            if part.name == 'metadata':
+                raw = await part.read(decode=True)
+                try:
+                    meta = json.loads(raw)
+                    text = meta.get('text', '')
+                    ideation_answer = meta.get('ideation_answer', '')
+                    token = meta.get('token', '')
+                    choice = meta.get('choice', '')  # 'keep_brainstorming' or 'start_building'
+                except Exception:
+                    text = raw.decode('utf-8', errors='replace')
+            elif part.name == 'video':
+                video_bytes = await part.read(decode=True)
+                filename = part.filename or 'upload.mp4'
+                video_suffix = Path(filename).suffix or '.mp4'
+    except Exception as e:
+        logger.error("Failed to parse multipart in /submit-creation: %s", e)
+        return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
+
+    if not text or not text.strip():
+        # Allow empty text if user is starting to build (already answered and stored)
+        if choice != 'start_building':
+            return web.json_response({'status': 'error', 'error': 'No text provided'}, status=400)
+
+    # --- Shape B: ideation answer received — store in brainstorm history and offer choice ---
+    if token and ideation_answer:
+        entry = pending_ideation_http.get(token)  # Don't pop yet; keep it for next round
+        if entry is None:
+            return web.json_response(
+                {'status': 'error', 'error': 'Ideation session expired or not found'},
+                status=400,
+            )
+        
+        # Store the Q&A pair in brainstorm history
+        last_question = entry.get('last_question', '')
+        brainstorm_history = entry.get('brainstorm_history', [])
+        if last_question and ideation_answer.strip():
+            brainstorm_history.append({
+                'question': last_question,
+                'answer': ideation_answer.strip()
+            })
+            entry['brainstorm_history'] = brainstorm_history
+            logger.info("Stored brainstorming Q&A pair (total: %d)", len(brainstorm_history))
+        
+        # If user is starting to build, remove token and proceed to issue creation
+        if choice == 'start_building':
+            logger.info("User chose to start building with brainstorm history (token=%s)", token)
+            pending_ideation_http.pop(token, None)
+            parsed_data = entry['parsed_data']
+            video_summary = entry['video_summary']
+            
+            # Add brainstorm context to parsed data
+            brainstorm_summary = '\n\n'.join([
+                f"Q: {qa.get('question')}\nA: {qa.get('answer')}"
+                for qa in brainstorm_history
+            ])
+            if brainstorm_summary:
+                parsed_data['additional'] = (
+                    (parsed_data.get('additional') or '') + '\n\n## Brainstorming Session\n\n' + brainstorm_summary
+                ).strip()
+            
+            # Store the parsed_data and video_summary for the issue creation below
+            # Fall through to the template fill + issue creation logic
+        else:
+            # User chose to keep brainstorming; return choice
+            logger.info("Sending user choice: keep brainstorming (token=%s)", token)
+            return web.json_response({
+                'status': 'brainstorm_choice',
+                'token': token,
+                'brainstorm_history': brainstorm_history,
+            })
+        # Fall through to template fill + issue creation below using this parsed_data.
+    else:
+        # --- Shape A: first call — summarize video, parse transcript ---
+        video_summary = ''
+        if video_bytes:
+            tmp_path = None
+            try:
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=video_suffix, prefix='creation_')
+                with os.fdopen(tmp_fd, 'wb') as fh:
+                    fh.write(video_bytes)
+                logger.info("Saved uploaded video to %s (%d bytes)", tmp_path, len(video_bytes))
+                await _broadcast_ws({'type': 'progress', 'message': 'Summarizing video…'})
+                video_summary = await summarize_video(tmp_path)
+                if video_summary:
+                    await _broadcast_ws({'type': 'progress', 'message': 'Video summarized. Parsing your description…'})
+                else:
+                    await _broadcast_ws({'type': 'progress', 'message': 'Parsing your description…'})
+            except Exception:
+                logger.error("Video temp-file handling failed", exc_info=True)
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+        else:
+            await _broadcast_ws({'type': 'progress', 'message': 'Parsing your description…'})
+
+        parse_input = text.strip()
+        if video_summary:
+            parse_input = (
+                f"{text.strip()}\n\n"
+                f"[Video demonstration summary – use this to populate example_usage "
+                f"and any other relevant fields]:\n{video_summary}"
+            )
+
+        try:
+            parsed_data = await asyncio.to_thread(
+                parse_transcript_with_ai, parse_input, None
+            )
+        except Exception as e:
+            logger.error("AI parsing failed in /submit-creation: %s", e, exc_info=True)
+            return web.json_response(
+                {'status': 'error', 'error': 'Failed to process issue data',
+                 'video_failed': not bool(video_summary) and bool(video_bytes)},
+                status=500,
+            )
+
+        if BRAINSTORMING_ENABLED:
+            await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Coming up with a follow-up question…'})
+            try:
+                question = await generate_ideation_question(parsed_data, video_summary)
+            except Exception:
+                logger.warning("generate_ideation_question failed in HTTP path", exc_info=True)
+                question = "Is there anything specific about how the tool should behave in difficult conditions?"
+
+            new_token = secrets.token_urlsafe(12)
+            pending_ideation_http[new_token] = {
+                'parsed_data': parsed_data,
+                'video_summary': video_summary,
+                'brainstorm_history': [],
+                'last_question': question,
+                'created_at': datetime.now(),
+            }
+            logger.info("Sending ideation question via HTTP (token=%s)", new_token)
+            return web.json_response({'status': 'ideation', 'question': question, 'token': new_token})
+
+        logger.info("Brainstorming disabled for HTTP creation; creating issue directly")
+
+    # --- Fill template and create GitHub issue (reached from Shape B) ---
+    try:
+        template_file = TEMPLATE_DIR / 'visual_at.md'
+        if template_file.exists():
+            template_content = template_file.read_text(encoding='utf-8')
+            if template_content.startswith('---'):
+                parts = template_content.split('---', 2)
+                if len(parts) >= 3:
+                    template_content = parts[2].strip()
+            body = await asyncio.to_thread(fill_template, template_content, parsed_data)
+        else:
+            body = (
+                f"**Transcript:**\n{text}\n\n"
+                f"**Parsed Data:**\n{json.dumps(parsed_data, indent=2)}"
+            )
+
+        if video_summary:
+            body += f"\n\n## Video Summary\n\n{video_summary}"
+
+        title = parsed_data.get('title', text[:100])
+        if isinstance(title, list):
+            title = ' '.join(str(t) for t in title)
+        else:
+            title = str(title)
+        if len(title) > 256:
+            title = title[:253] + '...'
+
+    except Exception as e:
+        logger.error("Template fill failed in /submit-creation: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'error': 'Failed to process issue data'}, status=500)
+
+    try:
+        def _create_issue():
+            g = Github(GITHUB_TOKEN)
+            repo = g.get_repo(GITHUB_REPO)
+            return repo.create_issue(title=title, body=body, labels=['enhancement'])
+
+        issue = await asyncio.to_thread(_create_issue)
+        logger.info("Created GitHub issue #%d via /submit-creation: %s", issue.number, title[:60])
+
+        return web.json_response({
+            'status': 'created',
+            'issue_number': issue.number,
+            'issue_url': issue.html_url,
+            'video_summary': video_summary,
+        })
+
+    except Exception as e:
+        logger.error("GitHub issue creation failed in /submit-creation: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'error': str(e)}, status=500)
+
+
+async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
+    """
+    POST /brainstorm-next-question
+    Accepts JSON with:
+      - 'token': the ideation session token
+
+    Generates the next brainstorming question based on existing brainstorm history.
+    The answer to the current question was already stored when /submit-creation was called.
+    Returns the next question and updated brainstorm history.
+    """
+    if not BRAINSTORMING_ENABLED:
+        return web.json_response(
+            {'status': 'disabled', 'error': 'Brainstorming is temporarily disabled'},
+            status=503,
+        )
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({'status': 'error', 'error': 'Invalid JSON'}, status=400)
+
+    token = data.get('token', '')
+
+    if not token:
+        return web.json_response({'status': 'error', 'error': 'Missing token'}, status=400)
+
+    entry = pending_ideation_http.get(token)
+    if entry is None:
+        return web.json_response(
+            {'status': 'error', 'error': 'Brainstorm session expired or not found'},
+            status=400,
+        )
+
+    # Brainstorm history already contains all previous Q&A pairs
+    brainstorm_history = entry.get('brainstorm_history', [])
+
+    # Generate next question with brainstorm context
+    parsed_data = entry['parsed_data']
+    video_summary = entry['video_summary']
+    await _broadcast_ws({'type': 'progress', 'message': 'Generating next brainstorming question…'})
+    
+    try:
+        next_question = await generate_ideation_question(parsed_data, video_summary, brainstorm_history)
+    except Exception:
+        logger.warning("generate_ideation_question failed in /brainstorm-next-question", exc_info=True)
+        next_question = "What other features or behaviors would be helpful for this tool?"
+
+    # Store the new question for next round
+    entry['last_question'] = next_question
+    
+    logger.info("Sending next brainstorming question (token=%s, history size=%d)", token, len(brainstorm_history))
+    return web.json_response({
+        'status': 'ideation',
+        'question': next_question,
+        'token': token,
+        'brainstorm_history': brainstorm_history,
+    })
+
+
+async def handle_update_submit(request: web.Request) -> web.Response:
+    """
+    POST /submit-update
+    Accepts multipart/form-data with:
+      - 'metadata'  (JSON): must include 'text' and 'issue_number'
+      - 'video'     (bytes, optional): video whose Gemini summary is appended directly
+                    to the comment text — no AI field-parsing, just concatenation.
+
+    Posts a comment to the GitHub issue and broadcasts issue_updated to clients.
+    """
+    if not GITHUB_TOKEN:
+        return web.json_response({'status': 'error', 'error': 'GitHub not configured'}, status=503)
+
+    text = ''
+    issue_number = None
+    video_bytes = None
+    video_suffix = '.mp4'
+
+    try:
+        reader = await request.multipart()
+        async for part in reader:
+            if part.name == 'metadata':
+                raw = await part.read(decode=True)
+                try:
+                    meta = json.loads(raw)
+                    text = meta.get('text', '')
+                    issue_number = meta.get('issue_number')
+                except Exception:
+                    text = raw.decode('utf-8', errors='replace')
+            elif part.name == 'video':
+                video_bytes = await part.read(decode=True)
+                filename = part.filename or 'upload.mp4'
+                video_suffix = Path(filename).suffix or '.mp4'
+    except Exception as e:
+        logger.error("Failed to parse multipart in /submit-update: %s", e)
+        return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
+
+    if not text or not text.strip():
+        return web.json_response({'status': 'error', 'error': 'No text provided'}, status=400)
+    if not issue_number:
+        return web.json_response({'status': 'error', 'error': 'No issue_number provided'}, status=400)
+
+    # --- Summarize video if present (best-effort) ---
+    video_summary = ''
+    if video_bytes:
+        tmp_path = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=video_suffix, prefix='update_')
+            with os.fdopen(tmp_fd, 'wb') as fh:
+                fh.write(video_bytes)
+            logger.info("Saved update video to %s (%d bytes)", tmp_path, len(video_bytes))
+            video_summary = await summarize_video(tmp_path)
+        except Exception:
+            logger.error("Video summarization failed in /submit-update", exc_info=True)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    # --- Build comment: text + appended video summary ---
+    comment = text.strip()
+    if video_summary:
+        comment += f"\n\n---\n**Video Summary:**\n{video_summary}"
+
+    # --- Post to GitHub ---
+    try:
+        # Always @copilot on updates so it stays aware of new context/video summaries.
+        final_comment = f"{comment}\n\n@copilot"
+
+        def _post_comment():
+            g = Github(GITHUB_TOKEN)
+            repo = g.get_repo(GITHUB_REPO)
+            issue = repo.get_issue(int(issue_number))
+            issue.create_comment(final_comment)
+            return issue.html_url
+
+        issue_url = await asyncio.to_thread(_post_comment)
+        logger.info("Posted comment to issue #%s via /submit-update", issue_number)
+
+        await _broadcast_ws({
+            'type': 'issue_updated',
+            'message': f"Comment added to issue #{issue_number}",
+            'issue_number': int(issue_number),
+            'issue_url': issue_url,
+        })
+
+        return web.json_response({
+            'status': 'updated',
+            'issue_number': int(issue_number),
+            'issue_url': issue_url,
+            'video_summary': video_summary,
+        })
+
+    except Exception as e:
+        logger.error("Failed to post comment in /submit-update: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'error': str(e)}, status=500)
+
+
+async def handle_test_video_summary(request: web.Request) -> web.Response:
+    """
+    POST /test-video-summary
+    Developer testing endpoint: accepts a 'video' multipart field, summarizes it
+    via Gemini, and returns the summary — no GitHub issue is created.
+    Returns JSON: {status: 'ok', summary: str} or {status: 'error', error: str}
+    """
+    video_bytes = None
+    video_suffix = '.mp4'
+
+    try:
+        reader = await request.multipart()
+        async for part in reader:
+            if part.name == 'video':
+                video_bytes = await part.read(decode=True)
+                filename = part.filename or 'test.mp4'
+                video_suffix = Path(filename).suffix or '.mp4'
+    except Exception as e:
+        logger.error("Failed to parse multipart in /test-video-summary: %s", e)
+        return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
+
+    if not video_bytes:
+        return web.json_response({'status': 'error', 'error': 'No video field provided'}, status=400)
+
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=video_suffix, prefix='vidtest_')
+        with os.fdopen(tmp_fd, 'wb') as fh:
+            fh.write(video_bytes)
+        logger.info("Test video saved to %s (%d bytes)", tmp_path, len(video_bytes))
+
+        summary = await summarize_video(tmp_path)
+
+        if summary:
+            return web.json_response({'status': 'ok', 'summary': summary})
+        else:
+            return web.json_response(
+                {'status': 'error', 'error': 'Gemini returned no summary — check GEMINI_API_KEY and video format.'},
+                status=500,
+            )
+
+    except Exception as e:
+        logger.error("test-video-summary handler failed: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'error': str(e)}, status=500)
+
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # New helper to process/save incoming text
@@ -4361,6 +6658,19 @@ async def handle_client(websocket):
             **SERVER_CAPABILITIES,
             'model_routing': True,
             'routing_mode': 'semantic',
+            'nvidia_streaming_mode': NVIDIA_STREAMING_MODE,
+            'streaming_frame_interval_ms': (
+                max(
+                    100,
+                    round(
+                        NVIDIA_HOSTED_WINDOW_SECONDS
+                        * 1000
+                        / NVIDIA_HOSTED_SAMPLE_FRAMES
+                    ),
+                )
+                if NVIDIA_STREAMING_MODE == 'hosted_multiframe'
+                else None
+            ),
             'default_model': '',
             'available_models': [],
         }
@@ -4398,7 +6708,58 @@ async def handle_client(websocket):
                 if msg_type == 'start_streaming_tool':
                     logger.info(f"Client {client_id} started streaming tool: {data.get('tool_name')}")
                     session_log.log("INFO", f"Started streaming tool: {data.get('tool_name')}")
-                    
+
+                    if NVIDIA_STREAMING_MODE in {'disabled', 'original'}:
+                        await _cleanup_rtvi_session(client_id, reason='mode_switch')
+                        await _cleanup_hosted_nvidia_session(client_id, reason='mode_switch')
+
+                    if NVIDIA_STREAMING_MODE in {'rtvi', 'hosted_multiframe'}:
+                        # Experimental branches deliberately precede tool resolution and
+                        # scheduler setup: the selected NVIDIA path is the only inference path.
+                        if client_id in active_streaming_tasks:
+                            old_task = active_streaming_tasks.pop(client_id)
+                            if not old_task.done():
+                                old_task.cancel()
+                        previous_config = active_streaming_tools.pop(client_id, None)
+                        if previous_config:
+                            for task_key in ('cascade_task', 'debounce_task'):
+                                previous_task = previous_config.get(task_key)
+                                if previous_task is not None and not previous_task.done():
+                                    previous_task.cancel()
+                            if previous_config.get('gemini_live') and gemini_live_manager:
+                                await gemini_live_manager.stop_session(client_id)
+                        await _cleanup_rtvi_session(client_id, reason='mode_switch')
+                        await _cleanup_hosted_nvidia_session(client_id, reason='mode_switch')
+                        try:
+                            if NVIDIA_STREAMING_MODE == 'rtvi':
+                                await _start_rtvi_session(websocket, client_id, data)
+                            else:
+                                await _start_hosted_nvidia_session(websocket, client_id, data)
+                        except Exception as exc:
+                            logger.error(
+                                "[NVIDIA Streaming] failed to start mode=%s client=%s error=%s",
+                                NVIDIA_STREAMING_MODE,
+                                client_id,
+                                exc,
+                            )
+                            await websocket.send(json.dumps({
+                                'type': 'tool_stream_result',
+                                'tool_name': data.get('tool_name', 'unknown'),
+                                'result': f'NVIDIA {NVIDIA_STREAMING_MODE} streaming error: {exc}',
+                                'status': 'error',
+                                'error': str(exc),
+                                'mode': NVIDIA_STREAMING_MODE,
+                                'timestamp': datetime.now().isoformat(),
+                            }))
+                        continue
+
+                    # Cancel any in-flight task from the previous tool so its
+                    # stale result can't arrive after the new tool is registered.
+                    if client_id in active_streaming_tasks:
+                        old_task = active_streaming_tasks.pop(client_id)
+                        if not old_task.done():
+                            old_task.cancel()
+
                     custom_gpt = data.get('custom_gpt', False)
                     gpt_query = data.get('gpt_query', '')
                     tool_name = data.get('tool_name', 'unknown')
@@ -4409,6 +6770,13 @@ async def handle_client(websocket):
                         client_tool_code=data.get('tool_code', ''),
                     )
                     
+                    previous_config = active_streaming_tools.get(client_id)
+                    previous_task = previous_config.get('cascade_task') if previous_config else None
+                    if previous_task is not None and not previous_task.done():
+                        previous_task.cancel()
+                    previous_debounce = previous_config.get('debounce_task') if previous_config else None
+                    if previous_debounce is not None and not previous_debounce.done():
+                        previous_debounce.cancel()
                     active_streaming_tools[client_id] = {
                         'tool': {
                             'name': tool_name,
@@ -4416,10 +6784,37 @@ async def handle_client(websocket):
                             'code': tool_code,
                             'language': data.get('tool_language', 'python'),
                             'input': data.get('input', ''),
+                            'task': data.get('task', ''),
                         },
                         'last_run': None,
                         'throttle_ms': data.get('throttle_ms', 1000),
+                        'frame_selector_config': load_streaming_frame_selector_config(),
+                        'stability_debounce_seconds': STREAMING_STABILITY_DEBOUNCE_SECONDS,
+                        'candidate_max_age_seconds': STREAMING_CANDIDATE_MAX_AGE_SECONDS,
+                        'forced_key_frame_interval_seconds': FORCED_KEY_FRAME_INTERVAL_SECONDS,
+                        'min_stable_confirmations': STREAMING_MIN_STABLE_CONFIRMATIONS,
+                        'execution_lock': asyncio.Lock(),
+                        'active_visual_state': None,
+                        'deferred_visual_state': None,
+                        'in_flight_state_embedding': None,
+                        'in_flight_state_id': None,
                     }
+                    logger.info(
+                        "[Streaming] scheduler configured client=%s debounce_ms=%.1f "
+                        "candidate_max_age_ms=%.1f visual_state_tracker=true "
+                        "latest_frame_only=true deferred_state_slots=1 "
+                        "embedding_gating_enabled=true fail_open=true embedding_source=%s "
+                        "stability_threshold=%.3f difference_threshold=%.3f "
+                        "forced_interval_seconds=%.1f min_stable_confirmations=%d",
+                        client_id,
+                        active_streaming_tools[client_id]['stability_debounce_seconds'] * 1000,
+                        active_streaming_tools[client_id]['candidate_max_age_seconds'] * 1000,
+                        active_streaming_tools[client_id]['frame_selector_config']['implementation'],
+                        active_streaming_tools[client_id]['frame_selector_config']['similarity_threshold'],
+                        active_streaming_tools[client_id]['frame_selector_config']['max_similarity_to_last_sent'],
+                        active_streaming_tools[client_id]['forced_key_frame_interval_seconds'],
+                        active_streaming_tools[client_id]['min_stable_confirmations'],
+                    )
                     
                     # Custom GPT mode: use Gemini Live instead of code execution
                     if custom_gpt and gpt_query and gemini_live_manager:
@@ -4512,8 +6907,39 @@ async def handle_client(websocket):
                 # Handle stop_streaming_tool message type
                 if msg_type == 'stop_streaming_tool':
                     logger.info(f"Client {client_id} stopped streaming tool")
+                    if client_id in active_hosted_nvidia_sessions:
+                        tool_name = active_hosted_nvidia_sessions[client_id]['tool_name']
+                        await _cleanup_hosted_nvidia_session(client_id, reason='client_stop')
+                        await websocket.send(json.dumps({
+                            'type': 'streaming_stopped',
+                            'tool_name': tool_name,
+                            'mode': 'hosted_multiframe',
+                            'timestamp': datetime.now().isoformat(),
+                        }))
+                        continue
+                    if client_id in active_rtvi_sessions:
+                        tool_name = active_rtvi_sessions[client_id]['tool_name']
+                        await _cleanup_rtvi_session(client_id, reason='client_stop')
+                        await websocket.send(json.dumps({
+                            'type': 'streaming_stopped',
+                            'tool_name': tool_name,
+                            'mode': 'nvidia_rtvi',
+                            'timestamp': datetime.now().isoformat(),
+                        }))
+                        continue
+                    if client_id in active_streaming_tasks:
+                        old_task = active_streaming_tasks.pop(client_id)
+                        if not old_task.done():
+                            old_task.cancel()
                     if client_id in active_streaming_tools:
-                        tool_name = active_streaming_tools[client_id]['tool']['name']
+                        stopping_config = active_streaming_tools[client_id]
+                        tool_name = stopping_config['tool']['name']
+                        cascade_task = stopping_config.get('cascade_task')
+                        if cascade_task is not None and not cascade_task.done():
+                            cascade_task.cancel()
+                        debounce_task = stopping_config.get('debounce_task')
+                        if debounce_task is not None and not debounce_task.done():
+                            debounce_task.cancel()
                         # Clean up Gemini Live session if active
                         if active_streaming_tools[client_id].get('gemini_live') and gemini_live_manager:
                             await gemini_live_manager.stop_session(client_id)
@@ -4993,13 +7419,34 @@ async def handle_client(websocket):
                     frame_results = process_frame(data)
                     combined_results['frame'] = frame_results
                     
-                    # Run active streaming tools asynchronously
-                    if last_frame['image'] is not None and client_id in active_streaming_tools:
-                        logger.info(f"About to run streaming tools for {client_id}")
-                        # Run tool execution in background task to avoid blocking frame processing
-                        task = asyncio.create_task(run_streaming_tools(websocket, client_id, last_frame['image'], last_frame['base64']))
-                        # Add error handling to the task
-                        task.add_done_callback(lambda t: logger.error(f"Streaming tool task error: {t.exception()}") if t.exception() else None)
+                    # Experimental modes consume frames before ProgramAT's
+                    # CLIP/router/cascade scheduler.
+                    if (
+                        NVIDIA_STREAMING_MODE == 'rtvi'
+                        and client_id in active_rtvi_sessions
+                    ) or (
+                        NVIDIA_STREAMING_MODE == 'hosted_multiframe'
+                        and client_id in active_hosted_nvidia_sessions
+                    ) or (
+                        NVIDIA_STREAMING_MODE in {'disabled', 'original'}
+                        and last_frame['image'] is not None
+                        and client_id in active_streaming_tools
+                    ):
+                        source_timestamp = data.get('timestamp')
+                        if isinstance(source_timestamp, (int, float)):
+                            frame_timestamp = float(source_timestamp)
+                            if frame_timestamp > 10_000_000_000:
+                                frame_timestamp /= 1000.0
+                        else:
+                            frame_timestamp = time.time()
+                        logger.debug("[Streaming] frame received; scheduling client=%s", client_id)
+                        await _dispatch_active_streaming_frame(
+                            websocket,
+                            client_id,
+                            last_frame['image'],
+                            data_field['base64Image'],
+                            frame_timestamp,
+                        )
                     elif last_frame['image'] is None:
                         logger.debug(f"No image available for {client_id}")
                     elif client_id not in active_streaming_tools:
@@ -5149,6 +7596,7 @@ async def handle_client(websocket):
                     
                     # Execute the tool (Python tools only for now)
                     if tool_language == 'python' and tool_code:
+                        image_context_token = None
                         try:
                             # Use frame from message if provided, otherwise use last streaming frame
                             frame_image = None
@@ -5221,16 +7669,39 @@ async def handle_client(websocket):
                                 
                                 frame_image = last_frame['image']
                                 frame_base64 = last_frame['base64']
+
+                            if TAKE_PHOTO_PLANNING_MODE in {'no_planner', 'fused_prompt'}:
+                                baseline_result = await asyncio.to_thread(
+                                    _run_take_photo_single_vlm,
+                                    tool_name,
+                                    data.get('task', ''),
+                                    tool_code,
+                                    frame_image,
+                                )
+                                response_data = _build_mobile_tool_response(
+                                    'tool_result', tool_name, baseline_result, datetime.now()
+                                )
+                                _log_final_tool_response(tool_name, response_data)
+                                await websocket.send(json.dumps(response_data))
+                                continue
                             
                             # Get module manager and load common modules dynamically
                             module_mgr = get_module_manager()
                             common_modules = module_mgr.get_common_modules()
                             
                             # Create a sandboxed execution environment with image data
+                            def frame_copilot_llm_call(*args, **kwargs):
+                                metadata = dict(kwargs.get('metadata') or {})
+                                metadata.setdefault('tool_name', tool_name)
+                                kwargs['metadata'] = metadata
+                                if not kwargs.get('images'):
+                                    kwargs['images'] = [frame_image]
+                                return tool_copilot_llm_call(*args, **kwargs)
+
                             exec_globals = {
                                 '__builtins__': __builtins__,
                                 '__file__': str(TOOLS_DIR / f'{Path(tool_name).name}.py'),
-                                'copilot_llm_call': tool_copilot_llm_call,
+                                'copilot_llm_call': frame_copilot_llm_call,
                                 'input_data': parsed_input,  # Use parsed input (dict or string)
                                 'image': frame_image,  # OpenCV image (numpy array)
                                 'image_base64': frame_base64,  # Base64 string
@@ -5243,178 +7714,102 @@ async def handle_client(websocket):
                             logger.info(f"EXEC_GLOBALS: image_base64 length: {len(frame_base64) if frame_base64 else 0}")
                             
                             exec_locals = {}
-                            
-                            # Capture stdout to get print() output
-                            import io
+                            image_context_token = TOOL_EXECUTION_IMAGES.set([frame_image])
+
                             import sys
-                            stdout_capture = io.StringIO()
-                            old_stdout = sys.stdout
-                            
-                            # Execute the tool code with retry on module errors
-                            max_retries = 3
-                            retry_count = 0
-                            
-                            while retry_count < max_retries:
-                                try:
-                                    # Redirect stdout to capture print statements
-                                    sys.stdout = stdout_capture
-                                    try:
-                                        exec(tool_code, exec_globals, exec_locals)
-                                    finally:
-                                        sys.stdout = old_stdout
-                                    break  # Success, exit retry loop
-                                except (ImportError, ModuleNotFoundError) as e:
-                                    error_msg = str(e)
-                                    logger.warning(f"Module error in {tool_name}: {error_msg}")
-                                    
-                                    # Try to install the missing module
-                                    installed_module = module_mgr.install_from_error(error_msg)
-                                    
-                                    if installed_module:
-                                        logger.info(f"Installed {installed_module}, retrying execution...")
-                                        # Reload common modules to include newly installed one
-                                        common_modules = module_mgr.get_common_modules()
-                                        exec_globals.update(common_modules)
-                                        retry_count += 1
-                                    else:
-                                        # Could not identify/install module, raise error
-                                        raise
-                                except Exception:
-                                    # Non-module errors should be raised immediately
-                                    sys.stdout = old_stdout  # Restore stdout before raising
-                                    raise
-                            
-                            # Get captured print output
-                            printed_output = stdout_capture.getvalue()
-                            
-                            # IMPORTANT: Merge exec_locals into exec_globals so functions can see each other
-                            # This allows main() to call helper functions defined in the same file
-                            exec_globals.update(exec_locals)
-                            
-                            # Try to find a main function or use the result
-                            # Check function signatures to avoid calling helper functions
                             import inspect
-                            
-                            result = None
-                            
-                            # Try main() - highest priority
-                            if 'main' in exec_locals and callable(exec_locals['main']):
+                            import io as _io
+
+                            _fi = frame_image
+                            _fb = frame_base64
+
+                            def _run_one_shot_in_thread():
+                                _capture = _io.StringIO()
+                                _old = sys.stdout
+                                sys.stdout = _capture
                                 try:
+                                    exec(tool_code, exec_globals, exec_locals)
+                                finally:
+                                    sys.stdout = _old
+
+                                exec_globals.update(exec_locals)
+
+                                _result = None
+                                if 'main' in exec_locals and callable(exec_locals['main']):
                                     sig = inspect.signature(exec_locals['main'])
-                                    if len(sig.parameters) == 2:  # Should take (image, input_data)
-                                        result = exec_locals['main'](frame_image, parsed_input)
+                                    if len(sig.parameters) == 2:
+                                        _result = exec_locals['main'](_fi, parsed_input)
                                     else:
                                         logger.warning(f"main() has {len(sig.parameters)} params, expected 2")
-                                except Exception as e:
-                                    logger.error(f"Error calling main(): {e}")
-                            
-                            # Try run() - second priority
-                            elif 'run' in exec_locals and callable(exec_locals['run']):
-                                try:
+                                elif 'run' in exec_locals and callable(exec_locals['run']):
                                     sig = inspect.signature(exec_locals['run'])
                                     if len(sig.parameters) == 2:
-                                        result = exec_locals['run'](frame_image, parsed_input)
+                                        _result = exec_locals['run'](_fi, parsed_input)
                                     else:
                                         logger.warning(f"run() has {len(sig.parameters)} params, expected 2")
-                                except Exception as e:
-                                    logger.error(f"Error calling run(): {e}")
-                            
-                            # Try process_image() - but check signature carefully
-                            elif 'process_image' in exec_locals and callable(exec_locals['process_image']):
-                                try:
+                                elif 'process_image' in exec_locals and callable(exec_locals['process_image']):
                                     sig = inspect.signature(exec_locals['process_image'])
-                                    # Only call if it takes 2 params (entry point), not 1 (helper function)
                                     if len(sig.parameters) == 2:
-                                        result = exec_locals['process_image'](frame_image, parsed_input)
+                                        _result = exec_locals['process_image'](_fi, parsed_input)
                                     else:
                                         logger.info(f"Skipping process_image() - has {len(sig.parameters)} params (likely a helper function)")
-                                except Exception as e:
-                                    logger.error(f"Error calling process_image(): {e}")
-                            
-                            # Try process_frame_for_text() - special case for text tools
-                            elif 'process_frame_for_text' in exec_locals and callable(exec_locals['process_frame_for_text']):
-                                try:
-                                    # Initialize verbalizer if needed
+                                elif 'process_frame_for_text' in exec_locals and callable(exec_locals['process_frame_for_text']):
                                     if 'initialize_verbalizer' in exec_locals and 'get_verbalizer' in exec_locals:
                                         verbalizer = exec_locals['get_verbalizer']()
                                         if not verbalizer and GEMINI_API_KEY:
                                             exec_locals['initialize_verbalizer'](GEMINI_API_KEY)
-                                    result = exec_locals['process_frame_for_text'](frame_base64)
-                                except Exception as e:
-                                    logger.error(f"Error calling process_frame_for_text(): {e}")
-                            
-                            # Check for result variable
-                            elif 'result' in exec_locals:
-                                result = exec_locals['result']
-                            else:
-                                # Tool is a library - show available functions
-                                available_funcs = [name for name, obj in exec_locals.items() 
-                                                 if callable(obj) and not name.startswith('_')]
-                                available_classes = [name for name, obj in exec_locals.items() 
-                                                   if isinstance(obj, type) and not name.startswith('_')]
-                                
-                                if available_funcs or available_classes:
-                                    result = f"Tool loaded successfully.\n\nAvailable functions: {', '.join(available_funcs) if available_funcs else 'none'}\nAvailable classes: {', '.join(available_classes) if available_classes else 'none'}\n\nNote: This tool is a library. To use it, you may need to call one of these functions."
+                                    _result = exec_locals['process_frame_for_text'](_fb)
+                                elif 'result' in exec_locals:
+                                    _result = exec_locals['result']
                                 else:
-                                    result = None
+                                    available_funcs = [n for n, o in exec_locals.items() if callable(o) and not n.startswith('_')]
+                                    available_classes = [n for n, o in exec_locals.items() if isinstance(o, type) and not n.startswith('_')]
+                                    if available_funcs or available_classes:
+                                        _result = f"Tool loaded successfully.\n\nAvailable functions: {', '.join(available_funcs) if available_funcs else 'none'}\nAvailable classes: {', '.join(available_classes) if available_classes else 'none'}\n\nNote: This tool is a library. To use it, you may need to call one of these functions."
+
+                                return _capture.getvalue(), _result
+
+                            max_retries = 3
+                            retry_count = 0
+                            printed_output = ''
+                            result = None
+
+                            while retry_count < max_retries:
+                                try:
+                                    printed_output, result = await asyncio.to_thread(_run_one_shot_in_thread)
+                                    break
+                                except (ImportError, ModuleNotFoundError) as e:
+                                    error_msg = str(e)
+                                    logger.warning(f"Module error in {tool_name}: {error_msg}")
+                                    installed_module = await asyncio.to_thread(module_mgr.install_from_error, error_msg)
+                                    if installed_module:
+                                        logger.info(f"Installed {installed_module}, retrying execution...")
+                                        common_modules = module_mgr.get_common_modules()
+                                        exec_globals.update(common_modules)
+                                        retry_count += 1
+                                    else:
+                                        raise
+                                except Exception:
+                                    raise
+                            TOOL_EXECUTION_IMAGES.reset(image_context_token)
+                            image_context_token = None
                             
-                            # Combine printed output with result
-                            result = _response_field_only(result)
-                            # Check if result is a dict with 'audio' and 'text' keys (advanced format)
-                            if isinstance(result, dict) and ('audio' in result or 'text' in result):
-                                # Advanced format - preserve audio configuration
-                                response_data = {
-                                    'type': 'tool_result',
-                                    'tool_name': tool_name,
-                                    'status': 'success',
-                                    'result': result.get('text', ''),
-                                    'timestamp': datetime.now().isoformat()
-                                }
-                                
-                                # Add audio configuration if provided
-                                if 'audio' in result:
-                                    response_data['audio'] = result['audio']
-                                
-                                # Prepend printed output to text if any
-                                if printed_output.strip():
-                                    response_data['result'] = printed_output.strip() + '\n' + response_data['result']
-                                    # Also update audio text to include printed output
-                                    if 'audio' in response_data and 'text' in response_data['audio']:
-                                        response_data['audio']['text'] = printed_output.strip() + '. ' + response_data['audio']['text']
-                                
-                                logger.info(f"Sending tool_result: result length={len(response_data.get('result', ''))}, audio.text length={len(response_data.get('audio', {}).get('text', ''))}")
-                                _log_final_tool_response(tool_name, response_data)
-                                await websocket.send(json.dumps(response_data))
-                            else:
-                                # Simple format - just strings
-                                output_parts = []
-                                if printed_output.strip():
-                                    output_parts.append(printed_output.strip())
-                                if result is not None:
-                                    output_parts.append(str(result))
-                                
-                                final_result = '\n'.join(output_parts) if output_parts else "Tool executed (no output)"
-                                
-                                # Send result back to client (with default audio config)
-                                response_data = {
-                                    'type': 'tool_result',
-                                    'tool_name': tool_name,
-                                    'status': 'success',
-                                    'result': final_result,
-                                    'audio': {
-                                        'type': 'speech',
-                                        'text': final_result,
-                                        'rate': 1.0,
-                                        'interrupt': False
-                                    },
-                                    'timestamp': datetime.now().isoformat()
-                                }
-                                _log_final_tool_response(tool_name, response_data)
-                                await websocket.send(json.dumps(response_data))
+                            response_data = _build_mobile_tool_response(
+                                'tool_result', tool_name, result, datetime.now(), printed_output
+                            )
+                            logger.info(
+                                "Sending tool_result: result length=%d, audio.text length=%d",
+                                len(response_data['result']),
+                                len(response_data['audio']['text']),
+                            )
+                            _log_final_tool_response(tool_name, response_data)
+                            await websocket.send(json.dumps(response_data))
                             
                             logger.info(f"Tool {tool_name} executed successfully")
                             
                         except Exception as e:
+                            if image_context_token is not None:
+                                TOOL_EXECUTION_IMAGES.reset(image_context_token)
                             logger.error(f"Error executing tool {tool_name}: {e}")
                             await websocket.send(json.dumps({
                                 'type': 'tool_result',
@@ -5608,6 +8003,13 @@ async def handle_client(websocket):
                 active_session_loggers[client_id].log("ERROR", f"Connection error: {e}")
     finally:
         connected_clients.discard(websocket)
+        await _cleanup_rtvi_session(client_id, reason='client_disconnect')
+        await _cleanup_hosted_nvidia_session(client_id, reason='client_disconnect')
+        # Cancel any in-flight streaming task
+        if client_id in active_streaming_tasks:
+            t = active_streaming_tasks.pop(client_id)
+            if not t.done():
+                t.cancel()
         # Clean up streaming tools for this client
         if client_id in active_streaming_tools:
             logger.info(f"Stopping streaming tool for disconnected client {client_id}")
@@ -5861,10 +8263,37 @@ async def main():
     logger.info(f"Frame saving: {'enabled' if SAVE_FRAMES else 'disabled'}")
     logger.info(f"GitHub issue creation: {'enabled' if GITHUB_TOKEN else 'disabled'}")
 
+    logger.info("[NVIDIA Streaming] selected mode=%s", NVIDIA_STREAMING_MODE)
+    if NVIDIA_STREAMING_MODE == 'rtvi':
+        logger.info(
+            "[NVIDIA RTVI] experimental streaming enabled base_url=%s rtsp_base=%s",
+            NVIDIA_RTVI_BASE_URL,
+            PROGRAMAT_RTSP_PUBLIC_BASE_URL,
+        )
+    elif NVIDIA_STREAMING_MODE == 'hosted_multiframe':
+        logger.info(
+            "[NVIDIA Hosted] experimental streaming enabled base_url=%s "
+            "window_seconds=%s sample_frames=%s interval_seconds=%s",
+            NVIDIA_HOSTED_API_BASE_URL,
+            NVIDIA_HOSTED_WINDOW_SECONDS,
+            NVIDIA_HOSTED_SAMPLE_FRAMES,
+            NVIDIA_HOSTED_REQUEST_INTERVAL_SECONDS,
+        )
+    else:
+        try:
+            await asyncio.to_thread(warm_streaming_frame_selector)
+        except Exception as exc:
+            logger.warning("[Streaming] CLIP warm-up failed; frame gating will fail open: %s", exc)
+
     app = web.Application(client_max_size=20 * 1024 * 1024)
     app.router.add_get('/', websocket_handler)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_post('/test-door-recognition', test_door_recognition)
+    app.router.add_post('/submit-creation', handle_creation_submit)
+    app.router.add_post('/brainstorm-next-question', handle_brainstorm_next_question)
+    app.router.add_post('/submit-update', handle_update_submit)
+    app.router.add_post('/test-video-summary', handle_test_video_summary)
+    app.router.add_post('/offer', webrtc_offer_handler)  # WebRTC signaling
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -5882,7 +8311,16 @@ async def main():
     # Background Copilot monitoring disabled - we poll specific PRs when user comments with @copilot
 
     # Keep server running
-    await asyncio.Future()  # Run forever
+    try:
+        await asyncio.Future()  # Run forever
+    finally:
+        for client_id in list(active_rtvi_sessions):
+            await _cleanup_rtvi_session(client_id, reason='server_shutdown')
+        for client_id in list(active_hosted_nvidia_sessions):
+            await _cleanup_hosted_nvidia_session(client_id, reason='server_shutdown')
+        await rtvi_client.close()
+        await hosted_nvidia_client.close()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
@@ -5890,6 +8328,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
+        asyncio.run(cleanup_webrtc_peers())
     except Exception as e:
         logger.error(f"Server error: {e}")
         raise
