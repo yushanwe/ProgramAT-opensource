@@ -8,25 +8,20 @@ not print results, connect to the backend, or use WebSockets.
 
 ## Take-photo tools
 
-Implement one user-facing task by copying the issue's Runtime prompt verbatim; do not author or improve it:
+Use the issue's `Task Stages` as the implementation plan. Import the existing
+tool-facing call:
 
 ```python
-from litellm_utils import call_take_photo_baseline_vlm
-
-TOOL_PROMPT = "Copy the issue's Runtime prompt here verbatim."
-
-
-def main(image, input_data):
-    if image is None:
-        return "No camera image is available."
-    answer = call_take_photo_baseline_vlm(image=image, prompt=TOOL_PROMPT)
-    return answer
+from model_router_client import copilot_llm_call
 ```
 
-Make exactly one `call_take_photo_baseline_vlm` call and return its answer
-directly. Do not add any other model calls, specialist calls, fallback logic,
-verification passes, or provider SDKs. Do not hardcode a model name in the tool;
-the shared helper owns the fixed Gemini Flash Lite model.
+Generate exactly one ordered call per declared stage. Use the stage capability
+and preserve its goal as the step-specific `goal` or user message. Pass
+`images=[image]` whenever the stage needs the scene. Later calls must explicitly
+receive useful earlier `artifact` values in `metadata` and/or messages. Return
+the last call's `response`. A one-stage issue produces one call. Never fuse a
+multi-stage issue into one `TOOL_PROMPT`, choose an implementation, add retries,
+or add evaluation/escalation logic; the backend supplies one fixed model per call.
 
 ## Streaming tools
 
