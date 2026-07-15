@@ -54,6 +54,11 @@ The server uses environment variables for configuration:
 
 ProgramAT separates fixed infrastructure LLM calls from take-photo capability execution.
 
+For take-photo tools, the system LLM extracts issue fields and the coding agent
+authors one fused `TOOL_PROMPT`. Runtime bypasses capability routing and calls
+the fixed Gemini Flash Lite helper exactly once. It does not execute task stages,
+routers, cascades, evaluators, or specialist models.
+
 Infrastructure/system work such as text parsing, command extraction, issue generation, metadata generation, and internal assistant logic should call `system_llm_call(...)` from `model_router.py`. This uses `global.system_model` and bypasses capability routing.
 
 Take-photo model-backed work should call `copilot_llm_call(...)` through `model_router_client.py`. The declared capability selects its configured policy:
