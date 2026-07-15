@@ -7,6 +7,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import litellm_utils
 import stream_server
+import stream_server
 from validate_generated_tools import validate_take_photo_baseline
 
 
