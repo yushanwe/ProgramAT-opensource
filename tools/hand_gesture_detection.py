@@ -1,6 +1,6 @@
 from litellm_utils import call_take_photo_baseline_vlm
 
-TOOL_PROMPT = "Tell me when someone is pointing, waving, giving a thumbs up, raising a hand, or making another common hand gesture, and briefly explain what it likely means."
+TOOL_PROMPT = "Detect any hand gesture in the image and name it concisely (for example: thumbs up, pointing, waving, raised hand). If you cannot recognize the gesture, say so. Do not explain what the gesture means."
 
 
 def main(image, input_data):
