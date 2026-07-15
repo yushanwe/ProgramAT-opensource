@@ -130,6 +130,54 @@ def extract_copilot_llm_task_categories(tool_text: str) -> List[Optional[str]]:
     return categories
 
 
+def validate_no_stringified_copilot_results(tool_text: str, rel_path: Path) -> List[str]:
+    """Reject turning structured capability results into user-facing repr strings."""
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+
+    result_names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        is_copilot_call = (
+            isinstance(value.func, ast.Name) and value.func.id == "copilot_llm_call"
+        ) or (
+            isinstance(value.func, ast.Attribute) and value.func.attr == "copilot_llm_call"
+        )
+        if not is_copilot_call:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        result_names.update(target.id for target in targets if isinstance(target, ast.Name))
+
+    failures = []
+    for node in ast.walk(tree):
+        stringified_name = None
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"str", "repr"}
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in result_names
+        ):
+            stringified_name = node.args[0].id
+        elif isinstance(node, ast.FormattedValue) and isinstance(node.value, ast.Name):
+            if node.value.id in result_names:
+                stringified_name = node.value.id
+
+        if stringified_name:
+            failures.append(
+                f"{rel_path}:{node.lineno}: capability result '{stringified_name}' must not be "
+                "stringified; return or use its ['response'] field for user-facing text."
+            )
+    return failures
+
+
 def validate_stage_enforcement(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
     failures: List[str] = []
     stage_capabilities = extract_stage_capabilities(issue_text)
@@ -143,6 +191,52 @@ def validate_stage_enforcement(tool_text: str, issue_text: str, rel_path: Path) 
             f"Task Stages {stage_capabilities}."
         )
 
+    return failures
+
+
+def validate_take_photo_baseline(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
+    """Enforce the E1/P1 generation contract for take-photo issues."""
+    if not re.search(
+        r"^##\s+Mode\s*\n(?:\s*<!--[^\n]*-->\s*\n)?\s*take-photo\s*$",
+        issue_text,
+        re.IGNORECASE | re.MULTILINE,
+    ):
+        return []
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+
+    baseline_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "call_take_photo_baseline_vlm"
+        )
+    ]
+    failures = []
+    if len(baseline_calls) != 1:
+        failures.append(
+            f"{rel_path}: take-photo P1 requires exactly one call_take_photo_baseline_vlm() call; "
+            f"found {len(baseline_calls)}."
+        )
+    tool_prompt = _extract_string_constants(tree).get("TOOL_PROMPT")
+    if tool_prompt is None:
+        failures.append(f"{rel_path}: take-photo P1 requires one string TOOL_PROMPT constant.")
+    runtime_prompt_match = re.search(
+        r"^##\s+Runtime\s+prompt\s*$\n(.*?)(?=^##\s+|\Z)",
+        issue_text,
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    if runtime_prompt_match and tool_prompt is not None:
+        runtime_prompt = re.sub(r"^\s*<!--.*?-->\s*", "", runtime_prompt_match.group(1), flags=re.DOTALL).strip()
+        if runtime_prompt and tool_prompt != runtime_prompt:
+            failures.append(
+                f"{rel_path}: TOOL_PROMPT must exactly match the issue Runtime prompt."
+            )
+    if extract_copilot_llm_task_categories(tool_text):
+        failures.append(f"{rel_path}: take-photo P1 must not call copilot_llm_call().")
     return failures
 
 
@@ -209,8 +303,10 @@ def validate_files(paths: Iterable[Path], issue_text: Optional[str] = None) -> L
                 failures.append(f"{rel_path}:{line_number}: forbidden generated-tool pattern: {label}")
 
         failures.extend(validate_canonical_task_categories(text, rel_path))
+        failures.extend(validate_no_stringified_copilot_results(text, rel_path))
         if issue_text:
             failures.extend(validate_stage_enforcement(text, issue_text, rel_path))
+            failures.extend(validate_take_photo_baseline(text, issue_text, rel_path))
 
     return failures
 
@@ -237,17 +333,13 @@ def main(argv: List[str] | None = None) -> int:
 
     failures = validate_files(paths, issue_text=issue_text)
     if failures:
-        print("Generated tools must use model_router_client capability interfaces for LLM/VLM operations.")
-        print("Do not implement detection, OCR, VLM, LLM, model loading, provider calls, or model discovery in tool files.")
-        print(
-            "When Task Stages are provided, compose one ordered copilot_llm_call() per stage."
-        )
+        print("Generated tool validation failed.")
         print()
         for failure in failures:
             print(failure)
         return 1
 
-    print("Generated tool router guardrails passed.")
+    print("Generated tool guardrails passed.")
     return 0
 
 
