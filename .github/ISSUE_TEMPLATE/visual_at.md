@@ -24,7 +24,11 @@ assignees: ''
 ## Mode
 <!-- Enter exactly: take-photo or streaming. -->
 
-For a take-photo tool, define one concise task-specific `TOOL_PROMPT` and call
+## Runtime prompt
+<!-- The exact prompt copied into TOOL_PROMPT. -->
+
+For a take-photo tool, copy the Runtime prompt above verbatim into `TOOL_PROMPT`;
+do not author, summarize, or improve it. Call
 `call_take_photo_baseline_vlm(image=image, prompt=TOOL_PROMPT)` from
 `litellm_utils`. Return that answer directly. The tool must make no other model
 or specialist calls.

@@ -13,7 +13,7 @@ For a take-photo tool, use this shape:
 ```python
 from litellm_utils import call_take_photo_baseline_vlm
 
-TOOL_PROMPT = "A concise prompt describing this tool's visual task."
+TOOL_PROMPT = "Copy the issue's Runtime prompt here verbatim."
 
 
 def main(image, input_data):

@@ -1577,12 +1577,13 @@ def _take_photo_tool_prompt(tool_name: str, task: str, tool_code: str) -> str:
     return str(task or '').strip() or str(tool_name).replace('_', ' ')
 
 
-def _run_take_photo_no_planner(tool_name: str, task: str, tool_code: str, image) -> str:
-    """Execute E1/P1 with exactly one direct Gemini Flash Lite inference."""
+def _run_take_photo_single_vlm(tool_name: str, task: str, tool_code: str, image) -> str:
+    """Execute E1/P1 or E1/P2 with exactly one direct Gemini Flash Lite inference."""
     prompt = _take_photo_tool_prompt(tool_name, task, tool_code)
     logger.info(
-        "[Take Photo E1] planning_mode=no_planner model=Gemini Flash Lite model_id=%s total_model_calls=1 "
-        "planner_calls=0 router_calls=0 cascade_calls=0 evaluator_calls=0",
+        "[Take Photo E1] planning_mode=%s model=Gemini Flash Lite model_id=%s total_model_calls=1 "
+        "runtime_planner_calls=0 router_calls=0 cascade_calls=0 evaluator_calls=0",
+        TAKE_PHOTO_PLANNING_MODE,
         TAKE_PHOTO_BASELINE_MODEL,
     )
     return call_take_photo_baseline_vlm(image=image, prompt=prompt)
@@ -5007,6 +5008,10 @@ Fields previously missing: {existing_data.get('missing_fields', [])}
 Merge the new transcript into those issue fields.
 """
 
+    fused_field = ""
+    if globals().get('TAKE_PHOTO_PLANNING_MODE', 'no_planner') == 'fused_prompt':
+        fused_field = "- fused_vlm_prompt: one self-contained runtime VLM prompt preserving every explicit user constraint"
+
     return f"""Parse the following voice transcript for a visual assistive technology tool request.
 
 CRITICAL: Do not make up, infer, or extrapolate content that was not explicitly provided. Leave unmentioned fields empty.
@@ -5018,6 +5023,7 @@ Extract only these user-facing fields:
 - additional: constraints and examples
 - execution_mode: exactly "take-photo", "streaming", or empty when unstated
 - missing_fields: only missing important fields
+{fused_field}
 
 Only block creation when the core task is genuinely unclear.
 - Tool name, task, and expected output are the core fields.
@@ -5032,11 +5038,39 @@ Return ONLY this JSON object:
   "example_usage": "...",
   "additional": "...",
   "execution_mode": "...",
+  {('"fused_vlm_prompt": "...",' if fused_field else '')}
   "missing_fields": []
 }}
 {context_info}
 Transcript: {transcript}
 """
+
+
+def _is_explicit_streaming_request(transcript: str) -> bool:
+    text = str(transcript or '').lower()
+    return any(marker in text for marker in ('streaming', 'stream continuously', 'live mode'))
+
+
+def _parse_no_planner_request(transcript: str, existing_data: Optional[dict] = None) -> dict:
+    """Persist an E1/P1 request verbatim without invoking an LLM."""
+    existing_prompts = list((existing_data or {}).get('original_prompts') or [])
+    prompt_parts = [entry.split('] ', 1)[-1] for entry in existing_prompts]
+    prompt_parts.append(str(transcript or '').strip())
+    raw_prompt = '\n'.join(part for part in prompt_parts if part).strip()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return {
+        'type': 'visual AT',
+        'title': raw_prompt[:100],
+        'description': raw_prompt,
+        'example_usage': raw_prompt,
+        'additional': '',
+        'execution_mode': 'take-photo',
+        'custom_gpt': 'no',
+        'gpt_query': '',
+        'missing_fields': [] if raw_prompt else ['description', 'example_usage'],
+        'runtime_prompt': raw_prompt,
+        'original_prompts': existing_prompts + [f"[{timestamp}] {transcript}"],
+    }
 
 
 def _stage_decomposition_input(transcript: str, existing_data: Optional[dict] = None) -> str:
@@ -5096,6 +5130,10 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
     Returns:
         Dictionary with parsed fields including 'missing_fields' list
     """
+    if TAKE_PHOTO_PLANNING_MODE == 'no_planner' and not _is_explicit_streaming_request(transcript):
+        logger.info("Take-photo planning_mode=no_planner; persisting raw request without parser or planner")
+        return _parse_no_planner_request(transcript, existing_data)
+
     try:
         issue_prompt = _build_issue_extraction_prompt(transcript, existing_data)
         issue_response = system_llm_call(
@@ -5110,13 +5148,14 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
         )
 
         execution_mode = str(issue_data.get('execution_mode') or '').strip().lower()
-        if TAKE_PHOTO_PLANNING_MODE == 'no_planner' and execution_mode != 'streaming':
+        if TAKE_PHOTO_PLANNING_MODE == 'fused_prompt' and execution_mode != 'streaming':
             parsed_data = _normalize_issue_creation_requirements(issue_data, transcript)
             parsed_data['stages'] = []
+            parsed_data['runtime_prompt'] = str(parsed_data.pop('fused_vlm_prompt', '')).strip()
             existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             parsed_data['original_prompts'] = existing_prompts + [f"[{timestamp}] {transcript}"]
-            logger.info("Take-photo planning_mode=no_planner; skipping stage decomposition")
+            logger.info("Take-photo planning_mode=fused_prompt; persisted fused prompt and skipped stage decomposition")
             return parsed_data
 
         planner_enabled = load_global_execution_config()['planner_enabled']
@@ -5256,6 +5295,8 @@ def fill_template(template_content: str, parsed_data: dict) -> str:
                             ensure_string(parsed_data.get('additional', '')))
     filled = filled.replace('<!-- Enter exactly: take-photo or streaming. -->',
                             ensure_string(parsed_data.get('execution_mode', '')))
+    filled = filled.replace('<!-- The exact prompt copied into TOOL_PROMPT. -->',
+                            ensure_string(parsed_data.get('runtime_prompt', '')))
     
     # Inject original prompts into the ORIGINAL_PROMPTS comment block
     original_prompts = parsed_data.get('original_prompts', [])
@@ -5505,7 +5546,11 @@ async def create_github_issue(text: str):
                 f"score={selection.get('confidence'):.2f}"
             )
         else:
-            selection = parse_issue_selection(text.strip(), available_issues)
+            if TAKE_PHOTO_PLANNING_MODE in {'no_planner', 'fused_prompt'} and not _is_explicit_streaming_request(text):
+                selection = {'mode': 'create', 'issue_number': None, 'issue_title': None}
+                logger.info("Take-photo planning_mode=%s; skipping AI issue selection", TAKE_PHOTO_PLANNING_MODE)
+            else:
+                selection = parse_issue_selection(text.strip(), available_issues)
         
         # Handle list mode
         if selection.get('mode') == 'list':
@@ -5620,7 +5665,9 @@ async def create_github_issue(text: str):
         incomplete_issue['missing_fields'] = []
         incomplete_issue['timestamp'] = None
 
-        if BRAINSTORMING_ENABLED:
+        if BRAINSTORMING_ENABLED and not (
+            TAKE_PHOTO_PLANNING_MODE in {'no_planner', 'fused_prompt'} and parsed_data.get('runtime_prompt')
+        ):
             # Send one open-ended question, then fold the answer into the issue.
             if not pending_ideation['active']:
                 logger.info("Sending ideation question before issue creation")
@@ -7661,9 +7708,9 @@ async def handle_client(websocket):
                                 frame_image = last_frame['image']
                                 frame_base64 = last_frame['base64']
 
-                            if TAKE_PHOTO_PLANNING_MODE == 'no_planner':
+                            if TAKE_PHOTO_PLANNING_MODE in {'no_planner', 'fused_prompt'}:
                                 baseline_result = await asyncio.to_thread(
-                                    _run_take_photo_no_planner,
+                                    _run_take_photo_single_vlm,
                                     tool_name,
                                     data.get('task', ''),
                                     tool_code,

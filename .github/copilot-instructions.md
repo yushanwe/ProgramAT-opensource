@@ -8,12 +8,12 @@ not print results, connect to the backend, or use WebSockets.
 
 ## Take-photo tools
 
-Implement one user-facing task with one concise task-specific prompt:
+Implement one user-facing task by copying the issue's Runtime prompt verbatim; do not author or improve it:
 
 ```python
 from litellm_utils import call_take_photo_baseline_vlm
 
-TOOL_PROMPT = "Describe exactly what this tool should determine from the image."
+TOOL_PROMPT = "Copy the issue's Runtime prompt here verbatim."
 
 
 def main(image, input_data):

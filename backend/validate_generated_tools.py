@@ -221,8 +221,20 @@ def validate_take_photo_baseline(tool_text: str, issue_text: str, rel_path: Path
             f"{rel_path}: take-photo P1 requires exactly one call_take_photo_baseline_vlm() call; "
             f"found {len(baseline_calls)}."
         )
-    if "TOOL_PROMPT" not in _extract_string_constants(tree):
+    tool_prompt = _extract_string_constants(tree).get("TOOL_PROMPT")
+    if tool_prompt is None:
         failures.append(f"{rel_path}: take-photo P1 requires one string TOOL_PROMPT constant.")
+    runtime_prompt_match = re.search(
+        r"^##\s+Runtime\s+prompt\s*$\n(.*?)(?=^##\s+|\Z)",
+        issue_text,
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    if runtime_prompt_match and tool_prompt is not None:
+        runtime_prompt = re.sub(r"^\s*<!--.*?-->\s*", "", runtime_prompt_match.group(1), flags=re.DOTALL).strip()
+        if runtime_prompt and tool_prompt != runtime_prompt:
+            failures.append(
+                f"{rel_path}: TOOL_PROMPT must exactly match the issue Runtime prompt."
+            )
     if extract_copilot_llm_task_categories(tool_text):
         failures.append(f"{rel_path}: take-photo P1 must not call copilot_llm_call().")
     return failures

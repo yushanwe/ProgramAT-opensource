@@ -17,7 +17,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const issue = context.payload.issue;
-            const extraLine = "\n\nWrite this Python tool inside `tools/`. For take-photo mode, define one concise task-specific `TOOL_PROMPT`, import `call_take_photo_baseline_vlm` from `litellm_utils`, call it exactly once with the supplied image and prompt, and return its answer directly. Do not make any other model or specialist calls.";
+            const extraLine = "\n\nWrite this Python tool inside `tools/`. For take-photo mode, copy the issue's Runtime prompt verbatim into `TOOL_PROMPT` without authoring or improving it, import `call_take_photo_baseline_vlm` from `litellm_utils`, call it exactly once with the supplied image and prompt, and return its answer directly. Do not make any other model or specialist calls.";
 
             await github.rest.issues.update({
               owner: context.repo.owner,
