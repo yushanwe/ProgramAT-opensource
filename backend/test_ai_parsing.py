@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from stage_decomposition import build_stage_decomposition_prompt, normalize_stage_plan
+from stage_decomposition import (
+    PLAYING_CARD_STAGE_GOAL,
+    build_stage_decomposition_prompt,
+    normalize_stage_plan,
+)
 
 
 def load_stream_server_function(name: str):
@@ -52,22 +56,16 @@ def load_stream_server_function(name: str):
 class TestIssueTemplateGuidance(unittest.TestCase):
     """Test Copilot-facing issue template guidance."""
 
-    def test_visual_at_template_uses_capability_routing(self):
+    def test_visual_at_template_uses_take_photo_baseline(self):
         template_path = Path(__file__).resolve().parent.parent / ".github" / "ISSUE_TEMPLATE" / "visual_at.md"
         template = template_path.read_text(encoding="utf-8")
 
-        self.assertIn("one user-facing task", template)
-        self.assertIn("If this issue enumerates multiple stages", template)
-        self.assertIn("one ordered `copilot_llm_call(...)` per stage", template)
-        self.assertIn("evaluate and escalate reasoning capabilities", template)
-        self.assertIn("pass useful structured artifacts to later calls", template)
-        self.assertIn("spatial_reasoning", template)
-        self.assertIn("Choose only from these capabilities", template)
-        self.assertNotIn("Capability Pipeline", template)
-        self.assertNotIn("should either utilize Yolo11", template)
-        self.assertNotIn("Google Vision", template)
-        self.assertIn("must not choose implementations", template)
-        self.assertIn("provider-specific `DEFAULT_MODEL` constants", template)
+        for heading in ("Tool name", "Task", "Expected output", "Constraints / examples", "Mode"):
+            self.assertIn(f"## {heading}", template)
+        self.assertIn("call_take_photo_baseline_vlm", template)
+        self.assertIn("TOOL_PROMPT", template)
+        self.assertNotIn("Task Stages", template)
+        self.assertNotIn("copilot_llm_call", template)
 
 
 class TestParserStageIssueIntegration(unittest.TestCase):
@@ -148,6 +146,22 @@ class TestParserStageIssueIntegration(unittest.TestCase):
         self.assertEqual(
             result["stages"],
             [{"goal": "Locate the exit", "capability": "object_detection_localization"}],
+        )
+
+    def test_normalizes_playing_card_stage_goal(self):
+        result = self.normalize({
+            "stages": [{
+                "goal": "Identify the cards and their properties",
+                "capability": "structured_visual_understanding",
+            }],
+        })
+
+        self.assertEqual(
+            result["stages"],
+            [{
+                "goal": "Identify only the playing cards by rank and suit.",
+                "capability": "structured_visual_understanding",
+            }],
         )
 
     def test_parses_fenced_json_with_trailing_text(self):
@@ -254,6 +268,22 @@ class TestParserStageIssueIntegration(unittest.TestCase):
         self.assertIn("Issue creation stopped because stage decomposition failed", source)
         self.assertIn("Always return at least one stage", build_stage_decomposition_prompt("test"))
 
+    def test_routing_disabled_parser_skips_stage_decomposition(self):
+        source = (Path(__file__).resolve().parent / "stream_server.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        parser = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "parse_transcript_with_ai"
+        )
+        parser_source = ast.get_source_segment(source, parser)
+
+        self.assertIn("if not planner_enabled:", parser_source)
+        self.assertIn("parsed_data['stages'] = []", parser_source)
+        self.assertLess(
+            parser_source.index("if not planner_enabled:"),
+            parser_source.index("build_stage_decomposition_prompt"),
+        )
+
     def test_uber_stage_plan_reaches_issue_markdown(self):
         plan = self.normalize(
             {
@@ -283,7 +313,7 @@ class TestParserStageIssueIntegration(unittest.TestCase):
 
         complete = self.normalize_requirements(
             {
-                "problem": "Crowded pickup areas make the correct car difficult to find.",
+                "description": "Find the user's Uber and guide them to it.",
                 "example_usage": "Find my Uber, locate its passenger door, and guide me to it.",
                 "implementation_details": "",
                 "custom_gpt": "no",
@@ -312,6 +342,64 @@ class TestParserStageIssueIntegration(unittest.TestCase):
         self.assertNotIn("select_model(", create_source)
         self.assertNotIn("final_execution_plan", create_source)
         self.assertNotIn("stage_model_selection", create_source)
+
+    def test_mail_sorter_drops_hallucinated_playing_card_stage(self):
+        plan = self.normalize(
+            {
+                "stages": [
+                    {
+                        "goal": "Identify the importance of each piece of mail.",
+                        "capability": "structured_visual_understanding",
+                    },
+                    {
+                        "goal": "Detect playing cards by rank and suit.",
+                        "capability": "structured_visual_understanding",
+                    },
+                    {
+                        "goal": "Read the contents of each letter or package.",
+                        "capability": "ocr",
+                    },
+                ],
+            },
+            ["structured_visual_understanding", "ocr"],
+            source_task="Sort my mail by importance and read each letter or package.",
+        )
+
+        self.assertEqual(
+            plan["stages"],
+            [
+                {
+                    "goal": "Identify the importance of each piece of mail.",
+                    "capability": "structured_visual_understanding",
+                },
+                {
+                    "goal": "Read the contents of each letter or package.",
+                    "capability": "ocr",
+                },
+            ],
+        )
+
+    def test_card_identifier_still_uses_exact_card_stage_goal(self):
+        plan = self.normalize(
+            {
+                "stages": [
+                    {
+                        "goal": "Detect playing cards by rank and suit.",
+                        "capability": "structured_visual_understanding",
+                    },
+                ],
+            },
+            ["structured_visual_understanding"],
+            source_task="Identify the playing cards by rank and suit.",
+        )
+
+        self.assertEqual(
+            plan["stages"],
+            [{
+                "goal": PLAYING_CARD_STAGE_GOAL,
+                "capability": "structured_visual_understanding",
+            }],
+        )
 
 
 class TestSentenceDetectionLogic(unittest.TestCase):
