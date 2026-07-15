@@ -195,7 +195,7 @@ def validate_stage_enforcement(tool_text: str, issue_text: str, rel_path: Path) 
 
 
 def validate_take_photo_baseline(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
-    """Enforce the E1/P1 generation contract for take-photo issues."""
+    """Enforce the unified single-call take-photo generation contract."""
     if not re.search(
         r"^##\s+Mode\s*\n(?:\s*<!--[^\n]*-->\s*\n)?\s*take-photo\s*$",
         issue_text,
@@ -218,25 +218,37 @@ def validate_take_photo_baseline(tool_text: str, issue_text: str, rel_path: Path
     failures = []
     if len(baseline_calls) != 1:
         failures.append(
-            f"{rel_path}: take-photo P1 requires exactly one call_take_photo_baseline_vlm() call; "
+            f"{rel_path}: take-photo tools require exactly one call_take_photo_baseline_vlm() call; "
             f"found {len(baseline_calls)}."
         )
-    tool_prompt = _extract_string_constants(tree).get("TOOL_PROMPT")
+    constants = _extract_string_constants(tree)
+    tool_prompt = constants.get("TOOL_PROMPT")
     if tool_prompt is None:
-        failures.append(f"{rel_path}: take-photo P1 requires one string TOOL_PROMPT constant.")
-    runtime_prompt_match = re.search(
-        r"^##\s+Runtime\s+prompt\s*$\n(.*?)(?=^##\s+|\Z)",
-        issue_text,
-        re.IGNORECASE | re.MULTILINE | re.DOTALL,
-    )
-    if runtime_prompt_match and tool_prompt is not None:
-        runtime_prompt = re.sub(r"^\s*<!--.*?-->\s*", "", runtime_prompt_match.group(1), flags=re.DOTALL).strip()
-        if runtime_prompt and tool_prompt != runtime_prompt:
-            failures.append(
-                f"{rel_path}: TOOL_PROMPT must exactly match the issue Runtime prompt."
-            )
+        failures.append(f"{rel_path}: take-photo tools require one string TOOL_PROMPT constant.")
+    if "TOOL_NAME" not in constants:
+        failures.append(f"{rel_path}: take-photo tools require one string TOOL_NAME constant.")
+    prompt_uses = []
+    for call in baseline_calls:
+        prompt_keyword = next((kw for kw in call.keywords if kw.arg == "prompt"), None)
+        prompt_uses.append(
+            prompt_keyword is not None
+            and isinstance(prompt_keyword.value, ast.Name)
+            and prompt_keyword.value.id == "TOOL_PROMPT"
+        )
+    if prompt_uses != [True]:
+        failures.append(f"{rel_path}: take-photo tools must pass TOOL_PROMPT directly as the helper prompt.")
+    tool_name_uses = []
+    for call in baseline_calls:
+        keyword = next((kw for kw in call.keywords if kw.arg == "tool_name"), None)
+        tool_name_uses.append(
+            keyword is not None
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "TOOL_NAME"
+        )
+    if tool_name_uses != [True]:
+        failures.append(f"{rel_path}: take-photo tools must pass TOOL_NAME directly as tool_name.")
     if extract_copilot_llm_task_categories(tool_text):
-        failures.append(f"{rel_path}: take-photo P1 must not call copilot_llm_call().")
+        failures.append(f"{rel_path}: take-photo tools must not call copilot_llm_call().")
     return failures
 
 
@@ -306,7 +318,6 @@ def validate_files(paths: Iterable[Path], issue_text: Optional[str] = None) -> L
         failures.extend(validate_no_stringified_copilot_results(text, rel_path))
         if issue_text:
             failures.extend(validate_stage_enforcement(text, issue_text, rel_path))
-            failures.extend(validate_take_photo_baseline(text, issue_text, rel_path))
 
     return failures
 
