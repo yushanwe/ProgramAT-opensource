@@ -1,6 +1,14 @@
+from __future__ import annotations
+
 import io
 import base64
-from PIL import Image
+import importlib.util
+from pathlib import Path
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 
 def extract_text(response) -> str:
@@ -23,7 +31,19 @@ def extract_text(response) -> str:
 
 def pil_image_to_data_uri(pil_image: Image.Image, quality: int = 85) -> str:
     """Convert a PIL image to a JPEG base64 data URI."""
+    if Image is None:
+        raise ImportError("Pillow is required for pil_image_to_data_uri")
     buffer = io.BytesIO()
     pil_image.save(buffer, format='JPEG', quality=quality)
     image_base64 = base64.b64encode(buffer.getvalue()).decode('ascii')
     return f'data:image/jpeg;base64,{image_base64}'
+
+
+_BACKEND_LITELLM_UTILS_PATH = Path(__file__).resolve().parent.parent / "backend" / "litellm_utils.py"
+_BACKEND_LITELLM_UTILS_SPEC = importlib.util.spec_from_file_location(
+    "_programat_backend_litellm_utils",
+    _BACKEND_LITELLM_UTILS_PATH,
+)
+_BACKEND_LITELLM_UTILS = importlib.util.module_from_spec(_BACKEND_LITELLM_UTILS_SPEC)
+_BACKEND_LITELLM_UTILS_SPEC.loader.exec_module(_BACKEND_LITELLM_UTILS)
+call_take_photo_baseline_vlm = _BACKEND_LITELLM_UTILS.call_take_photo_baseline_vlm

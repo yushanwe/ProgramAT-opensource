@@ -16,7 +16,7 @@ class TestTakePhotoBaseline(unittest.TestCase):
         tools_dir = Path(__file__).resolve().parent.parent / "tools"
         tool_names = (
             "camera_aiming", "clothing_recognition", "door_detection",
-            "empty_seat_detection", "live_ocr", "object_recognition",
+            "empty_seat_detection", "identify_uber_car", "live_ocr", "object_recognition",
             "scene_description",
         )
         for tool_name in tool_names:
