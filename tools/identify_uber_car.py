@@ -5,7 +5,8 @@ from litellm_utils import call_take_photo_baseline_vlm
 TOOL_NAME = "identify_uber_car"
 TOOL_PROMPT = (
     "Identify the car directly in front of the user so they can verify whether it is their Uber. "
-    "Name the brand, make, model, color, and license plate number if visible. "
+    "Name the brand or make, model, color, and license plate number if visible. "
+    "If the brand and make appear to be the same, say it only once. "
     "If any detail is not visible or uncertain, say that clearly. "
     "If no car is clearly visible, say 'No car is clearly visible.' "
     "Return a concise, audio-friendly answer."
