@@ -1,4 +1,5 @@
 import re
+from collections import Counter
 
 from litellm_utils import call_take_photo_baseline_vlm
 
@@ -17,12 +18,26 @@ _CARD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Module-level state for sequential single-user use.
+# This tool is designed for sequential frame processing; not intended for
+# concurrent multi-user access (consistent with camera_aiming.py pattern).
 _before_hand = None  # stores parsed card list from the before-photo invocation
 
 
 def _parse_cards(description):
     """Return a list of card strings found in a VLM description."""
-    return [m.lower() for m in _CARD_PATTERN.findall(description)]
+    return [match.lower() for match in _CARD_PATTERN.findall(description)]
+
+
+def _find_missing_cards(before, after):
+    """Return cards present in before but removed from after, handling duplicates."""
+    before_counts = Counter(before)
+    after_counts = Counter(after)
+    missing = []
+    for card, count in before_counts.items():
+        diff = count - after_counts.get(card, 0)
+        missing.extend([card] * max(diff, 0))
+    return missing
 
 
 def main(image, input_data):
@@ -38,7 +53,7 @@ def main(image, input_data):
         return "No playing cards detected. Please try again with your full hand visible."
     before = list(_before_hand)
     _before_hand = None
-    missing = [c for c in before if c not in cards]
+    missing = _find_missing_cards(before, cards)
     if len(missing) == 1:
         return f"You played the {missing[0]}."
     if len(missing) > 1:

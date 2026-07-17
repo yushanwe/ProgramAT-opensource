@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(1, str(Path(__file__).resolve().parent.parent / 'tools'))
 
 import card_identification
-from card_identification import _parse_cards, main
+from card_identification import _parse_cards, _find_missing_cards, main
 
 
 def _blank_image():
@@ -46,6 +46,31 @@ class TestParseCards(unittest.TestCase):
     def test_partial_sentence(self):
         result = _parse_cards("I can see the jack of clubs in the image.")
         self.assertEqual(result, ["jack of clubs"])
+
+
+class TestFindMissingCards(unittest.TestCase):
+    def test_single_missing_card(self):
+        before = ["ace of spades", "seven of hearts", "three of diamonds"]
+        after = ["ace of spades", "three of diamonds"]
+        self.assertEqual(_find_missing_cards(before, after), ["seven of hearts"])
+
+    def test_no_missing_cards(self):
+        before = ["ace of spades", "seven of hearts"]
+        after = ["ace of spades", "seven of hearts"]
+        self.assertEqual(_find_missing_cards(before, after), [])
+
+    def test_duplicate_card_one_removed(self):
+        before = ["ace of spades", "ace of spades", "three of diamonds"]
+        after = ["ace of spades", "three of diamonds"]
+        self.assertEqual(_find_missing_cards(before, after), ["ace of spades"])
+
+    def test_all_cards_missing(self):
+        before = ["ace of spades", "seven of hearts"]
+        after = []
+        self.assertCountEqual(
+            _find_missing_cards(before, after),
+            ["ace of spades", "seven of hearts"],
+        )
 
 
 class TestMain(unittest.TestCase):
