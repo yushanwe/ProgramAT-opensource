@@ -17,7 +17,7 @@ class TestTakePhotoBaseline(unittest.TestCase):
         tool_names = (
             "camera_aiming", "clothing_recognition", "door_detection",
             "empty_seat_detection", "live_ocr", "object_recognition",
-            "scene_description",
+            "play_card_identifier", "scene_description",
         )
         for tool_name in tool_names:
             tree = ast.parse((tools_dir / f"{tool_name}.py").read_text(encoding="utf-8"))
