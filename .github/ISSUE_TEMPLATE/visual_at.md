@@ -10,27 +10,65 @@ assignees: ''
 -->
 
 ## Tool name
+
 <!-- A short Python-friendly name for the tool. -->
 
 ## Task
+
 <!-- What should the tool determine from the camera image? -->
 
 ## Expected output
+
 <!-- What should the spoken answer contain? -->
 
 ## Constraints / examples
+
 <!-- Important constraints, edge cases, and example inputs or answers. -->
 
 ## Mode
-<!-- Enter exactly: take-photo or streaming. -->
 
-For take-photo tools, follow the generated `Task Stages` exactly. Implement one
-ordered `copilot_llm_call(...)` per stage using its declared capability and goal.
-Pass the original image to each visual stage. Pass useful earlier `artifact`
-values explicitly through `metadata={"previous_stage_artifact": ...}` and/or the
-next stage's messages. Return only the final stage's `response`. Do not fuse the
-stages into one prompt, select models, add retries, or add evaluators.
+<!-- Enter exactly: take_photo or hosted_video_streaming. -->
 
-Tools belong in `tools/`, must be Python, and must expose `main(image,
-input_data)`. Return concise audio-friendly text. Do not connect to the backend
-server or use WebSockets; the backend supplies the image and delivers the result.
+<!-- Use take_photo for a static current-frame task, even if it may be run
+continuously. Use hosted_video_streaming only when the answer requires recent
+history, sequence, duration, before/after comparison, or what just happened. -->
+
+### Take-photo implementation guidance
+
+For a take-photo tool, author one concise, task-specific `TOOL_PROMPT` from
+Task, Expected output, and Constraints / examples. Preserve the requested
+behavior and output format, make the final answer accessible and audio-friendly,
+and include a clear fallback when the requested visual information is unavailable.
+Before writing the prompt, determine whether the task can be completed as one
+operation or contains genuinely dependent subproblems. Default to no steps. If
+one operation is sufficient, use one direct instruction even when the issue has
+multiple output constraints. Do not create steps merely to restate the issue
+fields. Only when a later conclusion depends on earlier visual findings should
+the single fused prompt contain a concise ordered sequence; numbered instructions
+are optional when they improve reliability.
+
+The sequence must request only the final answer. Never turn prompt-level steps
+into runtime stages, multiple model calls, router stages, specialist calls,
+cascades, evaluators, or verification calls. Do not include capability names
+unless naturally needed.
+
+Every take-photo tool must define exactly one `TOOL_PROMPT`, call
+`call_take_photo_vlm` exactly once, and return its answer directly.
+It must declare `EXECUTION_MODE = "take_photo"` and must not declare
+`VIDEO_CONFIG`. The same tool may be streamed as independent single-frame calls.
+
+### Hosted-video streaming implementation guidance
+
+For `hosted_video_streaming`, generate only `TOOL_NAME`, `EXECUTION_MODE =
+"hosted_video_streaming"`, required literal `VIDEO_CONFIG`, optional literal `OUTPUT_CONFIG`,
+and a task-specific `TOOL_PROMPT`. The shared runtime owns FFmpeg clip encoding,
+hosted NVIDIA requests,
+filtering, deduplication, result delivery, and cleanup. Do not generate frame
+processing, buffers, asynchronous loops, model calls, or take-photo imports.
+`VIDEO_CONFIG` must include valid `window_seconds`, `interval_seconds`,
+`minimum_span_seconds`, and `minimum_unique_frames`. `TOOL_PROMPT` must state
+what chronological or early/late state-change evidence to compare.
+
+Tools belong in `tools/` and must be Python. Take-photo tools expose
+`main(image, input_data)`; hosted-video tools contain only the declarative
+constants above. Do not connect to the backend server or use WebSockets.
