@@ -8,7 +8,7 @@ Expose `main(image, input_data)` with exactly two parameters. `image` is an
 OpenCV BGR array and `input_data` is a dictionary. Return concise,
 audio-friendly text; do not print.
 
-For a take-photo tool, use this shape:
+For a take-photo tool, import the established capability client:
 
 ```python
 from litellm_utils import call_take_photo_vlm
