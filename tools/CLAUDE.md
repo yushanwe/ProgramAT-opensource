@@ -11,14 +11,33 @@ audio-friendly text; do not print.
 For a take-photo tool, import the established capability client:
 
 ```python
-from model_router_client import copilot_llm_call
+from litellm_utils import call_take_photo_vlm
+
+TOOL_NAME = "tool_name"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = "One concise task-specific fused prompt."
+
+
+def main(image, input_data):
+    if image is None:
+        return "No camera image is available."
+    return call_take_photo_vlm(
+        image=image, prompt=TOOL_PROMPT, tool_name=TOOL_NAME
+    )
 ```
 
-Follow the issue's `Task Stages` exactly: one ordered call per stage, with the
-declared capability and step-specific goal. Pass useful prior artifacts to later
-calls, keep the original image available to visual stages, and return the final
-call's `response`. Do not fuse stages or choose models, retries, evaluators, or
-fallbacks. See `.github/copilot-instructions.md` for the full handoff contract.
+Make exactly one helper call and return it directly. Do not add another model or
+specialist call, verification pass, fallback model, model name, or provider SDK.
+Author one concise fused prompt following the detailed guidance in
+`.github/copilot-instructions.md`.
 
-For streaming tools, preserve existing streaming behavior and keep responses to
-about 15 spoken words. Do not change NVIDIA hosted streaming or RTVI code.
+Static `take_photo` tools may also stream; each selected frame is processed
+independently through the same one-image prompt. Static tools must not declare
+`VIDEO_CONFIG` or keep temporal state.
+
+For `hosted_video_streaming`, declare `TOOL_NAME`, `EXECUTION_MODE`,
+`TOOL_PROMPT`, required literal `VIDEO_CONFIG`, and optional literal
+`OUTPUT_CONFIG` only. The prompt must describe the chronological evidence to
+compare. The shared runtime owns the continuous video
+session and output filtering. Do not import take-photo helpers or implement
+buffering, FFmpeg, model calls, asynchronous loops, or before/after state.
