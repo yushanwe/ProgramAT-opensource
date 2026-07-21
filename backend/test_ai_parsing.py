@@ -11,11 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from stage_decomposition import (
-    PLAYING_CARD_STAGE_GOAL,
-    build_stage_decomposition_prompt,
-    normalize_stage_plan,
-)
 
 
 def load_stream_server_function(name: str):
@@ -56,366 +51,50 @@ def load_stream_server_function(name: str):
 class TestIssueTemplateGuidance(unittest.TestCase):
     """Test Copilot-facing issue template guidance."""
 
-    def test_visual_at_template_uses_separate_task_stages(self):
+    def test_visual_at_template_uses_take_photo_vlm(self):
         template_path = Path(__file__).resolve().parent.parent / ".github" / "ISSUE_TEMPLATE" / "visual_at.md"
         template = template_path.read_text(encoding="utf-8")
 
         for heading in ("Tool name", "Task", "Expected output", "Constraints / examples", "Mode"):
             self.assertIn(f"## {heading}", template)
-        self.assertIn("Task Stages", template)
-        self.assertIn("copilot_llm_call", template)
-        self.assertNotIn("call_take_photo_baseline_vlm", template)
-        self.assertNotIn("TOOL_PROMPT", template)
+            self.assertIn(f"## {heading}\n\n<!--", template)
+        self.assertIn("call_take_photo_vlm", template)
+        self.assertIn("TOOL_PROMPT", template)
+        self.assertIn("author one concise, task-specific `TOOL_PROMPT`", template)
+        self.assertNotIn("Task Stages", template)
+        self.assertNotIn("copilot_llm_call", template)
 
         instructions_path = template_path.parent.parent / "copilot-instructions.md"
         instructions = instructions_path.read_text(encoding="utf-8")
-        self.assertIn("one ordered call per declared stage", instructions)
-        self.assertIn("earlier `artifact` values", instructions)
-        self.assertIn("last call's `response`", instructions)
+        self.assertTrue(instructions.startswith("# ProgramAT Copilot instructions\n"))
+        self.assertIn("### Prompt examples", instructions)
+        self.assertIn("Simple task—use one direct instruction with no steps", instructions)
+        self.assertIn("Complex task—use one fused prompt", instructions)
+        self.assertEqual(instructions.count("```text"), 2)
+        self.assertIn("requested task is achievable", instructions)
+        self.assertIn("as one operation", instructions)
+        self.assertIn("Default to the simpler prompt", instructions)
+        self.assertIn("does not need steps", instructions)
+        self.assertIn("Do not create steps merely to restate", instructions)
+        self.assertIn("one direct instruction", instructions)
+        self.assertIn("ordered sequence of sub-tasks inside the single", instructions)
+        self.assertIn("may use numbered instructions", instructions)
+        self.assertIn("Never turn them", instructions)
+        self.assertIn("into runtime stages, multiple model calls", instructions)
 
-
-class TestParserStageIssueIntegration(unittest.TestCase):
-    """Test parser-owned stage normalization and issue-section wiring."""
-
-    def setUp(self):
-        self.normalize_requirements = load_stream_server_function("_normalize_issue_creation_requirements")
-        self.extraction_prompt = load_stream_server_function("_build_issue_extraction_prompt")
-        self.merge_outputs = load_stream_server_function("_merge_issue_and_stage_outputs")
-        self.normalize = normalize_stage_plan
-        self.render = load_stream_server_function("_build_task_stages_markdown")
-        self.append_stages = load_stream_server_function("_append_task_stages_to_issue_body")
-        self.parse_json = load_stream_server_function("_parse_llm_json_object")
-        self.response_field_only = load_stream_server_function("_response_field_only")
-
-    def test_mobile_payload_uses_only_atomic_response_field(self):
-        structured = {
-            "response": "Turn right toward the exit.",
-            "artifact": {"detections": [{"label": "exit"}]},
-            "implementation": "navigator",
-            "capability": "navigation",
-        }
-
-        self.assertEqual(
-            self.response_field_only(structured),
-            "Turn right toward the exit.",
-        )
-
-    def test_custom_gpt_no_does_not_require_query(self):
-        normalized = self.normalize_requirements(
-            {
-                "description": "Find the user's Uber and guide them to it.",
-                "example_usage": "Find the white Toyota and guide me to its passenger door.",
-                "live_mode": "yes",
-                "live_query": "",
-                "missing_fields": ["live_query"],
-            },
-            "Custom GPT: No",
-        )
-
-        self.assertEqual(normalized["custom_gpt"], "no")
-        self.assertEqual(normalized["gpt_query"], "")
-        self.assertEqual(normalized["missing_fields"], [])
-
-    def test_parser_uses_separate_extraction_and_decomposition_contracts(self):
-        task = "Find my Uber, locate the passenger-side door, and guide me to it."
-        extraction = self.extraction_prompt(task)
-        decomposition = build_stage_decomposition_prompt(task)
-
-        self.assertIn('"missing_fields"', extraction)
-        self.assertNotIn('"stages"', extraction)
-        self.assertIn('"stages"', decomposition)
-        self.assertIn('"goal"', decomposition)
-        self.assertIn('"capability"', decomposition)
-        self.assertIn("Each stage must contain exactly two fields: goal and capability", decomposition)
-        self.assertNotIn('"missing_fields"', decomposition)
-
-    def test_parser_contract_contains_fields_only_for_both_prompt_modes(self):
-        extraction = self.extraction_prompt("Identify the playing card. Only say rank and suit.")
-
-        self.assertNotIn('"fused_vlm_prompt"', extraction)
-        self.assertIn("Do not generate or improve a VLM prompt", extraction)
-        self.assertIn("Do not return stages, subtasks, reasoning steps", extraction)
-        self.assertNotIn('"stages"', extraction)
-
-    def test_take_photo_parser_contract_has_no_prompt_or_stage_fields(self):
-        extraction = self.extraction_prompt("Read the medication label.")
-        self.assertNotIn('"fused_vlm_prompt"', extraction)
-
-    def test_merges_only_stages_into_issue_data(self):
-        issue_data = {"title": "Find my Uber", "missing_fields": []}
-        decomposition_data = {
-            "stages": [
-                {"goal": "Find the vehicle", "capability": "object_detection_localization"},
-                {"goal": "Guide the user", "capability": "navigation"},
-            ],
-        }
-
-        merged = self.merge_outputs(issue_data, decomposition_data)
-
-        self.assertEqual(merged["title"], "Find my Uber")
-        self.assertIs(merged["stages"], decomposition_data["stages"])
-        self.assertEqual(set(merged), {"title", "missing_fields", "stages"})
-
-    def test_normalizes_legacy_object_detection_stage(self):
-        result = self.normalize({
-            "stages": [{"goal": "Locate the exit", "capability": "object_detection"}],
-        })
-
-        self.assertEqual(
-            result["stages"],
-            [{"goal": "Locate the exit", "capability": "object_detection_localization"}],
-        )
-
-    def test_normalizes_playing_card_stage_goal(self):
-        result = self.normalize({
-            "stages": [{
-                "goal": "Identify the cards and their properties",
-                "capability": "structured_visual_understanding",
-            }],
-        })
-
-        self.assertEqual(
-            result["stages"],
-            [{
-                "goal": "Identify only the playing cards by rank and suit.",
-                "capability": "structured_visual_understanding",
-            }],
-        )
-
-    def test_parses_fenced_json_with_trailing_text(self):
-        result = self.parse_json(
-            '```json\n{"stages":[{"goal":"Guide the user","capability":"navigation"}]}\n```\nDone.'
-        )
-
-        self.assertEqual(result["stages"][0]["capability"], "navigation")
-
-    def test_preserves_single_stage(self):
-        result = self.normalize(
-            {
-                "stages": [{
-                    "goal": "Extract the medication instructions.",
-                    "capability": "ocr",
-                }],
-            },
-            ["ocr", "general_reasoning"],
-        )
-
-        self.assertEqual(result, {"stages": [{"goal": "Extract the medication instructions.", "capability": "ocr"}]})
-
-    def test_preserves_multi_stage_order(self):
-        result = self.normalize(
-            {
-                "stages": [
-                    {
-                        "goal": "Identify the user's vehicle.",
-                        "capability": "object_detection_localization",
-                    },
-                    {
-                        "goal": "Locate the passenger-side handle.",
-                        "capability": "spatial_reasoning",
-                    },
-                ],
-            },
-            ["object_detection_localization", "spatial_reasoning"],
-        )
-
-        self.assertEqual(
-            result["stages"],
-            [
-                {"goal": "Identify the user's vehicle.", "capability": "object_detection_localization"},
-                {"goal": "Locate the passenger-side handle.", "capability": "spatial_reasoning"},
-            ],
-        )
-        self.assertTrue(all(set(stage) == {"goal", "capability"} for stage in result["stages"]))
-
-    def test_rejects_fields_outside_the_planner_schema(self):
-        with self.assertRaisesRegex(ValueError, "only goal and capability"):
-            self.normalize(
-                {
-                    "stages": [{
-                        "goal": "Read the label.",
-                        "capability": "ocr",
-                        "extra": "not allowed",
-                    }],
-                },
-                ["ocr"],
-            )
-
-        with self.assertRaisesRegex(ValueError, "only the stages field"):
-            self.normalize(
-                {
-                    "stages": [{"goal": "Read the label.", "capability": "ocr"}],
-                    "extra": "not allowed",
-                },
-                ["ocr"],
-            )
-
-    def test_rejects_empty_stage_list(self):
-        with self.assertRaisesRegex(ValueError, "non-empty stages list"):
-            self.normalize({"stages": []}, ["ocr"])
-
-    def test_rejects_unknown_capability_name(self):
-        with self.assertRaisesRegex(ValueError, "unknown capability"):
-            self.normalize(
-                {
-                    "stages": [{
-                        "goal": "Find the target object.",
-                        "capability": "not_a_real_capability",
-                    }],
-                },
-                ["object_detection_localization", "navigation"],
-            )
-
-    def test_issue_flow_contains_task_stages_section_and_logging(self):
-        source = (Path(__file__).resolve().parent / "stream_server.py").read_text(encoding="utf-8")
-        stage_plan = {
-            "stages": [{
-                "goal": "Locate the passenger-side handle.",
-                "capability": "spatial_reasoning",
-            }],
-        }
-        markdown = self.render(stage_plan)
-
-        self.assertIn("## Task Stages", markdown)
-        self.assertIn("### Stage 1", markdown)
-        self.assertIn("**Goal:** Locate the passenger-side handle.", markdown)
-        self.assertIn("**Expected output:** Final concise spoken response.", markdown)
-        self.assertIn("**Depends on:** Original image and user request.", markdown)
-        self.assertIn("Including Task Stages in GitHub issue", source)
-        self.assertIn("Issue body stage handoff", source)
-        self.assertIn("Issue creation stopped because stage decomposition failed", source)
-        self.assertIn("Always return at least one stage", build_stage_decomposition_prompt("test"))
-
-    def test_take_photo_parser_runs_stage_decomposition_when_planner_enabled(self):
-        source = (Path(__file__).resolve().parent / "stream_server.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        parser = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "parse_transcript_with_ai"
-        )
-        parser_source = ast.get_source_segment(source, parser)
-
-        self.assertNotIn("execution_mode != 'streaming'", parser_source)
-        self.assertIn("build_stage_decomposition_prompt", parser_source)
-        self.assertIn("planning_mode=separate_steps", parser_source)
-
-    def test_uber_stage_plan_reaches_issue_markdown(self):
-        plan = self.normalize(
-            {
-                "stages": [
-                    {
-                        "goal": "Identify the white Toyota Camry with plate ABC123.",
-                        "capability": "object_detection_localization",
-                    },
-                    {
-                        "goal": "Locate the passenger-side door.",
-                        "capability": "spatial_reasoning",
-                    },
-                    {
-                        "goal": "Guide the user toward the passenger-side door.",
-                        "capability": "navigation",
-                    },
-                ],
-            },
-            ["object_detection_localization", "spatial_reasoning", "navigation"],
-        )
-        markdown = self.render(plan)
-
-        self.assertIn("## Task Stages", markdown)
-        self.assertIn("### Stage 1", markdown)
-        self.assertIn("### Stage 2", markdown)
-        self.assertIn("### Stage 3", markdown)
-        self.assertIn("useful outputs from stages 1-2", markdown)
-
-        complete = self.normalize_requirements(
-            {
-                "description": "Find the user's Uber and guide them to it.",
-                "example_usage": "Find my Uber, locate its passenger door, and guide me to it.",
-                "implementation_details": "",
-                "custom_gpt": "no",
-                "gpt_query": "",
-            },
-            "Custom GPT: No",
-        )
-        body = self.append_stages("**Feature Description**\nUber guidance", plan)
-
-        self.assertEqual(complete["missing_fields"], [])
-        self.assertIn("## Task Stages", body)
-        self.assertIn("### Stage 3", body)
-        self.assertEqual(body, f"**Feature Description**\nUber guidance\n\n{markdown}\n")
-
-    def test_issue_creation_path_does_not_call_model_router(self):
-        source_path = Path(__file__).resolve().parent / "stream_server.py"
-        source = source_path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        create_node = next(
-            node for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_github_issue"
-        )
-        create_source = ast.get_source_segment(source, create_node)
-
-        self.assertNotIn("_build_tool_planning_context", create_source)
-        self.assertNotIn("select_model(", create_source)
-        self.assertNotIn("final_execution_plan", create_source)
-        self.assertNotIn("stage_model_selection", create_source)
-
-    def test_mail_sorter_drops_hallucinated_playing_card_stage(self):
-        plan = self.normalize(
-            {
-                "stages": [
-                    {
-                        "goal": "Identify the importance of each piece of mail.",
-                        "capability": "structured_visual_understanding",
-                    },
-                    {
-                        "goal": "Detect playing cards by rank and suit.",
-                        "capability": "structured_visual_understanding",
-                    },
-                    {
-                        "goal": "Read the contents of each letter or package.",
-                        "capability": "ocr",
-                    },
-                ],
-            },
-            ["structured_visual_understanding", "ocr"],
-            source_task="Sort my mail by importance and read each letter or package.",
-        )
-
-        self.assertEqual(
-            plan["stages"],
-            [
-                {
-                    "goal": "Identify the importance of each piece of mail.",
-                    "capability": "structured_visual_understanding",
-                },
-                {
-                    "goal": "Read the contents of each letter or package.",
-                    "capability": "ocr",
-                },
-            ],
-        )
-
-    def test_card_identifier_still_uses_exact_card_stage_goal(self):
-        plan = self.normalize(
-            {
-                "stages": [
-                    {
-                        "goal": "Detect playing cards by rank and suit.",
-                        "capability": "structured_visual_understanding",
-                    },
-                ],
-            },
-            ["structured_visual_understanding"],
-            source_task="Identify the playing cards by rank and suit.",
-        )
-
-        self.assertEqual(
-            plan["stages"],
-            [{
-                "goal": PLAYING_CARD_STAGE_GOAL,
-                "capability": "structured_visual_understanding",
-            }],
-        )
+        self.assertIn("### Take-photo implementation guidance", template)
+        self.assertIn("Default to no steps", template)
+        self.assertIn("one operation is sufficient", template)
+        self.assertIn("Do not create steps merely to restate", template)
+        self.assertIn("numbered instructions", template)
+        self.assertIn("are optional when they improve reliability", template)
+        self.assertIn("Never turn", template)
+        self.assertIn("multiple model calls", template)
+        self.assertIn("hosted_video_streaming", template)
+        self.assertIn("TOOL_PROMPT", template)
+        self.assertIn("runtime owns FFmpeg clip encoding", template)
+        self.assertIn("Hosted-video streaming tools", instructions)
+        self.assertIn("Never infer execution mode from the filename", instructions)
 
 
 class TestSentenceDetectionLogic(unittest.TestCase):
