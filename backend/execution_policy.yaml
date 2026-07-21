@@ -1,10 +1,6 @@
 global:
-  planner_enabled: true
-  routing_enabled: false
   system_model:
     implementation: llama_planner
-  default_llm_when_routing_disabled:
-    implementation: moondream_cloud
 
 streaming:
   frame_selector:
@@ -13,6 +9,14 @@ streaming:
     similarity_threshold: 0.985
     max_similarity_to_last_sent: 0.990
     max_skip_frames: 20
+
+mode_execution:
+  take-photo:
+    cascade: default_reasoning
+    planner_mode: FUSED_PROMPT
+  streaming:
+    cascade: default_reasoning
+    planner_mode: FUSED_PROMPT
 
 implementations:
   moondream_cloud:
@@ -39,6 +43,10 @@ implementations:
     kind: model
     model: openai/gpt-4o-mini
 
+  gpt5:
+    kind: openai_responses
+    model: gpt-5
+
   google_vision:
     kind: google_vision
 
@@ -55,38 +63,8 @@ implementations:
 cascade_profiles:
   default_reasoning:
     candidates:
-      - moondream_cloud
       - gemini_flash_lite
-      - gpt4o
+      - gpt5
     evaluator: gpt4o-mini
-
-  ocr:
-    candidates:
-      - mistral_ocr
-    evaluator: gpt4o-mini
-
-general_reasoning:
-  cascade: default_reasoning
-
-ocr:
-  cascade: ocr
-  specialized: true
-
-object_detection_localization:
-  implementation: yolo
-  specialized: true
-
-structured_visual_understanding:
-  cascade: default_reasoning
-
-spatial_reasoning:
-  cascade: default_reasoning
-
-navigation:
-  cascade: default_reasoning
-
-camera_motion:
-  cascade: default_reasoning
-
-temporal_reasoning:
-  cascade: default_reasoning
+    result_passing: failed_attempts
+    condition: C3_PASS_FAILED_ATTEMPTS
