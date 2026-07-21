@@ -161,17 +161,57 @@ def call_model(
     )
 
 
-TAKE_PHOTO_BASELINE_MODEL = "gemini/gemini-3.1-flash-lite-preview"
+def _extract_responses_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str):
+        return output_text.strip()
+    parts: List[str] = []
+    for item in getattr(response, "output", None) or []:
+        for content in getattr(item, "content", None) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts).strip()
 
 
-def call_take_photo_baseline_vlm(
-    image: Any, prompt: str, tool_name: Optional[str] = None,
+def call_openai_responses_model(
+    model_name: str,
+    prompt: str,
+    image: Any,
+    *,
+    reasoning_effort: str = "medium",
 ) -> str:
-    """Make the single fixed Gemini Flash Lite call used by take-photo P1 and P2."""
-    response = call_model(
-        model_name=TAKE_PHOTO_BASELINE_MODEL,
-        messages=[{"role": "user", "content": str(prompt).strip()}],
-        images=[image],
-        metadata={"num_retries": 0},
+    """Call one OpenAI Responses API model with one fresh multimodal request."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=resolve_api_key(model_name), max_retries=0)
+    response = client.responses.create(
+        model=model_name,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": str(prompt).strip()},
+                {"type": "input_image", "image_url": _image_to_data_uri(image)},
+            ],
+        }],
+        reasoning={"effort": reasoning_effort},
     )
-    return extract_text(response)
+    return _extract_responses_text(response)
+
+
+def call_take_photo_vlm(
+    image: Any,
+    prompt: str,
+    tool_name: Optional[str] = None,
+    *,
+    mode: str = "take-photo",
+    request_id: Optional[str] = None,
+) -> str:
+    """Delegate the fused prompt to the mode's YAML-configured cascade."""
+    # Imported lazily because model_router uses the individual provider wrappers
+    # in this module when constructing its implementation executor registry.
+    from model_router import run_mode_cascade
+
+    return run_mode_cascade(
+        mode=mode, prompt=prompt, image=image, request_id=request_id
+    )
