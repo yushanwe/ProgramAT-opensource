@@ -211,6 +211,21 @@ TOOL_PROMPT = "Compare chronological early and late frames and report whether th
             [],
         )
 
+    def test_temporal_sign_language_tool_is_valid_hosted_video_declaration(self):
+        issue = "## Mode\n\nhosted_video_streaming\n"
+        tool_path = (
+            Path(__file__).resolve().parent.parent
+            / "tools"
+            / "temporal_sign_language_gesture_recognition.py"
+        )
+        tool_text = tool_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            validate_generated_tools.validate_rtvi_streaming_tool(
+                tool_text, issue, Path("tools/temporal_sign_language_gesture_recognition.py")
+            ),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
