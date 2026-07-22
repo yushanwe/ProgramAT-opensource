@@ -667,20 +667,6 @@ def _tool_execution_mode(tool_code: str) -> str:
     return str(value or '').strip().lower().replace('-', '_')
 
 
-TEMPORAL_TAKE_PHOTO_ERROR = (
-    'This tool requires recent visual history and is only supported in streaming mode.'
-)
-
-
-def _tool_requires_temporal_context(tool_code: str) -> bool:
-    """Return whether a generated tool declares the rolling-window contract."""
-    return _tool_execution_mode(tool_code) == 'hosted_video_streaming'
-
-
-def _take_photo_mode_error(tool_code: str) -> Optional[str]:
-    return TEMPORAL_TAKE_PHOTO_ERROR if _tool_requires_temporal_context(tool_code) else None
-
-
 def _validated_rtvi_tool(tool_code: str) -> tuple[str, str]:
     name = _literal_tool_metadata(tool_code, 'TOOL_NAME')
     mode = _literal_tool_metadata(tool_code, 'EXECUTION_MODE')
@@ -736,6 +722,31 @@ def _filter_rtvi_event(
             return None, 'duplicate'
     session['last_emitted_events'][key] = (current_start, current_end, event_time)
     return normalized, 'accepted'
+
+
+def _generic_temporal_user_result(content: str) -> str:
+    """Return user-facing text and never expose a provider JSON object."""
+    normalized = ' '.join(str(content or '').strip().split())
+    if not normalized:
+        return 'No clear result detected.'
+    candidate = normalized
+    if candidate.startswith('```') and candidate.endswith('```'):
+        candidate = re.sub(r'^```(?:json)?\s*|\s*```$', '', candidate).strip()
+    if candidate.startswith(('{', '[')):
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 'I could not produce a clear result.'
+        if isinstance(parsed, dict):
+            for key in (
+                'result', 'text', 'message', 'answer', 'phrase', 'label',
+                'description',
+            ):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    return ' '.join(value.split())
+        return 'I could not produce a clear result.'
+    return normalized
 
 
 def _apply_played_card_semantic_transition(
@@ -1248,7 +1259,10 @@ async def _run_hosted_gemini_images(
             input_bytes, debug_path,
         )
         inference_started = time.perf_counter()
-        content, usage = await infer_images_with_gemini(images, session['prompt'], model_id)
+        output_schema = session.get('output_config', {}).get('schema')
+        content, usage = await infer_images_with_gemini(
+            images, session['prompt'], model_id, output_schema
+        )
         inference_ms = (time.perf_counter() - inference_started) * 1000
         usage_value = _metadata_json_value(usage)
         image_tokens = sum(
@@ -1295,9 +1309,10 @@ async def _run_hosted_gemini_images(
                     json.dumps(parsed, ensure_ascii=False, sort_keys=True), decision,
                 )
         else:
-            parsed = content
+            parsed = None
+            user_result = _generic_temporal_user_result(content)
             accepted, decision = _filter_rtvi_event(
-                session, content, window_start, window_end, time.monotonic()
+                session, user_result, window_start, window_end, time.monotonic()
             )
             if accepted is None:
                 logger.info(
@@ -1495,9 +1510,10 @@ async def _run_hosted_nvidia_clip(
                      'no_event' if decision == 'stable_no_event' else 'uncertain'),
                 )
         else:
-            parsed = content
+            parsed = None
+            user_result = _generic_temporal_user_result(content)
             accepted, decision = _filter_rtvi_event(
-                session, content, window_start, window_end, time.monotonic()
+                session, user_result, window_start, window_end, time.monotonic()
             )
         if accepted is None:
             logger.info(
@@ -2153,6 +2169,66 @@ def _run_take_photo_vlm(
         mode=mode,
         request_id=request_id,
     )
+
+
+def _resolve_tool_prompt(tool_code: str) -> Optional[str]:
+    """Resolve the prompt already declared by a generated tool without executing it."""
+    try:
+        tree = ast.parse(tool_code or '')
+    except SyntaxError:
+        return None
+
+    string_values: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                string_values[target.id] = value.value
+
+    declared_prompt = string_values.get('TOOL_PROMPT')
+    if declared_prompt and declared_prompt.strip():
+        return declared_prompt.strip()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        is_copilot_call = (
+            isinstance(node.func, ast.Name) and node.func.id == 'copilot_llm_call'
+        ) or (
+            isinstance(node.func, ast.Attribute) and node.func.attr == 'copilot_llm_call'
+        )
+        if not is_copilot_call:
+            continue
+        messages_kw = next((kw.value for kw in node.keywords if kw.arg == 'messages'), None)
+        if not isinstance(messages_kw, (ast.List, ast.Tuple)):
+            continue
+        for message_node in messages_kw.elts:
+            if not isinstance(message_node, ast.Dict):
+                continue
+            message = {
+                key.value: value
+                for key, value in zip(message_node.keys, message_node.values)
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            role_node = message.get('role')
+            if not (
+                isinstance(role_node, ast.Constant)
+                and role_node.value == 'user'
+            ):
+                continue
+            content_node = message.get('content')
+            if isinstance(content_node, ast.Constant) and isinstance(content_node.value, str):
+                return content_node.value.strip() or None
+            if isinstance(content_node, ast.Name):
+                prompt = string_values.get(content_node.id, '').strip()
+                if prompt:
+                    return prompt
+    return None
 
 
 def _streaming_embedding_similarity(
@@ -5363,6 +5439,11 @@ Only block creation when the core task is genuinely unclear.
 - A task answerable from the current frame is "take_photo", even when the user
   may run it continuously. Static identification, recognition, OCR, description,
   and classification do not become temporal merely because Streaming is available.
+- If correct interpretation may require several recent frames, classify the
+  whole tool as temporal even when some examples can be recognized statically.
+  In particular, a sign-language request involving recent hand movement, a sign
+  lasting several seconds, or the sign/phrase just made is temporal. A request
+  to identify only the current held hand posture is static.
 - Do not generate or improve a VLM prompt.
 - Do not return stages, subtasks, reasoning steps, capabilities, routes, or models.
 
@@ -5380,6 +5461,30 @@ Return ONLY this JSON object:
 {context_info}
 Transcript: {transcript}
 """
+
+
+def _request_explicitly_requires_temporal_context(text: str) -> bool:
+    """Recognize explicit cross-moment semantics without guessing from task nouns."""
+    normalized = ' '.join(str(text or '').casefold().split())
+    temporal_patterns = (
+        r'\brecent (?:visual |hand |body )?(?:history|movement|movements|frames?)\b',
+        r'\b(?:movement|movements|motion|gesture|sign|phrase)\b.{0,50}\b(?:sequence|duration|lasts?|lasting|seconds?)\b',
+        r'\b(?:sequence|duration|before|after|early|late)\b.{0,50}\b(?:frames?|movement|movements|motion|state|change|gesture|sign)\b',
+        r'\bwhat (?:has )?just happened\b',
+        r'\b(?:what|sign|phrase|gesture)\b.{0,35}\bjust (?:made|happened|did|occurred)\b',
+        r'\bcompare\b.{0,50}\b(?:before|after|earlier|later|frames?|states?)\b',
+    )
+    return any(re.search(pattern, normalized) for pattern in temporal_patterns)
+
+
+def _select_visual_execution_mode(suggested_mode: Any, original_request: str) -> str:
+    """Normalize the parser suggestion while preventing explicit temporal downgrades."""
+    if _request_explicitly_requires_temporal_context(original_request):
+        return 'hosted_video_streaming'
+    normalized = str(suggested_mode or '').strip().lower()
+    aliases = {'take-photo': 'take_photo', 'streaming': 'hosted_video_streaming'}
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {'take_photo', 'hosted_video_streaming'} else 'take_photo'
 
 
 def _normalize_issue_creation_requirements(
@@ -5444,13 +5549,11 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
         )
 
         parsed_data = _normalize_issue_creation_requirements(issue_data, transcript)
-        execution_mode = str(issue_data.get('execution_mode') or '').strip().lower()
-        mode_aliases = {'take-photo': 'take_photo', 'streaming': 'hosted_video_streaming'}
-        parsed_data['execution_mode'] = mode_aliases.get(execution_mode, execution_mode)
-        if parsed_data['execution_mode'] not in {
-            'take_photo', 'hosted_video_streaming'
-        }:
-            parsed_data['execution_mode'] = 'take_photo'
+        prior_requests = (existing_data or {}).get('original_prompts', [])
+        mode_semantics = '\n'.join([*(str(item) for item in prior_requests), transcript])
+        parsed_data['execution_mode'] = _select_visual_execution_mode(
+            issue_data.get('execution_mode'), mode_semantics
+        )
         parsed_data['stages'] = []
         
         # Preserve the original transcript for bookkeeping
@@ -5487,6 +5590,7 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
             'gpt_query': '',
             'alternatives': '',
             'additional': '',
+            'execution_mode': _select_visual_execution_mode('', transcript),
             'parser_failed': True,
             'parser_error': str(e),
             'missing_fields': fallback_missing_fields,
@@ -7833,17 +7937,6 @@ async def handle_client(websocket):
                                 tool_path=tool_path,
                                 client_tool_code=tool_code,
                             )
-                            mode_error = _take_photo_mode_error(resolved_tool_code)
-                            if mode_error:
-                                await websocket.send(json.dumps({
-                                    'type': 'tool_result',
-                                    'tool_name': tool_name,
-                                    'status': 'error',
-                                    'error': mode_error,
-                                    'result': mode_error,
-                                    'timestamp': datetime.now().isoformat(),
-                                }))
-                                continue
                             # Use frame from message if provided, otherwise use last streaming frame
                             frame_image = None
                             frame_base64 = None
