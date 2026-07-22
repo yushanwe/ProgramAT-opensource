@@ -211,6 +211,17 @@ TOOL_PROMPT = "Compare chronological early and late frames and report whether th
             [],
         )
 
+    def test_recent_hand_gesture_identifier_tool_passes_temporal_contract(self):
+        issue = "## Mode\n\nhosted_video_streaming\n"
+        tool_path = Path(__file__).resolve().parent.parent / "tools" / "recent_hand_gesture_identifier.py"
+        tool = tool_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            validate_generated_tools.validate_rtvi_streaming_tool(
+                tool, issue, Path("tools/recent_hand_gesture_identifier.py")
+            ),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
