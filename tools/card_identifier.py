@@ -10,18 +10,21 @@ VIDEO_CONFIG = {
 }
 TOOL_PROMPT = """
 When multiple chronological recent frames are available, inspect them from
-earliest to latest to determine the user's intent. If the user points at one
-card, identify only that card. If the user swipes across multiple cards,
-identify each clearly readable card in swipe order and return them as a comma-
-separated list. Use only standard ranks (ace through king) and suits (clubs,
-diamonds, hearts, spades).
+earliest to latest and decide between pointing and swiping. Only treat it as a
+swipe when there is a clear continuous left-to-right or right-to-left motion
+across multiple cards. For a swipe, return all clearly readable cards in that
+swipe direction order as a comma-separated list.
 
-When only one image is available, use only clear static evidence: identify a
-single clearly indicated card, or list multiple clearly readable cards from
-left to right if no motion cue is available. Do not invent unseen motion or
-cards.
+Otherwise treat it as pointing, including when the user shifts from one pointed
+card to another without a continuous sweep. For pointing, return exactly one
+card: the last clearly indicated card from the latest stable frames.
+
+When only one image is available, use only static evidence and return exactly
+one clearly indicated card; do not list multiple cards without motion evidence.
+Use only standard ranks (ace through king) and suits (clubs, diamonds, hearts,
+spades), and do not invent unseen cards or motion.
 
 Return only the concise spoken answer, for example "Nine of hearts." or "Nine
-of hearts, two of spades, jack of diamonds." If no card can be read clearly,
+of hearts, two of spades, jack of diamonds." If evidence is insufficient,
 return exactly "No clear card detected."
 """

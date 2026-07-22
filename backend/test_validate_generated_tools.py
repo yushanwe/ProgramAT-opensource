@@ -317,6 +317,9 @@ take_photo
         constants = validate_generated_tools._extract_literal_constants(ast.parse(text))
         self.assertEqual(constants.get("EXECUTION_MODE"), "hosted_video_streaming")
         self.assertIn("VIDEO_CONFIG", constants)
+        tool_prompt = constants.get("TOOL_PROMPT", "").lower()
+        self.assertIn("left-to-right or right-to-left", tool_prompt)
+        self.assertIn("last clearly indicated card", tool_prompt)
         self.assertEqual(validate_generated_tools.validate_take_photo_tool(text, issue, path), [])
         self.assertEqual(validate_generated_tools.validate_rtvi_streaming_tool(text, issue, path), [])
 
