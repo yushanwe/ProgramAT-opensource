@@ -297,6 +297,25 @@ TOOL_PROMPT = "Inspect chronological hand motion and identify the signed phrase.
         )
         self.assertTrue(any("card-specific prompt" in failure for failure in failures))
 
+    def test_card_identifier_file_validates_as_temporal_when_issue_mode_says_take_photo(self):
+        issue = """## Task
+identify cards in hand by pointing or swiping
+
+## Expected output
+When pointing, say "Nine of hearts." When swiping, say "Nine of hearts, two of spades, jack of diamonds."
+
+## Constraints / examples
+swiping requires temporal action understanding
+
+## Mode
+
+take_photo
+"""
+        path = Path(validate_generated_tools.TOOLS_DIR / "card_identifier.py")
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(validate_generated_tools.validate_take_photo_tool(text, issue, path), [])
+        self.assertEqual(validate_generated_tools.validate_rtvi_streaming_tool(text, issue, path), [])
+
 
 if __name__ == "__main__":
     unittest.main()
