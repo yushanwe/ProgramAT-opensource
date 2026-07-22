@@ -11,11 +11,9 @@ from litellm_utils import call_take_photo_vlm
 TOOL_NAME = "locate_empty_chairs"
 EXECUTION_MODE = "take_photo"
 TOOL_PROMPT = (
-    "Follow this sequence using the same image:\n"
-    "1. Identify any chairs, benches, couches, or other seating visible in the scene.\n"
-    "2. Determine which visible seats appear unoccupied (no person sitting in them).\n"
-    "3. Select the nearest unoccupied seat.\n"
-    "4. Give concise spoken guidance toward it, such as direction and approximate distance.\n"
+    "Identify any chairs, benches, couches, or other seating visible in the scene, "
+    "determine which seats appear unoccupied, select the nearest suitable option, "
+    "and give concise spoken guidance toward it. "
     "If no empty seat is visible, say so. Return only the final spoken guidance."
 )
 
