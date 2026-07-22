@@ -10,14 +10,16 @@ VIDEO_CONFIG = {
 }
 TOOL_PROMPT = """
 When multiple chronological recent frames are available, inspect them from
-earliest to latest and decide between pointing and swiping. Only treat it as a
-swipe when there is a clear continuous left-to-right or right-to-left motion
-across multiple cards. For a swipe, return all clearly readable cards in that
-swipe direction order as a comma-separated list.
+earliest to latest and decide between pointing and swiping. Treat it as a swipe
+when a finger continuously travels through multiple cards in sequence, even if
+the path is straight, curved, angled, or semicircular. For a swipe, return all
+clearly readable cards in the order the finger passes through them as a
+comma-separated list.
 
 Otherwise treat it as pointing, including when the user shifts from one pointed
-card to another without a continuous sweep. For pointing, return exactly one
-card: the last clearly indicated card from the latest stable frames.
+card to another without continuous pass-through motion across multiple cards.
+For pointing, return exactly one card: the last clearly indicated card from the
+latest stable frames.
 
 When only one image is available, use only static evidence and return exactly
 one clearly indicated card; do not list multiple cards without motion evidence.
