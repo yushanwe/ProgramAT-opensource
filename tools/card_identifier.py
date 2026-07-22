@@ -4,14 +4,9 @@ TOOL_NAME = "card_identifier"
 EXECUTION_MODE = "hosted_video_streaming"
 VIDEO_CONFIG = {
     "window_seconds": 6,
-    "interval_seconds": 3,
-    "overlap_seconds": 3,
+    "interval_seconds": 1,
     "minimum_span_seconds": 4,
-    "minimum_unique_frames": 8,
-}
-OUTPUT_CONFIG = {
-    "deduplicate": True,
-    "cooldown_seconds": 2,
+    "minimum_unique_frames": 6,
 }
 TOOL_PROMPT = """
 When multiple chronological recent frames are available, inspect them from

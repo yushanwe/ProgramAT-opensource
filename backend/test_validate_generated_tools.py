@@ -1,5 +1,6 @@
 """Tests for generated-tool router guardrails."""
 
+import ast
 import tempfile
 import unittest
 from pathlib import Path
@@ -313,6 +314,9 @@ take_photo
 """
         path = Path(validate_generated_tools.TOOLS_DIR / "card_identifier.py")
         text = path.read_text(encoding="utf-8")
+        constants = validate_generated_tools._extract_literal_constants(ast.parse(text))
+        self.assertEqual(constants.get("EXECUTION_MODE"), "hosted_video_streaming")
+        self.assertIn("VIDEO_CONFIG", constants)
         self.assertEqual(validate_generated_tools.validate_take_photo_tool(text, issue, path), [])
         self.assertEqual(validate_generated_tools.validate_rtvi_streaming_tool(text, issue, path), [])
 
