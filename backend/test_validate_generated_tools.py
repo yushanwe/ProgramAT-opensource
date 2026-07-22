@@ -211,6 +211,23 @@ TOOL_PROMPT = "Compare chronological early and late frames and report whether th
             [],
         )
 
+    def test_temporal_hand_gesture_tool_is_declarative_and_temporal(self):
+        tool_path = (
+            Path(__file__).resolve().parent.parent
+            / "tools"
+            / "temporal_hand_gesture_identification.py"
+        )
+        tool_text = tool_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            validate_generated_tools.validate_rtvi_streaming_tool(
+                tool_text, "## Mode\n\nhosted_video_streaming\n", tool_path
+            ),
+            [],
+        )
+        self.assertIn("No clear hand gesture.", tool_text)
+        self.assertNotIn("call_take_photo_vlm", tool_text)
+
 
 if __name__ == "__main__":
     unittest.main()
