@@ -9,14 +9,8 @@ TOOL_PROMPT = (
     "is visible, say exactly \"0 empty chairs. No empty seat is visible.\" Return only the final user-facing result."
 )
 TOOL_POLICY = {
-    "strategy": "parallel_aggregate",
+    "strategy": "parallel_progressive",
     "models": ["moondream", "gemini-3.1-flash-lite", "gpt-5"],
-    "aggregator": "gpt-4o-mini",
-    "aggregation_prompt": (
-        "You are combining three model answers in this order: Moondream, Gemini, GPT-5. "
-        "Return exactly three concise spoken lines prefixed 'Moondream:', 'Gemini:', and 'GPT-5:' "
-        "using each model's answer. Keep each line concise and audio-friendly."
-    ),
 }
 
 
