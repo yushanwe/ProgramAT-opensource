@@ -2270,6 +2270,17 @@ def _progressive_invocation_is_fresh(
     )
 
 
+def _progressive_invocation_in_flight(client_id: str, tool_name: str) -> bool:
+    key = _progressive_invocation_key(client_id, tool_name)
+    record = active_progressive_invocations.get(key)
+    if not isinstance(record, dict):
+        return False
+    if record.get('cancelled') is not None and record['cancelled'].is_set():
+        return False
+    task = record.get('task')
+    return isinstance(task, asyncio.Task) and not task.done()
+
+
 def _log_progressive_task_error(task: asyncio.Task) -> None:
     if task.cancelled():
         return
@@ -2834,6 +2845,15 @@ async def _try_send_visual_state(
         seconds_since_last_sent is not None
         and seconds_since_last_sent >= forced_interval_seconds
     )
+    tool_name = str(tool_config.get('tool', {}).get('name') or '')
+    progressive_in_flight = bool(
+        tool_name and _progressive_invocation_in_flight(client_id, tool_name)
+    )
+    progressive_in_flight_same_scene = bool(
+        progressive_in_flight
+        and last_sent_similarity is not None
+        and last_sent_similarity >= difference_threshold
+    )
     clip_gating_failed = bool(
         state_embedding is None
         or (
@@ -2912,6 +2932,23 @@ async def _try_send_visual_state(
             tool_config, state, 'clip_gating_failed_open', source,
             now, last_sent_similarity, in_flight_similarity,
         )
+    elif progressive_in_flight_same_scene:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_progressive_in_flight_same_scene', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        if tool_config.get('deferred_visual_state') is state:
+            tool_config['deferred_visual_state'] = None
+        else:
+            deferred_state = _optional_state(tool_config, 'deferred_visual_state')
+            if (
+                deferred_state is not None
+                and deferred_state.get('state_id') == state.get('state_id')
+            ):
+                tool_config['deferred_visual_state'] = None
+        if tool_config.get('active_visual_state') is state:
+            state['sent'] = True
+        return False
     elif forced_interval_elapsed:
         _log_visual_state_decision(
             tool_config, state, 'forced_key_frame_interval_elapsed', source,
@@ -2981,6 +3018,14 @@ async def _try_send_visual_state(
         seconds_since_last_sent is not None
         and seconds_since_last_sent >= forced_interval_seconds
     )
+    progressive_in_flight = bool(
+        tool_name and _progressive_invocation_in_flight(client_id, tool_name)
+    )
+    progressive_in_flight_same_scene = bool(
+        progressive_in_flight
+        and last_sent_similarity is not None
+        and last_sent_similarity >= difference_threshold
+    )
     clip_gating_failed = bool(
         state.get('embedding') is None
         or (
@@ -2994,6 +3039,20 @@ async def _try_send_visual_state(
             tool_config, state, 'clip_gating_failed_open', source,
             now, last_sent_similarity, in_flight_similarity,
         )
+    elif progressive_in_flight_same_scene:
+        _log_visual_state_decision(
+            tool_config, state, 'skipped_progressive_in_flight_same_scene', source,
+            now, last_sent_similarity, in_flight_similarity,
+        )
+        deferred_state = _optional_state(tool_config, 'deferred_visual_state')
+        if (
+            deferred_state is not None
+            and deferred_state.get('state_id') == state.get('state_id')
+        ):
+            tool_config['deferred_visual_state'] = None
+        if tool_config.get('active_visual_state') is state:
+            state['sent'] = True
+        return False
     elif forced_interval_elapsed:
         _log_visual_state_decision(
             tool_config, state, 'forced_key_frame_interval_elapsed', source,

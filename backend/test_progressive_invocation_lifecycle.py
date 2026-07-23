@@ -16,6 +16,7 @@ def load_lifecycle_helpers():
         "_progressive_invocation_key",
         "_obsolete_progressive_invocation",
         "_progressive_invocation_is_fresh",
+        "_progressive_invocation_in_flight",
     }
     nodes = [
         node for node in tree.body
@@ -56,6 +57,47 @@ class ProgressiveInvocationLifecycleTests(unittest.TestCase):
         self.assertTrue(old["cancelled"].is_set())
         self.assertFalse(is_fresh(key, old))
         self.assertTrue(is_fresh(key, new))
+
+    def test_in_flight_detects_running_task_only(self):
+        namespace = load_lifecycle_helpers()
+        key = ("client", "tool")
+
+        async def run_case():
+            blocker = asyncio.Event()
+
+            async def hold():
+                await blocker.wait()
+
+            task = asyncio.create_task(hold())
+            namespace["active_progressive_invocations"][key] = {
+                "invocation_id": "run",
+                "cancelled": threading.Event(),
+                "task": task,
+            }
+            self.assertTrue(
+                namespace["_progressive_invocation_in_flight"]("client", "tool")
+            )
+            blocker.set()
+            await task
+
+            self.assertFalse(
+                namespace["_progressive_invocation_in_flight"]("client", "tool")
+            )
+
+            cancelled = threading.Event()
+            cancelled.set()
+            cancelled_task = asyncio.create_task(asyncio.sleep(0))
+            namespace["active_progressive_invocations"][key] = {
+                "invocation_id": "cancelled",
+                "cancelled": cancelled,
+                "task": cancelled_task,
+            }
+            self.assertFalse(
+                namespace["_progressive_invocation_in_flight"]("client", "tool")
+            )
+            await cancelled_task
+
+        asyncio.run(run_case())
 
 
 if __name__ == "__main__":
