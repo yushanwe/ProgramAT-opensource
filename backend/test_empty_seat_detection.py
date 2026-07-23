@@ -33,7 +33,7 @@ class EmptySeatDetectionTests(unittest.TestCase):
         self.assertIn("rough distance", constants["TOOL_PROMPT"])
         self.assertEqual(
             constants["TOOL_POLICY"],
-            {"strategy": "single", "models": ["moondream"]},
+            {"strategy": "single", "models": ["gpt-5"]},
         )
 
     def test_main_handles_none_image(self):
