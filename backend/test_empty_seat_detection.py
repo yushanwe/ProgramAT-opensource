@@ -28,11 +28,12 @@ class EmptySeatDetectionTests(unittest.TestCase):
         self.assertEqual(constants["EXECUTION_MODE"], "take_photo")
         self.assertTrue(isinstance(constants["TOOL_PROMPT"], str) and constants["TOOL_PROMPT"].strip())
         self.assertIn("blind or low-vision user", constants["TOOL_PROMPT"])
+        self.assertIn("empty chairs", constants["TOOL_PROMPT"])
         self.assertIn("clock-face direction", constants["TOOL_PROMPT"])
         self.assertIn("rough distance", constants["TOOL_PROMPT"])
         self.assertEqual(
             constants["TOOL_POLICY"],
-            {"strategy": "single", "models": ["gemini-3.1-flash-lite"]},
+            {"strategy": "single", "models": ["moondream"]},
         )
 
     def test_main_handles_none_image(self):
