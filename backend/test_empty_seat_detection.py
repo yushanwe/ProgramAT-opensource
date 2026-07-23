@@ -35,13 +35,12 @@ class EmptySeatDetectionTests(unittest.TestCase):
             constants["TOOL_POLICY"],
             {
                 "strategy": "parallel_aggregate",
-                "models": ["moondream", "gemini-3.1-flash-lite", "gpt-5"],
+                "models": ["gpt-4o-mini", "gemini-3.1-flash-lite", "gpt-5"],
                 "aggregator": "gpt-4o-mini",
                 "aggregation_prompt": (
-                    "You are combining three model answers in this order: Moondream, Gemini, GPT-5. "
-                    "Return exactly three concise lines prefixed 'Moondream:', 'Gemini:', and 'GPT-5:' "
-                    "using each model's answer, then one final concise line prefixed 'Recommendation:' "
-                    "with the best guidance for a blind or low-vision user."
+                    "You are combining three model answers in this order: GPT-4o-mini, Gemini, GPT-5. "
+                    "Return exactly three short spoken lines prefixed 'Quick:', 'Balanced:', and 'Detailed:' "
+                    "using each model's answer. Keep each line concise and audio-friendly."
                 ),
             },
         )
