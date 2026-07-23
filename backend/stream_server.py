@@ -2275,7 +2275,8 @@ def _progressive_invocation_in_flight(client_id: str, tool_name: str) -> bool:
     record = active_progressive_invocations.get(key)
     if not isinstance(record, dict):
         return False
-    if record.get('cancelled') is not None and record['cancelled'].is_set():
+    cancelled = record.get('cancelled')
+    if cancelled and cancelled.is_set():
         return False
     task = record.get('task')
     return isinstance(task, asyncio.Task) and not task.done()
@@ -2721,6 +2722,19 @@ def _optional_state(tool_config: Dict[str, Any], key: str) -> Optional[Dict[str,
     return state if isinstance(state, dict) else None
 
 
+def _clear_matching_deferred_visual_state(
+    tool_config: Dict[str, Any], state: Dict[str, Any]
+) -> None:
+    deferred_state = _optional_state(tool_config, 'deferred_visual_state')
+    if deferred_state is None:
+        return
+    if (
+        deferred_state is state
+        or deferred_state.get('state_id') == state.get('state_id')
+    ):
+        tool_config['deferred_visual_state'] = None
+
+
 def _streaming_state_age_seconds(state: Dict[str, Any], now: float) -> float:
     return now - state['last_seen_at']
 
@@ -2937,15 +2951,7 @@ async def _try_send_visual_state(
             tool_config, state, 'skipped_progressive_in_flight_same_scene', source,
             now, last_sent_similarity, in_flight_similarity,
         )
-        if tool_config.get('deferred_visual_state') is state:
-            tool_config['deferred_visual_state'] = None
-        else:
-            deferred_state = _optional_state(tool_config, 'deferred_visual_state')
-            if (
-                deferred_state is not None
-                and deferred_state.get('state_id') == state.get('state_id')
-            ):
-                tool_config['deferred_visual_state'] = None
+        _clear_matching_deferred_visual_state(tool_config, state)
         if tool_config.get('active_visual_state') is state:
             state['sent'] = True
         return False
@@ -2959,15 +2965,7 @@ async def _try_send_visual_state(
             tool_config, state, 'skipped_too_similar_to_last_sent', source,
             now, last_sent_similarity, in_flight_similarity,
         )
-        if tool_config.get('deferred_visual_state') is state:
-            tool_config['deferred_visual_state'] = None
-        else:
-            deferred_state = _optional_state(tool_config, 'deferred_visual_state')
-            if (
-                deferred_state is not None
-                and deferred_state.get('state_id') == state.get('state_id')
-            ):
-                tool_config['deferred_visual_state'] = None
+        _clear_matching_deferred_visual_state(tool_config, state)
         if tool_config.get('active_visual_state') is state:
             state['sent'] = True
         return False
@@ -3044,12 +3042,7 @@ async def _try_send_visual_state(
             tool_config, state, 'skipped_progressive_in_flight_same_scene', source,
             now, last_sent_similarity, in_flight_similarity,
         )
-        deferred_state = _optional_state(tool_config, 'deferred_visual_state')
-        if (
-            deferred_state is not None
-            and deferred_state.get('state_id') == state.get('state_id')
-        ):
-            tool_config['deferred_visual_state'] = None
+        _clear_matching_deferred_visual_state(tool_config, state)
         if tool_config.get('active_visual_state') is state:
             state['sent'] = True
         return False
@@ -3063,12 +3056,7 @@ async def _try_send_visual_state(
             tool_config, state, 'skipped_too_similar_to_last_sent', source,
             now, last_sent_similarity, in_flight_similarity,
         )
-        deferred_state = _optional_state(tool_config, 'deferred_visual_state')
-        if (
-            deferred_state is not None
-            and deferred_state.get('state_id') == state.get('state_id')
-        ):
-            tool_config['deferred_visual_state'] = None
+        _clear_matching_deferred_visual_state(tool_config, state)
         if tool_config.get('active_visual_state') is state:
             state['sent'] = True
         return False
