@@ -24,7 +24,7 @@ TOOL_POLICY = {
 def main(image, input_data):
     if image is None:
         return "No camera image is available."
-    metadata = {"needs_accuracy": bool((input_data or {}).get("needs_accuracy", False))}
+    metadata = {"needs_accuracy": (input_data or {}).get("needs_accuracy", False)}
     return execute_tool_policy(
         image=image,
         prompt=TOOL_PROMPT,
