@@ -8,7 +8,12 @@ TOOL_PROMPT = (
     "closest empty seat's clock-face direction and rough distance in feet, without other visual landmarks. If no empty seat "
     "is visible, say exactly \"0 empty chairs. No empty seat is visible.\" Return only the final user-facing result."
 )
-TOOL_POLICY = {"strategy": "single", "models": ["gpt-5"]}
+TOOL_POLICY = {
+    "strategy": "cascade",
+    "models": ["gemini-3.1-flash-lite", "gpt-5"],
+    "evaluator": "gpt-4o-mini",
+    "stop_condition": "accepted",
+}
 
 
 def main(image, input_data):

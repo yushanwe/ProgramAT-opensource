@@ -33,7 +33,12 @@ class EmptySeatDetectionTests(unittest.TestCase):
         self.assertIn("rough distance", constants["TOOL_PROMPT"])
         self.assertEqual(
             constants["TOOL_POLICY"],
-            {"strategy": "single", "models": ["gpt-5"]},
+            {
+                "strategy": "cascade",
+                "models": ["gemini-3.1-flash-lite", "gpt-5"],
+                "evaluator": "gpt-4o-mini",
+                "stop_condition": "accepted",
+            },
         )
 
     def test_main_handles_none_image(self):
