@@ -6,7 +6,7 @@ TOOL_PROMPT = (
     "You are guiding a blind or low-vision user. Follow this sequence in the same image: "
     "1) identify visible chairs or other seats; 2) determine which visible seats are clearly unoccupied; "
     "3) choose the nearest suitable empty seat and return one short, fast user-facing instruction using only "
-    "clock-face direction (for example 11 o'clock) and rough distance (for example 2 meters or 6 feet), "
+    "clock-face direction (for example 11 o'clock) and rough distance in feet (for example 6 feet), "
     "without using other visual landmarks. If no empty seat is visible, say exactly "
     "\"No empty seat is visible.\" Return only the final user-facing result."
 )
