@@ -9,26 +9,24 @@ TOOL_PROMPT = (
     "is visible, say exactly \"0 empty chairs. No empty seat is visible.\" Return only the final user-facing result."
 )
 TOOL_POLICY = {
-    "strategy": "conditional",
-    "condition": {"key": "needs_accuracy", "equals": True},
-    "if_true": {"strategy": "single", "models": ["gpt-5"]},
-    "if_false": {
-        "strategy": "cascade",
-        "models": ["gemini-3.1-flash-lite", "gpt-5"],
-        "evaluator": "gpt-4o-mini",
-        "stop_condition": "accepted",
-    },
+    "strategy": "parallel_aggregate",
+    "models": ["moondream", "gemini-3.1-flash-lite", "gpt-5"],
+    "aggregator": "gpt-4o-mini",
+    "aggregation_prompt": (
+        "You are combining three model answers in this order: Moondream, Gemini, GPT-5. "
+        "Return exactly three concise lines prefixed 'Moondream:', 'Gemini:', and 'GPT-5:' "
+        "using each model's answer, then one final concise line prefixed 'Recommendation:' "
+        "with the best guidance for a blind or low-vision user."
+    ),
 }
 
 
 def main(image, input_data):
     if image is None:
         return "No camera image is available."
-    metadata = {"needs_accuracy": (input_data or {}).get("needs_accuracy", False)}
     return execute_tool_policy(
         image=image,
         prompt=TOOL_PROMPT,
         policy=TOOL_POLICY,
         tool_name=TOOL_NAME,
-        metadata=metadata,
     )

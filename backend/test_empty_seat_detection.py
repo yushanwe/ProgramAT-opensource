@@ -34,15 +34,15 @@ class EmptySeatDetectionTests(unittest.TestCase):
         self.assertEqual(
             constants["TOOL_POLICY"],
             {
-                "strategy": "conditional",
-                "condition": {"key": "needs_accuracy", "equals": True},
-                "if_true": {"strategy": "single", "models": ["gpt-5"]},
-                "if_false": {
-                    "strategy": "cascade",
-                    "models": ["gemini-3.1-flash-lite", "gpt-5"],
-                    "evaluator": "gpt-4o-mini",
-                    "stop_condition": "accepted",
-                },
+                "strategy": "parallel_aggregate",
+                "models": ["moondream", "gemini-3.1-flash-lite", "gpt-5"],
+                "aggregator": "gpt-4o-mini",
+                "aggregation_prompt": (
+                    "You are combining three model answers in this order: Moondream, Gemini, GPT-5. "
+                    "Return exactly three concise lines prefixed 'Moondream:', 'Gemini:', and 'GPT-5:' "
+                    "using each model's answer, then one final concise line prefixed 'Recommendation:' "
+                    "with the best guidance for a blind or low-vision user."
+                ),
             },
         )
 
@@ -61,15 +61,7 @@ class EmptySeatDetectionTests(unittest.TestCase):
             prompt=module.TOOL_PROMPT,
             policy=module.TOOL_POLICY,
             tool_name=module.TOOL_NAME,
-            metadata={"needs_accuracy": False},
         )
-
-    def test_main_sets_needs_accuracy_metadata_from_input(self):
-        module = self._load_tool_module()
-        fake_image = object()
-        with patch.object(module, "execute_tool_policy", return_value="done") as call:
-            module.main(fake_image, {"needs_accuracy": True})
-        self.assertEqual(call.call_args.kwargs["metadata"], {"needs_accuracy": True})
 
     def _load_tool_module(self):
         spec = importlib.util.spec_from_file_location("empty_seat_detection", TOOL_PATH)
