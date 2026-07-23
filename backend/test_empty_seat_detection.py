@@ -11,16 +11,22 @@ TOOL_PATH = TOOLS_DIR / "empty_seat_detection.py"
 class EmptySeatDetectionTests(unittest.TestCase):
     def test_declares_required_constants(self):
         tree = ast.parse(TOOL_PATH.read_text(encoding="utf-8"))
-        constants = {
-            node.targets[0].id: ast.literal_eval(node.value)
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in {"TOOL_NAME", "EXECUTION_MODE", "TOOL_POLICY"}
-        }
+        constants = {}
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in {"TOOL_NAME", "EXECUTION_MODE", "TOOL_PROMPT", "TOOL_POLICY"}
+            ):
+                name = node.targets[0].id
+                if isinstance(node.value, ast.Constant):
+                    constants[name] = node.value.value
+                else:
+                    constants[name] = ast.literal_eval(node.value)
         self.assertEqual(constants["TOOL_NAME"], "empty_seat_detection")
         self.assertEqual(constants["EXECUTION_MODE"], "take_photo")
+        self.assertTrue(isinstance(constants["TOOL_PROMPT"], str) and constants["TOOL_PROMPT"].strip())
         self.assertEqual(
             constants["TOOL_POLICY"],
             {"strategy": "single", "models": ["gemini-3.1-flash-lite"]},
