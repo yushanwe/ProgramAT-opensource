@@ -9,16 +9,26 @@ TOOL_PROMPT = (
     "is visible, say exactly \"0 empty chairs. No empty seat is visible.\" Return only the final user-facing result."
 )
 TOOL_POLICY = {
-    "strategy": "cascade",
-    "models": ["gemini-3.1-flash-lite", "gpt-5"],
-    "evaluator": "gpt-4o-mini",
-    "stop_condition": "accepted",
+    "strategy": "conditional",
+    "condition": {"key": "needs_accuracy", "equals": True},
+    "if_true": {"strategy": "single", "models": ["gpt-5"]},
+    "if_false": {
+        "strategy": "cascade",
+        "models": ["gemini-3.1-flash-lite", "gpt-5"],
+        "evaluator": "gpt-4o-mini",
+        "stop_condition": "accepted",
+    },
 }
 
 
 def main(image, input_data):
     if image is None:
         return "No camera image is available."
+    metadata = {"needs_accuracy": bool((input_data or {}).get("needs_accuracy", False))}
     return execute_tool_policy(
-        image=image, prompt=TOOL_PROMPT, policy=TOOL_POLICY, tool_name=TOOL_NAME
+        image=image,
+        prompt=TOOL_PROMPT,
+        policy=TOOL_POLICY,
+        tool_name=TOOL_NAME,
+        metadata=metadata,
     )

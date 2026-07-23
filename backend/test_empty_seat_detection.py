@@ -34,10 +34,15 @@ class EmptySeatDetectionTests(unittest.TestCase):
         self.assertEqual(
             constants["TOOL_POLICY"],
             {
-                "strategy": "cascade",
-                "models": ["gemini-3.1-flash-lite", "gpt-5"],
-                "evaluator": "gpt-4o-mini",
-                "stop_condition": "accepted",
+                "strategy": "conditional",
+                "condition": {"key": "needs_accuracy", "equals": True},
+                "if_true": {"strategy": "single", "models": ["gpt-5"]},
+                "if_false": {
+                    "strategy": "cascade",
+                    "models": ["gemini-3.1-flash-lite", "gpt-5"],
+                    "evaluator": "gpt-4o-mini",
+                    "stop_condition": "accepted",
+                },
             },
         )
 
@@ -56,7 +61,15 @@ class EmptySeatDetectionTests(unittest.TestCase):
             prompt=module.TOOL_PROMPT,
             policy=module.TOOL_POLICY,
             tool_name=module.TOOL_NAME,
+            metadata={"needs_accuracy": False},
         )
+
+    def test_main_sets_needs_accuracy_metadata_from_input(self):
+        module = self._load_tool_module()
+        fake_image = object()
+        with patch.object(module, "execute_tool_policy", return_value="done") as call:
+            module.main(fake_image, {"needs_accuracy": True})
+        self.assertEqual(call.call_args.kwargs["metadata"], {"needs_accuracy": True})
 
     def _load_tool_module(self):
         spec = importlib.util.spec_from_file_location("empty_seat_detection", TOOL_PATH)
