@@ -459,6 +459,54 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(emit_progressive.await_count, 1)
 
+    async def test_confirmed_scene_change_starts_new_three_model_run(self):
+        emitted = []
+
+        async def emit(event):
+            emitted.append(event)
+            return True
+
+        runtime = ToolRuntime(
+            client_id="client",
+            tool_name="empty_seat_detection",
+            tool_version="v1",
+            session_id="session",
+            frame_store=FrameStore(),
+            emit_callback=emit,
+        )
+        await empty_seat_detection.on_stream_start(runtime, {})
+        image = np.full((32, 32, 3), 80, dtype=np.uint8)
+        frame1 = ToolFrame(1, 1.0, image, 32, 32)
+        frame2 = ToolFrame(3, 2.0, image.copy(), 32, 32)
+        frame3 = ToolFrame(5, 3.0, image.copy(), 32, 32)
+
+        e1 = np.array([1.0, 0.0], dtype=np.float32)
+        e2 = np.array([0.0, 1.0], dtype=np.float32)
+        e3 = np.array([-1.0, 0.0], dtype=np.float32)
+
+        with patch.object(
+            empty_seat_detection,
+            "_call_selected_model",
+            side_effect=lambda model, provider, frame, prompt: f"{model} result",
+        ) as calls, patch.object(
+            empty_seat_detection,
+            "compute_scene_embedding",
+            side_effect=[e1, e2, e3],
+        ), patch.object(
+            empty_seat_detection.asyncio,
+            "to_thread",
+            side_effect=self._to_thread_inline,
+        ):
+            await empty_seat_detection.on_frame(runtime, frame1)
+            await self._wait_until_settled(runtime)
+            await empty_seat_detection.on_frame(runtime, frame2)
+            await self._wait_until_settled(runtime)
+            await empty_seat_detection.on_frame(runtime, frame3)
+            await self._wait_until_settled(runtime)
+
+        self.assertEqual(calls.call_count, 6)
+        self.assertEqual(runtime.get_state("scene_generation"), 2)
+
 
 class TestExecutableToolValidation(unittest.TestCase):
     def test_allows_direct_model_calls_async_and_local_similarity(self):

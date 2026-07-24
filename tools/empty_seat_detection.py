@@ -294,6 +294,7 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("last_embedding_frame_id", 0)
     runtime.set_state("scene_change_streak", 0)
     runtime.set_state("base_task", None)
+    runtime.set_state("last_processed_frame_id", 0)
 
 
 def _get_or_create_scene_lock(runtime):
@@ -356,17 +357,28 @@ async def on_frame(runtime, frame):
 
     scene_lock = _get_or_create_scene_lock(runtime)
     async with scene_lock:
+        last_processed_frame_id = int(runtime.get_state("last_processed_frame_id", 0))
+        if frame.frame_id <= last_processed_frame_id:
+            return
+        runtime.set_state("last_processed_frame_id", frame.frame_id)
+
         previous_embedding = runtime.get_state("last_embedding")
         cached_frame_id = int(runtime.get_state("last_embedding_frame_id", 0))
+        embedding_recomputed = True
         if (
             previous_embedding is not None
             and frame.frame_id - cached_frame_id < EMBEDDING_FRAME_STRIDE
         ):
             embedding = previous_embedding
+            embedding_recomputed = False
         else:
             embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
             runtime.set_state("last_embedding", embedding)
             runtime.set_state("last_embedding_frame_id", frame.frame_id)
+
+        if not embedding_recomputed:
+            return
+
         anchor = runtime.get_state("scene_anchor")
         generation = int(runtime.get_state("scene_generation", 0))
         if anchor is None:

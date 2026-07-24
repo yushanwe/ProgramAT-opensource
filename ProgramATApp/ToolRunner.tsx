@@ -40,6 +40,28 @@ const SIMILARITY_THRESHOLDS = {
   AGGRESSIVE: 0.75,   // 75% for fewer updates
 };
 
+const SHORT_MODEL_PREFIXES = ['Moondream:', 'Gemini:', 'GPT:'];
+
+function toShortModelLabel(model?: string): string | null {
+  if (!model) return null;
+  const lowered = model.toLowerCase();
+  if (lowered.includes('moondream')) return 'Moondream';
+  if (lowered.includes('gemini')) return 'Gemini';
+  if (lowered.includes('gpt')) return 'GPT';
+  return null;
+}
+
+function withSingleShortModelPrefix(text: string, model?: string): string {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return trimmed;
+  if (SHORT_MODEL_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) {
+    return trimmed;
+  }
+  const shortLabel = toShortModelLabel(model);
+  if (!shortLabel) return trimmed;
+  return `${shortLabel}: ${trimmed}`;
+}
+
 interface Tool {
   name: string;
   path: string;
@@ -589,9 +611,15 @@ export default function ToolRunner({
           );
           activeProgressiveInvocationRef.current = message.invocation_id;
           lastProgressiveResultIndexRef.current = 0;
-          setIsRunning(true);
+          if (message.mode !== 'streaming') {
+            setIsRunning(true);
+          }
           setToolOutput('Waiting for model results...');
         } else if (message.type === 'tool_progress_result') {
+          if (message.mode === 'streaming' && !isStreamingRef.current) {
+            console.log('[ToolProgress] ignoring late streaming progress result after stop');
+            return;
+          }
           const accepted = acceptsProgressiveResult(
             activeProgressiveInvocationRef.current,
             lastProgressiveResultIndexRef.current,
@@ -618,9 +646,8 @@ export default function ToolRunner({
             return;
           }
           if (message.text) {
-            const labeledText = message.model
-              ? `${message.model}: ${message.text}`
-              : message.text;
+            const modelName = message.model || message.metadata?.model;
+            const labeledText = withSingleShortModelPrefix(message.text, modelName);
             setToolOutput(labeledText);
             if (audioEnabled) {
               AudioOutputService.play({
@@ -1195,14 +1222,18 @@ export default function ToolRunner({
               {/* Main action buttons - Full width, readable */}
               <View style={styles.buttonRow}>
                 <TouchableOpacity
-                  style={[styles.button, isStreaming ? styles.stopButton : styles.streamButton, isRunning && styles.buttonDisabled]}
+                  style={[
+                    styles.button,
+                    isStreaming ? styles.stopButton : styles.streamButton,
+                    (!isStreaming && isRunning) && styles.buttonDisabled,
+                  ]}
                   onPress={isStreaming ? stopStreamingTool : startStreamingTool}
-                  disabled={isRunning}
+                  disabled={!isStreaming && isRunning}
                   accessible={true}
                   accessibilityLabel={isStreaming ? "Stop streaming" : "Start streaming"}
                   accessibilityHint={isStreaming ? "Stops continuous tool execution" : "Starts continuous tool execution on camera frames"}
                   accessibilityRole="button"
-                  accessibilityState={{ disabled: isRunning }}>
+                  accessibilityState={{ disabled: !isStreaming && isRunning }}>
                   <Text style={styles.buttonText}>
                     {isStreaming ? 'Stop' : 'Stream'}
                   </Text>
