@@ -364,7 +364,6 @@ async def on_frame(runtime, frame):
 
         previous_embedding = runtime.get_state("last_embedding")
         cached_frame_id = int(runtime.get_state("last_embedding_frame_id", 0))
-        embedding_recomputed = True
         if (
             previous_embedding is not None
             and frame.frame_id - cached_frame_id < EMBEDDING_FRAME_STRIDE
@@ -375,6 +374,7 @@ async def on_frame(runtime, frame):
             embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
             runtime.set_state("last_embedding", embedding)
             runtime.set_state("last_embedding_frame_id", frame.frame_id)
+            embedding_recomputed = True
 
         if not embedding_recomputed:
             # Skip scene-change evaluation on stride-skipped frames so cached

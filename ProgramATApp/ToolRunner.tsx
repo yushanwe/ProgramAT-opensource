@@ -40,6 +40,7 @@ const SIMILARITY_THRESHOLDS = {
   AGGRESSIVE: 0.75,   // 75% for fewer updates
 };
 
+// Canonical short model labels used for progressive spoken/text prefixes.
 const SHORT_MODEL_LABELS = ['Moondream', 'Gemini', 'GPT'];
 
 function toShortModelLabel(model?: string): string | null {
@@ -1191,6 +1192,7 @@ export default function ToolRunner({
         </View>
       );
     }
+    const shouldDisableStreamButton = !isStreaming && isRunning;
 
     // All tools get the camera view - they're all camera-based
     // Tools loaded from GitHub PRs will process the camera images
@@ -1225,15 +1227,15 @@ export default function ToolRunner({
                   style={[
                     styles.button,
                     isStreaming ? styles.stopButton : styles.streamButton,
-                    (!isStreaming && isRunning) && styles.buttonDisabled,
+                    shouldDisableStreamButton && styles.buttonDisabled,
                   ]}
                   onPress={isStreaming ? stopStreamingTool : startStreamingTool}
-                  disabled={!isStreaming && isRunning}
+                  disabled={shouldDisableStreamButton}
                   accessible={true}
                   accessibilityLabel={isStreaming ? "Stop streaming" : "Start streaming"}
                   accessibilityHint={isStreaming ? "Stops continuous tool execution" : "Starts continuous tool execution on camera frames"}
                   accessibilityRole="button"
-                  accessibilityState={{ disabled: !isStreaming && isRunning }}>
+                  accessibilityState={{ disabled: shouldDisableStreamButton }}>
                   <Text style={styles.buttonText}>
                     {isStreaming ? 'Stop' : 'Stream'}
                   </Text>
