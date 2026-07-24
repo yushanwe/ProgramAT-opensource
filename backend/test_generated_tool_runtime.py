@@ -149,6 +149,13 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(_poll(), timeout=timeout)
 
+    async def _wait_for_base_task_start(self, runtime, timeout=0.2):
+        async def _poll():
+            while runtime.get_state("base_task") is None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_poll(), timeout=timeout)
+
     async def test_take_photo_emits_progressive_results(self):
         image = np.zeros((16, 16, 3), dtype=np.uint8)
         emitted = []
@@ -449,12 +456,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
-            for _ in range(20):
-                if runtime.get_state("base_task") is not None:
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("Timed out waiting for base task to start")
+            await self._wait_for_base_task_start(runtime)
             await empty_seat_detection.on_frame(runtime, frame2)
             hold.set()
             await self._wait_until_settled(runtime)

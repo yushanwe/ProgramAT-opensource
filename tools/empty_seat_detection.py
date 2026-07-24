@@ -310,25 +310,11 @@ async def on_stream_start(runtime, input_data):
 
 
 def _ensure_scene_lock(runtime):
-    lock = _RUNTIME_LOCKS.get(runtime)
-    if lock is None:
-        lock = asyncio.Lock()
-        _RUNTIME_LOCKS[runtime] = lock
-    return lock
+    return _RUNTIME_LOCKS.setdefault(runtime, asyncio.Lock())
 
 
 def _task_is_running(task) -> bool:
-    if task is None:
-        return False
-    try:
-        return not task.done()
-    except Exception as exc:
-        logger.exception(
-            "[empty_seat_detection] task state check failed: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
-        return False
+    return task is not None and not task.done()
 
 
 def _register_task(runtime, key: str, task):
@@ -337,12 +323,11 @@ def _register_task(runtime, key: str, task):
     def _clear_task(completed_task):
         if runtime.get_state(key) is completed_task:
             runtime.set_state(key, None)
-        try:
-            completed_task.exception()
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.exception(
+        if completed_task.cancelled():
+            return
+        exc = completed_task.exception()
+        if exc is not None:
+            logger.error(
                 "[empty_seat_detection] scene task failed key=%s error=%s: %s",
                 key,
                 type(exc).__name__,
