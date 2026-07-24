@@ -377,6 +377,8 @@ async def on_frame(runtime, frame):
             runtime.set_state("last_embedding_frame_id", frame.frame_id)
 
         if not embedding_recomputed:
+            # Skip scene-change evaluation on stride-skipped frames so cached
+            # embeddings do not reset pending scene-change confirmations.
             return
 
         anchor = runtime.get_state("scene_anchor")

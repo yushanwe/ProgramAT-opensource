@@ -504,6 +504,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             await empty_seat_detection.on_frame(runtime, frame3)
             await self._wait_until_settled(runtime)
 
+        # Two confirmed scenes should each trigger one 3-model run.
         self.assertEqual(calls.call_count, 6)
         self.assertEqual(runtime.get_state("scene_generation"), 2)
 

@@ -40,7 +40,7 @@ const SIMILARITY_THRESHOLDS = {
   AGGRESSIVE: 0.75,   // 75% for fewer updates
 };
 
-const SHORT_MODEL_PREFIXES = ['Moondream:', 'Gemini:', 'GPT:'];
+const SHORT_MODEL_LABELS = ['Moondream', 'Gemini', 'GPT'];
 
 function toShortModelLabel(model?: string): string | null {
   if (!model) return null;
@@ -54,7 +54,7 @@ function toShortModelLabel(model?: string): string | null {
 function withSingleShortModelPrefix(text: string, model?: string): string {
   const trimmed = (text || '').trim();
   if (!trimmed) return trimmed;
-  if (SHORT_MODEL_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) {
+  if (SHORT_MODEL_LABELS.some((label) => trimmed.startsWith(`${label}:`))) {
     return trimmed;
   }
   const shortLabel = toShortModelLabel(model);
