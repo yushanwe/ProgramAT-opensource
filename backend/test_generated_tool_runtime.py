@@ -136,6 +136,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         return function(*args, **kwargs)
 
     async def _wait_until_settled(self, runtime, timeout=0.2):
+        """Wait until base/precise scene tasks are absent or finished."""
         async def _poll():
             while True:
                 base_task = runtime.get_state("base_task")
@@ -150,6 +151,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(_poll(), timeout=timeout)
 
     async def _wait_for_base_task_start(self, runtime, timeout=0.2):
+        """Wait until a base scene task has been registered in runtime state."""
         async def _poll():
             while runtime.get_state("base_task") is None:
                 await asyncio.sleep(0)

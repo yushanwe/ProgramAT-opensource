@@ -309,15 +309,18 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("precise_task", None)
 
 
-def _ensure_scene_lock(runtime):
+def _get_or_create_scene_lock(runtime):
+    """Return a per-runtime asyncio lock used to serialize scene scheduling."""
     return _RUNTIME_LOCKS.setdefault(runtime, asyncio.Lock())
 
 
 def _task_is_running(task) -> bool:
+    """Return True only when a task exists and has not completed yet."""
     return task is not None and not task.done()
 
 
 def _register_task(runtime, key: str, task):
+    """Store a runtime task and clear it from state when the task finishes."""
     runtime.set_state(key, task)
 
     def _clear_task(completed_task):
@@ -370,7 +373,7 @@ async def on_frame(runtime, frame):
     if runtime.is_cancelled():
         return
 
-    scene_lock = _ensure_scene_lock(runtime)
+    scene_lock = _get_or_create_scene_lock(runtime)
     async with scene_lock:
         previous_embedding = runtime.get_state("last_embedding")
         cached_frame_id = int(runtime.get_state("last_embedding_frame_id", 0))
