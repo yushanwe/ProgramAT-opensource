@@ -1,4 +1,4 @@
-"""Find available seating with progressive multi-model output and CLIP scene detection."""
+"""Find available seating with progressive multi-model output and CLIP-based scene-change detection."""
 
 from __future__ import annotations
 
