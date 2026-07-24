@@ -201,6 +201,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls.call_count, 3)
         self.assertEqual(runtime.get_state("scene_generation"), 1)
+        self.assertEqual(runtime.get_state("scene_generation"), 1)
         self.assertEqual(len([event for event in emitted if event["partial"]]), 3)
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
 
