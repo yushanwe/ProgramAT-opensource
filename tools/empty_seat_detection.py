@@ -53,9 +53,9 @@ _CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 _clip_model = None
 _clip_processor = None
 _MODEL_LABELS = {
-    "moondream/moondream3-preview": "Moondream",
-    "gemini/gemini-3.1-flash-lite-preview": "Gemini",
-    "gpt-5": "GPT-5",
+    "moondream/moondream3-preview": "moondream",
+    "gemini/gemini-3.1-flash-lite-preview": "gemini",
+    "gpt-5": "gpt",
 }
 
 
@@ -192,13 +192,14 @@ async def _emit_progressive_results(
             )
             return model_name, "", str(exc)
 
-    tasks = [
+    tasks = {
         asyncio.create_task(run_model(model_name, provider))
         for model_name, provider in models
-    ]
+    }
     first_text = None
     try:
-        for completed in asyncio.as_completed(tasks):
+        pending = set(tasks)
+        while pending:
             if runtime is not None and (
                 runtime.is_cancelled()
                 or (
@@ -206,45 +207,51 @@ async def _emit_progressive_results(
                     and runtime.get_state("scene_generation") != generation
                 )
             ):
+                for task in pending:
+                    task.cancel()
                 break
-            model_name, text, _error = await completed
-            if _error is None and text and first_text is None:
-                first_text = text
-            if runtime is None:
-                continue
-            if runtime.is_cancelled() or (
-                generation is not None
-                and runtime.get_state("scene_generation") != generation
-            ):
-                continue
-            if _error is None and text:
-                await runtime.emit(
-                    prefixed_text(model_name, text),
-                    partial=True,
-                    metadata={
-                        "model": model_name,
-                        "status": "success",
-                        "phase": phase,
-                        "scene_generation": generation,
-                        "frame_id": frame_id,
-                    },
-                )
-            elif _error is not None:
-                await runtime.emit(
-                    prefixed_text(
-                        model_name,
-                        "encountered an error. Still using other model results.",
-                    ),
-                    partial=True,
-                    metadata={
-                        "model": model_name,
-                        "status": "failed",
-                        "error": _error,
-                        "phase": phase,
-                        "scene_generation": generation,
-                        "frame_id": frame_id,
-                    },
-                )
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for completed in done:
+                model_name, text, _error = await completed
+                if _error is None and text and first_text is None:
+                    first_text = text
+                if runtime is None:
+                    continue
+                if runtime.is_cancelled() or (
+                    generation is not None
+                    and runtime.get_state("scene_generation") != generation
+                ):
+                    continue
+                if _error is None and text:
+                    await runtime.emit(
+                        prefixed_text(model_name, text),
+                        partial=True,
+                        metadata={
+                            "model": model_name,
+                            "status": "success",
+                            "phase": phase,
+                            "scene_generation": generation,
+                            "frame_id": frame_id,
+                        },
+                    )
+                elif _error is not None:
+                    await runtime.emit(
+                        prefixed_text(
+                            model_name,
+                            "encountered an error. Still using other model results.",
+                        ),
+                        partial=True,
+                        metadata={
+                            "model": model_name,
+                            "status": "failed",
+                            "error": _error,
+                            "phase": phase,
+                            "scene_generation": generation,
+                            "frame_id": frame_id,
+                        },
+                    )
         if runtime is not None and not runtime.is_cancelled() and (
             generation is None or runtime.get_state("scene_generation") == generation
         ):
@@ -296,6 +303,37 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("last_embedding", None)
     runtime.set_state("last_embedding_frame_id", 0)
     runtime.set_state("scene_change_streak", 0)
+    runtime.set_state("scene_lock", asyncio.Lock())
+    runtime.set_state("base_task", None)
+    runtime.set_state("precise_task", None)
+
+
+def _ensure_scene_lock(runtime):
+    lock = runtime.get_state("scene_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        runtime.set_state("scene_lock", lock)
+    return lock
+
+
+def _task_is_running(task) -> bool:
+    return task is not None and not task.done()
+
+
+def _register_task(runtime, key: str, task):
+    runtime.set_state(key, task)
+
+    def _clear_task(completed_task):
+        if runtime.get_state(key) is completed_task:
+            runtime.set_state(key, None)
+        try:
+            completed_task.exception()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("[empty_seat_detection] scene task failed key=%s", key)
+
+    task.add_done_callback(_clear_task)
 
 
 async def _run_stream_phase(
@@ -331,94 +369,119 @@ async def on_frame(runtime, frame):
     if runtime.is_cancelled():
         return
 
-    previous_embedding = runtime.get_state("last_embedding")
-    cached_frame_id = int(runtime.get_state("last_embedding_frame_id", 0))
-    if (
-        previous_embedding is not None
-        and frame.frame_id - cached_frame_id < EMBEDDING_FRAME_STRIDE
-    ):
-        embedding = previous_embedding
-    else:
-        embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
-        runtime.set_state("last_embedding", embedding)
-        runtime.set_state("last_embedding_frame_id", frame.frame_id)
-    anchor = runtime.get_state("scene_anchor")
-    generation = int(runtime.get_state("scene_generation", 0))
-    if anchor is None:
-        same_scene = False
-    else:
-        anchor_similarity = cosine_similarity(anchor, embedding)
-        frame_to_frame_similarity = (
-            cosine_similarity(previous_embedding, embedding)
-            if previous_embedding is not None
-            else -1.0
-        )
-        same_scene = (
-            anchor_similarity >= SCENE_SIMILARITY_THRESHOLD
-            or frame_to_frame_similarity >= FRAME_TO_FRAME_SIMILARITY_THRESHOLD
-        )
+    scene_lock = _ensure_scene_lock(runtime)
+    async with scene_lock:
+        previous_embedding = runtime.get_state("last_embedding")
+        cached_frame_id = int(runtime.get_state("last_embedding_frame_id", 0))
+        if (
+            previous_embedding is not None
+            and frame.frame_id - cached_frame_id < EMBEDDING_FRAME_STRIDE
+        ):
+            embedding = previous_embedding
+        else:
+            embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+            runtime.set_state("last_embedding", embedding)
+            runtime.set_state("last_embedding_frame_id", frame.frame_id)
+        anchor = runtime.get_state("scene_anchor")
+        generation = int(runtime.get_state("scene_generation", 0))
+        if anchor is None:
+            same_scene = False
+        else:
+            anchor_similarity = cosine_similarity(anchor, embedding)
+            frame_to_frame_similarity = (
+                cosine_similarity(previous_embedding, embedding)
+                if previous_embedding is not None
+                else -1.0
+            )
+            same_scene = (
+                anchor_similarity >= SCENE_SIMILARITY_THRESHOLD
+                or frame_to_frame_similarity >= FRAME_TO_FRAME_SIMILARITY_THRESHOLD
+            )
 
-    if not same_scene and anchor is not None:
-        streak = int(runtime.get_state("scene_change_streak", 0)) + 1
-        runtime.set_state("scene_change_streak", streak)
-        if streak < SCENE_CHANGE_CONFIRMATIONS:
+        if not same_scene and anchor is not None:
+            streak = int(runtime.get_state("scene_change_streak", 0)) + 1
+            runtime.set_state("scene_change_streak", streak)
+            if streak < SCENE_CHANGE_CONFIRMATIONS:
+                return
+        else:
+            runtime.set_state("scene_change_streak", 0)
+
+        if not same_scene:
+            generation += 1
+            runtime.set_state("scene_generation", generation)
+            runtime.set_state("scene_anchor", embedding)
+            runtime.set_state("scene_started_at", frame.timestamp)
+            runtime.set_state("completed_generation", None)
+            runtime.set_state("precise_generation", None)
+            runtime.set_state("analyzing_generation", generation)
+
+            old_base_task = runtime.get_state("base_task")
+            old_precise_task = runtime.get_state("precise_task")
+            if _task_is_running(old_base_task):
+                old_base_task.cancel()
+            if _task_is_running(old_precise_task):
+                old_precise_task.cancel()
+
+            base_task = asyncio.create_task(
+                _run_stream_phase(
+                    runtime,
+                    frame,
+                    generation,
+                    TOOL_PROMPT,
+                    PROGRESSIVE_MODELS,
+                    "base",
+                    "completed_generation",
+                )
+            )
+            _register_task(runtime, "base_task", base_task)
             return
-    else:
-        runtime.set_state("scene_change_streak", 0)
 
-    if not same_scene:
-        next_generation = generation + 1
-        if runtime.get_state("analyzing_generation") == next_generation:
+        runtime.set_state("scene_anchor", _blend_scene_anchor(anchor, embedding))
+
+        if _task_is_running(runtime.get_state("base_task")):
             return
-        generation = next_generation
-        runtime.set_state("scene_generation", generation)
-        runtime.set_state("scene_anchor", embedding)
-        runtime.set_state("scene_started_at", frame.timestamp)
-        runtime.set_state("completed_generation", None)
-        runtime.set_state("precise_generation", None)
-        runtime.set_state("analyzing_generation", generation)
-        await _run_stream_phase(
-            runtime,
-            frame,
-            generation,
-            TOOL_PROMPT,
-            PROGRESSIVE_MODELS,
-            "base",
-            "completed_generation",
-        )
-        return
-    runtime.set_state("scene_anchor", _blend_scene_anchor(anchor, embedding))
 
-    started_at = runtime.get_state("scene_started_at")
-    if started_at is None:
-        runtime.set_state("scene_started_at", frame.timestamp)
-        started_at = frame.timestamp
+        started_at = runtime.get_state("scene_started_at")
+        if started_at is None:
+            runtime.set_state("scene_started_at", frame.timestamp)
+            return
 
-    if runtime.get_state("analyzing_generation") == generation:
-        return
-
-    elapsed = max(0.0, float(frame.timestamp) - float(started_at))
-    completed_generation = runtime.get_state("completed_generation")
-    precise_generation = runtime.get_state("precise_generation")
-
-    if (
-        completed_generation == generation
-        and precise_generation != generation
-        and elapsed >= SCENE_HOLD_SECONDS
-    ):
-        runtime.set_state("analyzing_generation", generation)
-        await _run_stream_phase(
-            runtime,
-            frame,
-            generation,
-            PRECISE_TOOL_PROMPT,
-            PRECISE_MODELS,
-            "precise",
-            "precise_generation",
-        )
+        elapsed = max(0.0, float(frame.timestamp) - float(started_at))
+        completed_generation = runtime.get_state("completed_generation")
+        precise_generation = runtime.get_state("precise_generation")
+        precise_task = runtime.get_state("precise_task")
+        if (
+            completed_generation == generation
+            and precise_generation != generation
+            and elapsed >= SCENE_HOLD_SECONDS
+            and not _task_is_running(precise_task)
+        ):
+            runtime.set_state("analyzing_generation", generation)
+            next_precise_task = asyncio.create_task(
+                _run_stream_phase(
+                    runtime,
+                    frame,
+                    generation,
+                    PRECISE_TOOL_PROMPT,
+                    PRECISE_MODELS,
+                    "precise",
+                    "precise_generation",
+                )
+            )
+            _register_task(runtime, "precise_task", next_precise_task)
+            return
 
 
 async def on_stream_stop(runtime):
+    tasks = [
+        task
+        for task in (runtime.get_state("base_task"), runtime.get_state("precise_task"))
+        if _task_is_running(task)
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     runtime.set_state("analyzing_generation", None)
 
 

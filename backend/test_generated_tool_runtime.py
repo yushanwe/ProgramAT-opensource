@@ -176,7 +176,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             {event["text"].split(": ", 1)[0] for event in partial_events},
-            {"Moondream", "Gemini", "GPT-5"},
+            {"moondream", "gemini", "gpt"},
         )
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
 
@@ -221,7 +221,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             failures[0]["metadata"].get("model"),
             "moondream/moondream3-preview",
         )
-        self.assertTrue(failures[0]["text"].startswith("Moondream:"))
+        self.assertTrue(failures[0]["text"].startswith("moondream:"))
         self.assertIn("moondream unavailable", failures[0]["metadata"].get("error", ""))
 
     async def test_take_photo_emits_failure_for_all_failed_models(self):
@@ -295,7 +295,9 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
+            await asyncio.sleep(0.01)
             await empty_seat_detection.on_frame(runtime, frame2)
+            await asyncio.sleep(0.01)
 
         self.assertEqual(calls.call_count, 3)
         self.assertEqual(runtime.get_state("scene_generation"), 1)
@@ -322,6 +324,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         image = np.full((32, 32, 3), 80, dtype=np.uint8)
         frame1 = ToolFrame(1, 1.0, image, 32, 32)
         frame2 = ToolFrame(2, 4.0, image.copy(), 32, 32)
+        frame3 = ToolFrame(3, 4.1, image.copy(), 32, 32)
 
         with patch.object(
             empty_seat_detection,
@@ -333,7 +336,11 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
+            await asyncio.sleep(0.01)
             await empty_seat_detection.on_frame(runtime, frame2)
+            await asyncio.sleep(0.01)
+            await empty_seat_detection.on_frame(runtime, frame3)
+            await asyncio.sleep(0.01)
 
         self.assertEqual(calls.call_count, 4)
         self.assertEqual(len([event for event in emitted if event["partial"]]), 4)
@@ -386,9 +393,55 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
+            await asyncio.sleep(0)
             await empty_seat_detection.on_frame(runtime, frame2)
+            await asyncio.sleep(0)
 
         self.assertEqual(calls.call_count, 3)
+
+    async def test_same_scene_does_not_restart_base_run_while_active_or_completed(self):
+        emitted = []
+
+        async def emit(event):
+            emitted.append(event)
+            return True
+
+        runtime = ToolRuntime(
+            client_id="client",
+            tool_name="empty_seat_detection",
+            tool_version="v1",
+            session_id="session",
+            frame_store=FrameStore(),
+            emit_callback=emit,
+        )
+        await empty_seat_detection.on_stream_start(runtime, {})
+        image = np.full((32, 32, 3), 80, dtype=np.uint8)
+        frame1 = ToolFrame(1, 1.0, image, 32, 32)
+        frame2 = ToolFrame(2, 1.1, image.copy(), 32, 32)
+        frame3 = ToolFrame(3, 1.2, image.copy(), 32, 32)
+        hold = asyncio.Event()
+
+        async def fake_emit_progressive(*args, **kwargs):
+            await hold.wait()
+            return "done"
+
+        with patch.object(
+            empty_seat_detection,
+            "_emit_progressive_results",
+            side_effect=fake_emit_progressive,
+        ) as emit_progressive, patch.object(
+            empty_seat_detection.asyncio,
+            "to_thread",
+            side_effect=self._to_thread_inline,
+        ):
+            await empty_seat_detection.on_frame(runtime, frame1)
+            await asyncio.sleep(0)
+            await empty_seat_detection.on_frame(runtime, frame2)
+            hold.set()
+            await asyncio.sleep(0)
+            await empty_seat_detection.on_frame(runtime, frame3)
+
+        self.assertEqual(emit_progressive.await_count, 1)
 
 
 class TestExecutableToolValidation(unittest.TestCase):
