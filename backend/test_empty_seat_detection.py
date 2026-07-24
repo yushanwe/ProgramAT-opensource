@@ -30,7 +30,10 @@ class EmptySeatDetectionTests(unittest.IsolatedAsyncioTestCase):
                 }
             ):
                 name = node.targets[0].id
-                constants[name] = ast.literal_eval(node.value)
+                if isinstance(node.value, ast.Constant):
+                    constants[name] = node.value.value
+                else:
+                    constants[name] = ast.literal_eval(node.value)
 
         self.assertEqual(constants["TOOL_NAME"], "empty_seat_detection")
         self.assertEqual(constants["EXECUTION_MODE"], "take_photo")

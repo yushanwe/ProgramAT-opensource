@@ -26,6 +26,11 @@ PRECISE_TOOL_PROMPT = (
 
 SCENE_SIMILARITY_THRESHOLD = 0.985
 SCENE_HOLD_SECONDS = 2.5
+EMBEDDING_FRAME_STRIDE = 2
+CLIP_EMBEDDING_DIM = 512
+HISTOGRAM_FALLBACK_SIZE = (96, 96)
+HISTOGRAM_FALLBACK_BINS = [32, 16]
+HISTOGRAM_FALLBACK_RANGES = [0, 180, 0, 256]
 
 PROGRESSIVE_MODELS = (
     ("moondream/moondream3-preview", "litellm"),
@@ -54,7 +59,7 @@ def _load_clip_encoder():
 def compute_scene_embedding(image: np.ndarray) -> np.ndarray:
     """Create a normalized CLIP embedding for scene continuity checks."""
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
-        return np.zeros(512, dtype=np.float32)
+        return np.zeros(CLIP_EMBEDDING_DIM, dtype=np.float32)
 
     try:
         import torch
@@ -67,19 +72,20 @@ def compute_scene_embedding(image: np.ndarray) -> np.ndarray:
             output = model.get_image_features(**inputs)
         vector = output.detach().cpu().numpy().astype(np.float32).reshape(-1)
     except Exception:
-        resized = cv2.resize(image, (96, 96), interpolation=cv2.INTER_AREA)
+        resized = cv2.resize(image, HISTOGRAM_FALLBACK_SIZE, interpolation=cv2.INTER_AREA)
         hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
-        vector = cv2.calcHist([hsv], [0, 1], None, [32, 16], [0, 180, 0, 256]).astype(
-            np.float32
-        ).reshape(-1)
+        vector = cv2.calcHist(
+            [hsv], [0, 1], None, HISTOGRAM_FALLBACK_BINS, HISTOGRAM_FALLBACK_RANGES
+        ).astype(np.float32).reshape(-1)
 
     norm = float(np.linalg.norm(vector))
-    if norm == 0:
+    if norm < 1e-10:
         return np.zeros_like(vector)
     return vector / norm
 
 
 def cosine_similarity(first: np.ndarray, second: np.ndarray) -> float:
+    """Return cosine similarity or -1.0 sentinel when vectors are incompatible."""
     if first is None or second is None or first.shape != second.shape:
         return -1.0
     return float(np.dot(first, second))
@@ -195,6 +201,7 @@ async def on_take_photo(runtime, image, input_data):
     )
     if runtime is None:
         return result
+    # In executable runtime mode, outputs are delivered via runtime.emit events.
     return None
 
 
@@ -206,9 +213,19 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("completed_generation", None)
     runtime.set_state("precise_generation", None)
     runtime.set_state("scene_started_at", None)
+    runtime.set_state("last_embedding", None)
+    runtime.set_state("last_embedding_frame_id", 0)
 
 
-async def _run_stream_phase(runtime, frame, generation: int, prompt: str, models, phase: str):
+async def _run_stream_phase(
+    runtime,
+    frame,
+    generation: int,
+    prompt: str,
+    models,
+    phase: str,
+    completion_key: str | None,
+):
     try:
         await _emit_progressive_results(
             runtime,
@@ -219,10 +236,11 @@ async def _run_stream_phase(runtime, frame, generation: int, prompt: str, models
             frame_id=frame.frame_id,
             phase=phase,
         )
-        if runtime.get_state("scene_generation") == generation and phase == "base":
-            runtime.set_state("completed_generation", generation)
-        if runtime.get_state("scene_generation") == generation and phase == "precise":
-            runtime.set_state("precise_generation", generation)
+        if (
+            completion_key
+            and runtime.get_state("scene_generation") == generation
+        ):
+            runtime.set_state(completion_key, generation)
     finally:
         if runtime.get_state("analyzing_generation") == generation:
             runtime.set_state("analyzing_generation", None)
@@ -232,23 +250,40 @@ async def on_frame(runtime, frame):
     if runtime.is_cancelled():
         return
 
-    embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+    cached_embedding = runtime.get_state("last_embedding")
+    cached_frame_id = int(runtime.get_state("last_embedding_frame_id", 0))
+    if (
+        cached_embedding is not None
+        and frame.frame_id - cached_frame_id < EMBEDDING_FRAME_STRIDE
+    ):
+        embedding = cached_embedding
+    else:
+        embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+        runtime.set_state("last_embedding", embedding)
+        runtime.set_state("last_embedding_frame_id", frame.frame_id)
     anchor = runtime.get_state("scene_anchor")
     generation = int(runtime.get_state("scene_generation", 0))
     same_scene = anchor is not None and is_same_scene(anchor, embedding)
 
     if not same_scene:
-        generation += 1
+        next_generation = generation + 1
+        if runtime.get_state("analyzing_generation") == next_generation:
+            return
+        generation = next_generation
         runtime.set_state("scene_generation", generation)
         runtime.set_state("scene_anchor", embedding)
         runtime.set_state("scene_started_at", frame.timestamp)
         runtime.set_state("completed_generation", None)
         runtime.set_state("precise_generation", None)
-        if runtime.get_state("analyzing_generation") == generation:
-            return
         runtime.set_state("analyzing_generation", generation)
         await _run_stream_phase(
-            runtime, frame, generation, TOOL_PROMPT, PROGRESSIVE_MODELS, "base"
+            runtime,
+            frame,
+            generation,
+            TOOL_PROMPT,
+            PROGRESSIVE_MODELS,
+            "base",
+            "completed_generation",
         )
         return
 
@@ -271,12 +306,17 @@ async def on_frame(runtime, frame):
     ):
         runtime.set_state("analyzing_generation", generation)
         await _run_stream_phase(
-            runtime, frame, generation, PRECISE_TOOL_PROMPT, PRECISE_MODELS, "precise"
+            runtime,
+            frame,
+            generation,
+            PRECISE_TOOL_PROMPT,
+            PRECISE_MODELS,
+            "precise",
+            "precise_generation",
         )
 
 
 async def on_stream_stop(runtime):
-    runtime.set_state("scene_generation", int(runtime.get_state("scene_generation", 0)) + 1)
     runtime.set_state("analyzing_generation", None)
 
 
