@@ -135,17 +135,19 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
     async def _to_thread_inline(function, *args, **kwargs):
         return function(*args, **kwargs)
 
-    async def _wait_until_settled(self, runtime, max_ticks=20):
-        for _ in range(max_ticks):
-            base_task = runtime.get_state("base_task")
-            precise_task = runtime.get_state("precise_task")
-            if all(
-                task is None or task.done()
-                for task in (base_task, precise_task)
-            ):
-                return
-            await asyncio.sleep(0)
-        self.fail("Timed out waiting for scene tasks to settle")
+    async def _wait_until_settled(self, runtime, timeout=0.2):
+        async def _poll():
+            while True:
+                base_task = runtime.get_state("base_task")
+                precise_task = runtime.get_state("precise_task")
+                if all(
+                    task is None or task.done()
+                    for task in (base_task, precise_task)
+                ):
+                    return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_poll(), timeout=timeout)
 
     async def test_take_photo_emits_progressive_results(self):
         image = np.zeros((16, 16, 3), dtype=np.uint8)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 
 import cv2
 import numpy as np
@@ -52,6 +53,7 @@ logger = logging.getLogger(__name__)
 _CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 _clip_model = None
 _clip_processor = None
+_RUNTIME_LOCKS = weakref.WeakKeyDictionary()
 _MODEL_LABELS = {
     "moondream/moondream3-preview": "moondream",
     "gemini/gemini-3.1-flash-lite-preview": "gemini",
@@ -303,16 +305,15 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("last_embedding", None)
     runtime.set_state("last_embedding_frame_id", 0)
     runtime.set_state("scene_change_streak", 0)
-    runtime.set_state("scene_lock", asyncio.Lock())
     runtime.set_state("base_task", None)
     runtime.set_state("precise_task", None)
 
 
 def _ensure_scene_lock(runtime):
-    lock = runtime.get_state("scene_lock")
+    lock = _RUNTIME_LOCKS.get(runtime)
     if lock is None:
         lock = asyncio.Lock()
-        runtime.set_state("scene_lock", lock)
+        _RUNTIME_LOCKS[runtime] = lock
     return lock
 
 
@@ -321,8 +322,12 @@ def _task_is_running(task) -> bool:
         return False
     try:
         return not task.done()
-    except Exception:
-        logger.exception("[empty_seat_detection] invalid task state")
+    except Exception as exc:
+        logger.exception(
+            "[empty_seat_detection] task state check failed: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return False
 
 
