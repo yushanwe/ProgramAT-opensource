@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 _CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 _clip_model = None
 _clip_processor = None
+_MODEL_LABELS = {
+    "moondream/moondream3-preview": "Moondream",
+    "gemini/gemini-3.1-flash-lite-preview": "Gemini",
+    "gpt-5": "GPT-5",
+}
 
 
 def _load_clip_encoder():
@@ -169,6 +174,9 @@ async def _emit_progressive_results(
     frame_id: int | None,
     phase: str,
 ):
+    def prefixed_text(model_name: str, text: str) -> str:
+        return f"{_MODEL_LABELS.get(model_name, model_name)}: {text}"
+
     async def run_model(model_name: str, provider: str):
         logger.info("[empty_seat_detection] model_start model=%s", model_name)
         try:
@@ -211,7 +219,7 @@ async def _emit_progressive_results(
                 continue
             if _error is None and text:
                 await runtime.emit(
-                    text,
+                    prefixed_text(model_name, text),
                     partial=True,
                     metadata={
                         "model": model_name,
@@ -223,7 +231,10 @@ async def _emit_progressive_results(
                 )
             elif _error is not None:
                 await runtime.emit(
-                    f"{model_name} encountered an error. Still using other model results.",
+                    prefixed_text(
+                        model_name,
+                        "encountered an error. Still using other model results.",
+                    ),
                     partial=True,
                     metadata={
                         "model": model_name,

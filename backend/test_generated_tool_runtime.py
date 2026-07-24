@@ -174,6 +174,10 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
                 "gpt-5",
             },
         )
+        self.assertEqual(
+            {event["text"].split(": ", 1)[0] for event in partial_events},
+            {"Moondream", "Gemini", "GPT-5"},
+        )
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
 
     async def test_take_photo_emits_failed_model_event(self):
@@ -217,6 +221,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             failures[0]["metadata"].get("model"),
             "moondream/moondream3-preview",
         )
+        self.assertTrue(failures[0]["text"].startswith("Moondream:"))
         self.assertIn("moondream unavailable", failures[0]["metadata"].get("error", ""))
 
     async def test_take_photo_emits_failure_for_all_failed_models(self):
