@@ -25,7 +25,8 @@ PRECISE_TOOL_PROMPT = (
 )
 
 SCENE_SIMILARITY_THRESHOLD = 0.975
-SMALL_MOTION_SIMILARITY_THRESHOLD = 0.955
+FRAME_TO_FRAME_SIMILARITY_THRESHOLD = 0.955
+# Require consecutive changed frames before restarting model calls for a new scene.
 SCENE_CHANGE_CONFIRMATIONS = 2
 SCENE_HOLD_SECONDS = 2.5
 EMBEDDING_FRAME_STRIDE = 2
@@ -274,13 +275,13 @@ async def on_frame(runtime, frame):
     if runtime.is_cancelled():
         return
 
-    cached_embedding = runtime.get_state("last_embedding")
+    previous_embedding = runtime.get_state("last_embedding")
     cached_frame_id = int(runtime.get_state("last_embedding_frame_id", 0))
     if (
-        cached_embedding is not None
+        previous_embedding is not None
         and frame.frame_id - cached_frame_id < EMBEDDING_FRAME_STRIDE
     ):
-        embedding = cached_embedding
+        embedding = previous_embedding
     else:
         embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
         runtime.set_state("last_embedding", embedding)
@@ -291,10 +292,10 @@ async def on_frame(runtime, frame):
         same_scene = False
     else:
         anchor_similarity = cosine_similarity(anchor, embedding)
-        cached_similarity = cosine_similarity(cached_embedding, embedding)
+        cached_similarity = cosine_similarity(previous_embedding, embedding)
         same_scene = (
             anchor_similarity >= SCENE_SIMILARITY_THRESHOLD
-            or cached_similarity >= SMALL_MOTION_SIMILARITY_THRESHOLD
+            or cached_similarity >= FRAME_TO_FRAME_SIMILARITY_THRESHOLD
         )
 
     if not same_scene and anchor is not None:
