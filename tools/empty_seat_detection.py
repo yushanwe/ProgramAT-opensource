@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import cv2
 import numpy as np
 from PIL import Image
 
 from litellm_utils import call_model, call_openai_responses_model, extract_text
+from model_adapters import ImplementationProfile, _moondream_cloud_executor
 
 TOOL_NAME = "empty_seat_detection"
 EXECUTION_MODE = "take_photo"
@@ -39,11 +41,13 @@ ANCHOR_BLEND_CURRENT_WEIGHT = 0.15
 NORMALIZATION_EPSILON = 1e-10
 
 PROGRESSIVE_MODELS = (
-    ("moondream/moondream3-preview", "litellm"),
+    ("moondream/moondream3-preview", "moondream_cloud"),
     ("gemini/gemini-3.1-flash-lite-preview", "litellm"),
     ("gpt-5", "openai_responses"),
 )
 PRECISE_MODELS = (("gpt-5", "openai_responses"),)
+
+logger = logging.getLogger(__name__)
 
 _CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 _clip_model = None
@@ -121,6 +125,24 @@ def _blend_scene_anchor(reference: np.ndarray, current: np.ndarray) -> np.ndarra
 def _call_selected_model(
     model_name: str, provider: str, image: np.ndarray, prompt: str
 ) -> str:
+    if provider == "moondream_cloud":
+        try:
+            result = _moondream_cloud_executor(
+                ImplementationProfile(
+                    name="moondream",
+                    kind="moondream_cloud",
+                    model=model_name,
+                ),
+                [{"role": "user", "content": prompt}],
+                [image],
+                # Preserve the seating prompt exactly; we only want provider routing.
+                {"tool_name": TOOL_NAME, "preserve_original_prompt": True},
+            )
+            if result is None or not hasattr(result, "response"):
+                raise RuntimeError("Moondream returned no response payload")
+            return extract_text(result.response)
+        except Exception as exc:
+            raise RuntimeError(f"Moondream model call failed: {exc}") from exc
     if provider == "openai_responses":
         return call_openai_responses_model(
             model_name,
@@ -148,12 +170,18 @@ async def _emit_progressive_results(
     phase: str,
 ):
     async def run_model(model_name: str, provider: str):
+        logger.info("[empty_seat_detection] model_start model=%s", model_name)
         try:
             text = await asyncio.to_thread(
                 _call_selected_model, model_name, provider, image, prompt
             )
+            logger.info("[empty_seat_detection] model_success model=%s", model_name)
             return model_name, text, None
         except Exception as exc:
+            logger.exception(
+                "[empty_seat_detection] model_failure model=%s",
+                model_name,
+            )
             return model_name, "", str(exc)
 
     tasks = [
@@ -172,7 +200,7 @@ async def _emit_progressive_results(
             ):
                 break
             model_name, text, _error = await completed
-            if text and first_text is None:
+            if _error is None and text and first_text is None:
                 first_text = text
             if runtime is None:
                 continue
@@ -181,12 +209,26 @@ async def _emit_progressive_results(
                 and runtime.get_state("scene_generation") != generation
             ):
                 continue
-            if text:
+            if _error is None and text:
                 await runtime.emit(
                     text,
                     partial=True,
                     metadata={
                         "model": model_name,
+                        "status": "success",
+                        "phase": phase,
+                        "scene_generation": generation,
+                        "frame_id": frame_id,
+                    },
+                )
+            elif _error is not None:
+                await runtime.emit(
+                    f"{model_name} encountered an error. Still using other model results.",
+                    partial=True,
+                    metadata={
+                        "model": model_name,
+                        "status": "failed",
+                        "error": _error,
                         "phase": phase,
                         "scene_generation": generation,
                         "frame_id": frame_id,

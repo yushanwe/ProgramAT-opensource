@@ -164,8 +164,101 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
         self.assertEqual(call.call_count, 3)
-        self.assertEqual(len([event for event in emitted if event["partial"]]), 3)
+        partial_events = [event for event in emitted if event["partial"]]
+        self.assertEqual(len(partial_events), 3)
+        self.assertEqual(
+            {event["metadata"].get("model") for event in partial_events},
+            {
+                "moondream/moondream3-preview",
+                "gemini/gemini-3.1-flash-lite-preview",
+                "gpt-5",
+            },
+        )
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
+
+    async def test_take_photo_emits_failed_model_event(self):
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        emitted = []
+
+        async def emit(event):
+            emitted.append(event)
+            return True
+
+        runtime = ToolRuntime(
+            client_id="client",
+            tool_name="empty_seat_detection",
+            tool_version="v1",
+            session_id="session",
+            frame_store=FrameStore(),
+            emit_callback=emit,
+        )
+
+        def model_side_effect(model, provider, frame, prompt):
+            if model == "moondream/moondream3-preview":
+                raise RuntimeError("moondream unavailable")
+            return f"{model} seats"
+
+        with patch.object(
+            empty_seat_detection,
+            "_call_selected_model",
+            side_effect=model_side_effect,
+        ), patch.object(
+            empty_seat_detection.asyncio,
+            "to_thread",
+            side_effect=self._to_thread_inline,
+        ):
+            result = await empty_seat_detection.on_take_photo(runtime, image, {})
+
+        self.assertIsNone(result)
+        partial_events = [event for event in emitted if event["partial"]]
+        failures = [event for event in partial_events if event["metadata"].get("status") == "failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(
+            failures[0]["metadata"].get("model"),
+            "moondream/moondream3-preview",
+        )
+        self.assertIn("moondream unavailable", failures[0]["metadata"].get("error", ""))
+
+    async def test_take_photo_emits_failure_for_all_failed_models(self):
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        emitted = []
+
+        async def emit(event):
+            emitted.append(event)
+            return True
+
+        runtime = ToolRuntime(
+            client_id="client",
+            tool_name="empty_seat_detection",
+            tool_version="v1",
+            session_id="session",
+            frame_store=FrameStore(),
+            emit_callback=emit,
+        )
+
+        with patch.object(
+            empty_seat_detection,
+            "_call_selected_model",
+            side_effect=RuntimeError("all models unavailable"),
+        ), patch.object(
+            empty_seat_detection.asyncio,
+            "to_thread",
+            side_effect=self._to_thread_inline,
+        ):
+            result = await empty_seat_detection.on_take_photo(runtime, image, {})
+
+        self.assertIsNone(result)
+        partial_events = [event for event in emitted if event["partial"]]
+        failures = [event for event in partial_events if event["metadata"].get("status") == "failed"]
+        self.assertEqual(len(failures), 3)
+        self.assertEqual(
+            {event["metadata"].get("model") for event in failures},
+            {
+                "moondream/moondream3-preview",
+                "gemini/gemini-3.1-flash-lite-preview",
+                "gpt-5",
+            },
+        )
 
     async def test_tool_owned_similarity_suppresses_same_scene(self):
         emitted = []
