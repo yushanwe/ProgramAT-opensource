@@ -37,6 +37,8 @@ HISTOGRAM_FALLBACK_RANGES = [0, 180, 0, 256]
 ANCHOR_BLEND_REFERENCE_WEIGHT = 0.85
 ANCHOR_BLEND_CURRENT_WEIGHT = 0.15
 NORMALIZATION_EPSILON = 1e-10
+if abs((ANCHOR_BLEND_REFERENCE_WEIGHT + ANCHOR_BLEND_CURRENT_WEIGHT) - 1.0) > 1e-6:
+    raise ValueError("Anchor blend weights must sum to 1.0")
 
 PROGRESSIVE_MODELS = (
     ("moondream/moondream3-preview", "litellm"),
@@ -292,7 +294,11 @@ async def on_frame(runtime, frame):
         same_scene = False
     else:
         anchor_similarity = cosine_similarity(anchor, embedding)
-        cached_similarity = cosine_similarity(previous_embedding, embedding)
+        cached_similarity = (
+            cosine_similarity(previous_embedding, embedding)
+            if previous_embedding is not None
+            else -1.0
+        )
         same_scene = (
             anchor_similarity >= SCENE_SIMILARITY_THRESHOLD
             or cached_similarity >= FRAME_TO_FRAME_SIMILARITY_THRESHOLD

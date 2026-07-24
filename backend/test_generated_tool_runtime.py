@@ -264,6 +264,14 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         e1 = np.array([1.0, 0.0], dtype=np.float32)
         e2 = np.array([0.96, 0.28], dtype=np.float32)
         e2 = e2 / np.linalg.norm(e2)
+        self.assertLess(
+            float(np.dot(e1, e2)),
+            empty_seat_detection.SCENE_SIMILARITY_THRESHOLD,
+        )
+        self.assertGreaterEqual(
+            float(np.dot(e1, e2)),
+            empty_seat_detection.FRAME_TO_FRAME_SIMILARITY_THRESHOLD,
+        )
 
         with patch.object(
             empty_seat_detection,
