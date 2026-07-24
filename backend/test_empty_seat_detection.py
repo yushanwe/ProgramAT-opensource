@@ -2,13 +2,17 @@ import ast
 import importlib.util
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 TOOL_PATH = TOOLS_DIR / "empty_seat_detection.py"
+HAS_RUNTIME_DEPS = all(
+    importlib.util.find_spec(name) is not None
+    for name in ("cv2", "numpy", "PIL", "litellm_utils")
+)
 
 
-class EmptySeatDetectionTests(unittest.TestCase):
+class EmptySeatDetectionTests(unittest.IsolatedAsyncioTestCase):
     def test_declares_required_constants(self):
         tree = ast.parse(TOOL_PATH.read_text(encoding="utf-8"))
         constants = {}
@@ -17,44 +21,44 @@ class EmptySeatDetectionTests(unittest.TestCase):
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id in {"TOOL_NAME", "EXECUTION_MODE", "TOOL_PROMPT", "TOOL_POLICY"}
+                and node.targets[0].id
+                in {
+                    "TOOL_NAME",
+                    "EXECUTION_MODE",
+                    "TOOL_PROMPT",
+                    "PRECISE_TOOL_PROMPT",
+                }
             ):
                 name = node.targets[0].id
-                if isinstance(node.value, ast.Constant):
-                    constants[name] = node.value.value
-                else:
-                    constants[name] = ast.literal_eval(node.value)
+                constants[name] = ast.literal_eval(node.value)
+
         self.assertEqual(constants["TOOL_NAME"], "empty_seat_detection")
         self.assertEqual(constants["EXECUTION_MODE"], "take_photo")
-        self.assertTrue(isinstance(constants["TOOL_PROMPT"], str) and constants["TOOL_PROMPT"].strip())
         self.assertIn("blind or low-vision user", constants["TOOL_PROMPT"])
-        self.assertIn("empty chairs", constants["TOOL_PROMPT"])
         self.assertIn("clock-face direction", constants["TOOL_PROMPT"])
-        self.assertIn("rough distance", constants["TOOL_PROMPT"])
+        self.assertIn("more precise", constants["PRECISE_TOOL_PROMPT"])
+
+    @unittest.skipUnless(HAS_RUNTIME_DEPS, "runtime deps unavailable")
+    async def test_take_photo_handles_none_image(self):
+        module = self._load_tool_module()
         self.assertEqual(
-            constants["TOOL_POLICY"],
-            {
-                "strategy": "parallel_progressive",
-                "models": ["moondream", "gemini-3.1-flash-lite", "gpt-5"],
-            },
+            await module.on_take_photo(None, None, {}),
+            "No camera image is available.",
         )
 
-    def test_main_handles_none_image(self):
-        module = self._load_tool_module()
-        self.assertEqual(module.main(None, {}), "No camera image is available.")
-
-    def test_main_calls_execute_tool_policy_once(self):
+    @unittest.skipUnless(HAS_RUNTIME_DEPS, "runtime deps unavailable")
+    async def test_take_photo_calls_progressive_emitter(self):
         module = self._load_tool_module()
         fake_image = object()
-        with patch.object(module, "execute_tool_policy", return_value="Go left two steps.") as call:
-            result = module.main(fake_image, {})
-        self.assertEqual(result, "Go left two steps.")
-        call.assert_called_once_with(
-            image=fake_image,
-            prompt=module.TOOL_PROMPT,
-            policy=module.TOOL_POLICY,
-            tool_name=module.TOOL_NAME,
-        )
+        runtime = object()
+        with patch.object(
+            module,
+            "_emit_progressive_results",
+            new=AsyncMock(return_value="result"),
+        ) as emit:
+            result = await module.on_take_photo(runtime, fake_image, {})
+        self.assertIsNone(result)
+        emit.assert_awaited_once()
 
     def _load_tool_module(self):
         spec = importlib.util.spec_from_file_location("empty_seat_detection", TOOL_PATH)

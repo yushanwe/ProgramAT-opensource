@@ -4,7 +4,6 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -136,24 +135,37 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
     async def _to_thread_inline(function, *args, **kwargs):
         return function(*args, **kwargs)
 
-    async def test_take_photo_calls_exact_selected_model(self):
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Two empty seats."))]
-        )
+    async def test_take_photo_emits_progressive_results(self):
         image = np.zeros((16, 16, 3), dtype=np.uint8)
+        emitted = []
+
+        async def emit(event):
+            emitted.append(event)
+            return True
+
+        runtime = ToolRuntime(
+            client_id="client",
+            tool_name="empty_seat_detection",
+            tool_version="v1",
+            session_id="session",
+            frame_store=FrameStore(),
+            emit_callback=emit,
+        )
         with patch.object(
-            empty_seat_detection, "call_model", return_value=response
+            empty_seat_detection,
+            "_call_selected_model",
+            side_effect=lambda model, provider, frame, prompt: f"{model} seats",
         ) as call, patch.object(
             empty_seat_detection.asyncio,
             "to_thread",
             side_effect=self._to_thread_inline,
         ):
-            result = await empty_seat_detection.on_take_photo(None, image, {})
+            result = await empty_seat_detection.on_take_photo(runtime, image, {})
 
-        self.assertEqual(result, "Two empty seats.")
-        self.assertEqual(
-            call.call_args.args[0], "gemini/gemini-3.1-flash-lite-preview"
-        )
+        self.assertIsNone(result)
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual(len([event for event in emitted if event["partial"]]), 3)
+        self.assertEqual(len([event for event in emitted if event["final"]]), 1)
 
     async def test_tool_owned_similarity_suppresses_same_scene(self):
         emitted = []
@@ -178,7 +190,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             empty_seat_detection,
             "_call_selected_model",
-            side_effect=lambda model, provider, frame: f"{model} result",
+            side_effect=lambda model, provider, frame, prompt: f"{model} result",
         ) as calls, patch.object(
             empty_seat_detection.asyncio,
             "to_thread",
@@ -190,6 +202,44 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls.call_count, 3)
         self.assertEqual(len([event for event in emitted if event["partial"]]), 3)
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
+
+    async def test_tool_runs_precise_pass_when_scene_is_held(self):
+        emitted = []
+
+        async def emit(event):
+            emitted.append(event)
+            return True
+
+        runtime = ToolRuntime(
+            client_id="client",
+            tool_name="empty_seat_detection",
+            tool_version="v1",
+            session_id="session",
+            frame_store=FrameStore(),
+            emit_callback=emit,
+        )
+        await empty_seat_detection.on_stream_start(runtime, {})
+        image = np.full((32, 32, 3), 80, dtype=np.uint8)
+        frame1 = ToolFrame(1, 1.0, image, 32, 32)
+        frame2 = ToolFrame(2, 4.0, image.copy(), 32, 32)
+
+        with patch.object(
+            empty_seat_detection,
+            "_call_selected_model",
+            side_effect=lambda model, provider, frame, prompt: f"{model} result",
+        ) as calls, patch.object(
+            empty_seat_detection.asyncio,
+            "to_thread",
+            side_effect=self._to_thread_inline,
+        ):
+            await empty_seat_detection.on_frame(runtime, frame1)
+            await empty_seat_detection.on_frame(runtime, frame2)
+
+        self.assertEqual(calls.call_count, 4)
+        self.assertEqual(len([event for event in emitted if event["partial"]]), 4)
+        phases = {event["metadata"].get("phase") for event in emitted if event["partial"]}
+        self.assertIn("base", phases)
+        self.assertIn("precise", phases)
 
 
 class TestExecutableToolValidation(unittest.TestCase):
