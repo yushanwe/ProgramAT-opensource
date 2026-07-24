@@ -1,4 +1,4 @@
-"""Find available seating with progressive multi-model output and CLIP scene hold detection."""
+"""Find available seating with progressive multi-model output and CLIP scene detection."""
 
 from __future__ import annotations
 
@@ -20,18 +20,10 @@ TOOL_PROMPT = (
     "relative to the user using clock-face direction and rough distance in feet only. Keep it concise, include empty-seat "
     "count and closest-seat position. If no empty seat is visible, say exactly \"0 empty chairs. No empty seat is visible.\""
 )
-PRECISE_TOOL_PROMPT = (
-    "You are guiding a blind or low-vision user who is holding the camera on the same scene for a more precise answer. "
-    "Carefully verify which seats are truly unoccupied, then return one concise line with: empty-seat count, and closest "
-    "empty seat clock-face direction plus rough distance in feet. If uncertain, state uncertainty briefly. If no empty seat "
-    "is visible, say exactly \"0 empty chairs. No empty seat is visible.\""
-)
-
 SCENE_SIMILARITY_THRESHOLD = 0.975
 FRAME_TO_FRAME_SIMILARITY_THRESHOLD = 0.955
 # Require consecutive changed frames before restarting model calls for a new scene.
 SCENE_CHANGE_CONFIRMATIONS = 2
-SCENE_HOLD_SECONDS = 2.5
 EMBEDDING_FRAME_STRIDE = 2
 CLIP_EMBEDDING_DIM = 512
 HISTOGRAM_FALLBACK_SIZE = (96, 96)
@@ -46,7 +38,6 @@ PROGRESSIVE_MODELS = (
     ("gemini/gemini-3.1-flash-lite-preview", "litellm"),
     ("gpt-5", "openai_responses"),
 )
-PRECISE_MODELS = (("gpt-5", "openai_responses"),)
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +46,9 @@ _clip_model = None
 _clip_processor = None
 _RUNTIME_LOCKS = weakref.WeakKeyDictionary()
 _MODEL_LABELS = {
-    "moondream/moondream3-preview": "moondream",
-    "gemini/gemini-3.1-flash-lite-preview": "gemini",
-    "gpt-5": "gpt",
+    "moondream/moondream3-preview": "Moondream",
+    "gemini/gemini-3.1-flash-lite-preview": "Gemini",
+    "gpt-5": "GPT",
 }
 
 
@@ -299,14 +290,10 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("scene_anchor", None)
     runtime.set_state("scene_generation", 0)
     runtime.set_state("analyzing_generation", None)
-    runtime.set_state("completed_generation", None)
-    runtime.set_state("precise_generation", None)
-    runtime.set_state("scene_started_at", None)
     runtime.set_state("last_embedding", None)
     runtime.set_state("last_embedding_frame_id", 0)
     runtime.set_state("scene_change_streak", 0)
     runtime.set_state("base_task", None)
-    runtime.set_state("precise_task", None)
 
 
 def _get_or_create_scene_lock(runtime):
@@ -347,7 +334,6 @@ async def _run_stream_phase(
     prompt: str,
     models,
     phase: str,
-    completion_key: str | None,
 ):
     try:
         await _emit_progressive_results(
@@ -359,11 +345,6 @@ async def _run_stream_phase(
             frame_id=frame.frame_id,
             phase=phase,
         )
-        if (
-            completion_key
-            and runtime.get_state("scene_generation") == generation
-        ):
-            runtime.set_state(completion_key, generation)
     finally:
         if runtime.get_state("analyzing_generation") == generation:
             runtime.set_state("analyzing_generation", None)
@@ -414,17 +395,11 @@ async def on_frame(runtime, frame):
             generation += 1
             runtime.set_state("scene_generation", generation)
             runtime.set_state("scene_anchor", embedding)
-            runtime.set_state("scene_started_at", frame.timestamp)
-            runtime.set_state("completed_generation", None)
-            runtime.set_state("precise_generation", None)
             runtime.set_state("analyzing_generation", generation)
 
             old_base_task = runtime.get_state("base_task")
-            old_precise_task = runtime.get_state("precise_task")
             if _task_is_running(old_base_task):
                 old_base_task.cancel()
-            if _task_is_running(old_precise_task):
-                old_precise_task.cancel()
 
             base_task = asyncio.create_task(
                 _run_stream_phase(
@@ -434,7 +409,6 @@ async def on_frame(runtime, frame):
                     TOOL_PROMPT,
                     PROGRESSIVE_MODELS,
                     "base",
-                    "completed_generation",
                 )
             )
             _register_task(runtime, "base_task", base_task)
@@ -445,43 +419,9 @@ async def on_frame(runtime, frame):
         if _task_is_running(runtime.get_state("base_task")):
             return
 
-        started_at = runtime.get_state("scene_started_at")
-        if started_at is None:
-            runtime.set_state("scene_started_at", frame.timestamp)
-            return
-
-        elapsed = max(0.0, float(frame.timestamp) - float(started_at))
-        completed_generation = runtime.get_state("completed_generation")
-        precise_generation = runtime.get_state("precise_generation")
-        precise_task = runtime.get_state("precise_task")
-        if (
-            completed_generation == generation
-            and precise_generation != generation
-            and elapsed >= SCENE_HOLD_SECONDS
-            and not _task_is_running(precise_task)
-        ):
-            runtime.set_state("analyzing_generation", generation)
-            next_precise_task = asyncio.create_task(
-                _run_stream_phase(
-                    runtime,
-                    frame,
-                    generation,
-                    PRECISE_TOOL_PROMPT,
-                    PRECISE_MODELS,
-                    "precise",
-                    "precise_generation",
-                )
-            )
-            _register_task(runtime, "precise_task", next_precise_task)
-            return
-
 
 async def on_stream_stop(runtime):
-    tasks = [
-        task
-        for task in (runtime.get_state("base_task"), runtime.get_state("precise_task"))
-        if _task_is_running(task)
-    ]
+    tasks = [task for task in (runtime.get_state("base_task"),) if _task_is_running(task)]
     for task in tasks:
         task.cancel()
     if tasks:

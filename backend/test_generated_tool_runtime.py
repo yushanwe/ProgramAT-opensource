@@ -136,15 +136,11 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         return function(*args, **kwargs)
 
     async def _wait_until_settled(self, runtime, timeout=0.2):
-        """Wait until base/precise scene tasks are absent or finished."""
+        """Wait until the scene task is absent or finished."""
         async def _poll():
             while True:
                 base_task = runtime.get_state("base_task")
-                precise_task = runtime.get_state("precise_task")
-                if all(
-                    task is None or task.done()
-                    for task in (base_task, precise_task)
-                ):
+                if base_task is None or base_task.done():
                     return
                 await asyncio.sleep(0)
 
@@ -199,7 +195,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             {event["text"].split(": ", 1)[0] for event in partial_events},
-            {"moondream", "gemini", "gpt"},
+            {"Moondream", "Gemini", "GPT"},
         )
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
 
@@ -244,7 +240,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             failures[0]["metadata"].get("model"),
             "moondream/moondream3-preview",
         )
-        self.assertTrue(failures[0]["text"].startswith("moondream:"))
+        self.assertTrue(failures[0]["text"].startswith("Moondream:"))
         self.assertIn("moondream unavailable", failures[0]["metadata"].get("error", ""))
 
     async def test_take_photo_emits_failure_for_all_failed_models(self):
@@ -328,7 +324,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([event for event in emitted if event["partial"]]), 3)
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
 
-    async def test_tool_runs_precise_pass_when_scene_is_held(self):
+    async def test_scene_hold_does_not_start_extra_precision_run(self):
         emitted = []
 
         async def emit(event):
@@ -347,7 +343,6 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         image = np.full((32, 32, 3), 80, dtype=np.uint8)
         frame1 = ToolFrame(1, 1.0, image, 32, 32)
         frame2 = ToolFrame(2, 4.0, image.copy(), 32, 32)
-        frame3 = ToolFrame(3, 4.1, image.copy(), 32, 32)
 
         with patch.object(
             empty_seat_detection,
@@ -362,14 +357,11 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             await self._wait_until_settled(runtime)
             await empty_seat_detection.on_frame(runtime, frame2)
             await self._wait_until_settled(runtime)
-            await empty_seat_detection.on_frame(runtime, frame3)
-            await self._wait_until_settled(runtime)
 
-        self.assertEqual(calls.call_count, 4)
-        self.assertEqual(len([event for event in emitted if event["partial"]]), 4)
+        self.assertEqual(calls.call_count, 3)
+        self.assertEqual(len([event for event in emitted if event["partial"]]), 3)
         phases = {event["metadata"].get("phase") for event in emitted if event["partial"]}
-        self.assertIn("base", phases)
-        self.assertIn("precise", phases)
+        self.assertEqual(phases, {"base"})
 
     async def test_small_camera_movement_stays_same_scene(self):
         emitted = []
