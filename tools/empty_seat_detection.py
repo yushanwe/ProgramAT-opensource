@@ -317,7 +317,13 @@ def _ensure_scene_lock(runtime):
 
 
 def _task_is_running(task) -> bool:
-    return task is not None and not task.done()
+    if task is None:
+        return False
+    try:
+        return not task.done()
+    except Exception:
+        logger.exception("[empty_seat_detection] invalid task state")
+        return False
 
 
 def _register_task(runtime, key: str, task):
@@ -330,8 +336,13 @@ def _register_task(runtime, key: str, task):
             completed_task.exception()
         except asyncio.CancelledError:
             pass
-        except Exception:
-            logger.exception("[empty_seat_detection] scene task failed key=%s", key)
+        except Exception as exc:
+            logger.exception(
+                "[empty_seat_detection] scene task failed key=%s error=%s: %s",
+                key,
+                type(exc).__name__,
+                exc,
+            )
 
     task.add_done_callback(_clear_task)
 

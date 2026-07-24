@@ -135,6 +135,18 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
     async def _to_thread_inline(function, *args, **kwargs):
         return function(*args, **kwargs)
 
+    async def _wait_until_settled(self, runtime, max_ticks=20):
+        for _ in range(max_ticks):
+            base_task = runtime.get_state("base_task")
+            precise_task = runtime.get_state("precise_task")
+            if all(
+                task is None or task.done()
+                for task in (base_task, precise_task)
+            ):
+                return
+            await asyncio.sleep(0)
+        self.fail("Timed out waiting for scene tasks to settle")
+
     async def test_take_photo_emits_progressive_results(self):
         image = np.zeros((16, 16, 3), dtype=np.uint8)
         emitted = []
@@ -295,9 +307,9 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
-            await asyncio.sleep(0.01)
+            await self._wait_until_settled(runtime)
             await empty_seat_detection.on_frame(runtime, frame2)
-            await asyncio.sleep(0.01)
+            await self._wait_until_settled(runtime)
 
         self.assertEqual(calls.call_count, 3)
         self.assertEqual(runtime.get_state("scene_generation"), 1)
@@ -336,11 +348,11 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
-            await asyncio.sleep(0.01)
+            await self._wait_until_settled(runtime)
             await empty_seat_detection.on_frame(runtime, frame2)
-            await asyncio.sleep(0.01)
+            await self._wait_until_settled(runtime)
             await empty_seat_detection.on_frame(runtime, frame3)
-            await asyncio.sleep(0.01)
+            await self._wait_until_settled(runtime)
 
         self.assertEqual(calls.call_count, 4)
         self.assertEqual(len([event for event in emitted if event["partial"]]), 4)
@@ -393,9 +405,9 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
-            await asyncio.sleep(0)
+            await self._wait_until_settled(runtime)
             await empty_seat_detection.on_frame(runtime, frame2)
-            await asyncio.sleep(0)
+            await self._wait_until_settled(runtime)
 
         self.assertEqual(calls.call_count, 3)
 
@@ -435,11 +447,17 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
             side_effect=self._to_thread_inline,
         ):
             await empty_seat_detection.on_frame(runtime, frame1)
-            await asyncio.sleep(0)
+            for _ in range(20):
+                if runtime.get_state("base_task") is not None:
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("Timed out waiting for base task to start")
             await empty_seat_detection.on_frame(runtime, frame2)
             hold.set()
-            await asyncio.sleep(0)
+            await self._wait_until_settled(runtime)
             await empty_seat_detection.on_frame(runtime, frame3)
+            await self._wait_until_settled(runtime)
 
         self.assertEqual(emit_progressive.await_count, 1)
 
