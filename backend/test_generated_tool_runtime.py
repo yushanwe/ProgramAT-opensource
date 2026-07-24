@@ -241,6 +241,47 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         self.assertIn("base", phases)
         self.assertIn("precise", phases)
 
+    async def test_small_camera_movement_stays_same_scene(self):
+        emitted = []
+
+        async def emit(event):
+            emitted.append(event)
+            return True
+
+        runtime = ToolRuntime(
+            client_id="client",
+            tool_name="empty_seat_detection",
+            tool_version="v1",
+            session_id="session",
+            frame_store=FrameStore(),
+            emit_callback=emit,
+        )
+        await empty_seat_detection.on_stream_start(runtime, {})
+        image = np.full((32, 32, 3), 80, dtype=np.uint8)
+        frame1 = ToolFrame(1, 1.0, image, 32, 32)
+        frame2 = ToolFrame(3, 2.0, image.copy(), 32, 32)
+        e1 = np.array([1.0, 0.0], dtype=np.float32)
+        e2 = np.array([0.96, 0.28], dtype=np.float32)
+        e2 = e2 / np.linalg.norm(e2)
+
+        with patch.object(
+            empty_seat_detection,
+            "_call_selected_model",
+            side_effect=lambda model, provider, frame, prompt: f"{model} result",
+        ) as calls, patch.object(
+            empty_seat_detection,
+            "compute_scene_embedding",
+            side_effect=[e1, e2],
+        ), patch.object(
+            empty_seat_detection.asyncio,
+            "to_thread",
+            side_effect=self._to_thread_inline,
+        ):
+            await empty_seat_detection.on_frame(runtime, frame1)
+            await empty_seat_detection.on_frame(runtime, frame2)
+
+        self.assertEqual(calls.call_count, 3)
+
 
 class TestExecutableToolValidation(unittest.TestCase):
     def test_allows_direct_model_calls_async_and_local_similarity(self):

@@ -24,7 +24,9 @@ PRECISE_TOOL_PROMPT = (
     "is visible, say exactly \"0 empty chairs. No empty seat is visible.\""
 )
 
-SCENE_SIMILARITY_THRESHOLD = 0.985
+SCENE_SIMILARITY_THRESHOLD = 0.975
+SMALL_MOTION_SIMILARITY_THRESHOLD = 0.955
+SCENE_CHANGE_CONFIRMATIONS = 2
 SCENE_HOLD_SECONDS = 2.5
 EMBEDDING_FRAME_STRIDE = 2
 CLIP_EMBEDDING_DIM = 512
@@ -99,6 +101,14 @@ def is_same_scene(
     return cosine_similarity(reference, current) >= threshold
 
 
+def _blend_scene_anchor(reference: np.ndarray, current: np.ndarray) -> np.ndarray:
+    blended = (0.85 * reference.astype(np.float32)) + (0.15 * current.astype(np.float32))
+    norm = float(np.linalg.norm(blended))
+    if norm < 1e-10:
+        return current
+    return blended / norm
+
+
 def _call_selected_model(
     model_name: str, provider: str, image: np.ndarray, prompt: str
 ) -> str:
@@ -144,6 +154,14 @@ async def _emit_progressive_results(
     first_text = None
     try:
         for completed in asyncio.as_completed(tasks):
+            if runtime is not None and (
+                runtime.is_cancelled()
+                or (
+                    generation is not None
+                    and runtime.get_state("scene_generation") != generation
+                )
+            ):
+                break
             model_name, text, _error = await completed
             if text and first_text is None:
                 first_text = text
@@ -215,6 +233,7 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("scene_started_at", None)
     runtime.set_state("last_embedding", None)
     runtime.set_state("last_embedding_frame_id", 0)
+    runtime.set_state("scene_change_streak", 0)
 
 
 async def _run_stream_phase(
@@ -263,7 +282,23 @@ async def on_frame(runtime, frame):
         runtime.set_state("last_embedding_frame_id", frame.frame_id)
     anchor = runtime.get_state("scene_anchor")
     generation = int(runtime.get_state("scene_generation", 0))
-    same_scene = anchor is not None and is_same_scene(anchor, embedding)
+    if anchor is None:
+        same_scene = False
+    else:
+        anchor_similarity = cosine_similarity(anchor, embedding)
+        previous_similarity = cosine_similarity(cached_embedding, embedding)
+        same_scene = (
+            anchor_similarity >= SCENE_SIMILARITY_THRESHOLD
+            or previous_similarity >= SMALL_MOTION_SIMILARITY_THRESHOLD
+        )
+
+    if not same_scene and anchor is not None:
+        streak = int(runtime.get_state("scene_change_streak", 0)) + 1
+        runtime.set_state("scene_change_streak", streak)
+        if streak < SCENE_CHANGE_CONFIRMATIONS:
+            return
+    else:
+        runtime.set_state("scene_change_streak", 0)
 
     if not same_scene:
         next_generation = generation + 1
@@ -286,6 +321,7 @@ async def on_frame(runtime, frame):
             "completed_generation",
         )
         return
+    runtime.set_state("scene_anchor", _blend_scene_anchor(anchor, embedding))
 
     started_at = runtime.get_state("scene_started_at")
     if started_at is None:
