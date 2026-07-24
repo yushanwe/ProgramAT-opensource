@@ -29,8 +29,12 @@ import Voice, {
   SpeechErrorEvent,
 } from '@react-native-voice/voice';
 import {
+  appendProgressiveResult,
   acceptsProgressiveResult,
+  acceptsStreamingProgressEvent,
+  formatProgressiveResult,
   progressiveInvocationIsRunning,
+  progressiveResultModel,
 } from './progressiveResults';
 
 // Configuration for text similarity filtering
@@ -98,6 +102,7 @@ export default function ToolRunner({
   const [toolOutput, setToolOutput] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [isStreamProcessing, setIsStreamProcessing] = useState(false);
   const isStreamingRef = useRef(false); // Ref to avoid stale closures in cleanup effects
   const [audioEnabled, setAudioEnabled] = useState(true); // Toggle audio output
   const [conversationMode, setConversationMode] = useState(false); // Toggle conversation mode
@@ -110,6 +115,7 @@ export default function ToolRunner({
   const lastStreamingExecutionRef = useRef(0);
   const activeProgressiveInvocationRef = useRef<string | null>(null);
   const lastProgressiveResultIndexRef = useRef(0);
+  const progressiveResultsRef = useRef<string[]>([]);
   
   // Custom GPT follow-up state
   const [isCustomGptStreaming, setIsCustomGptStreaming] = useState(false);
@@ -574,7 +580,7 @@ export default function ToolRunner({
   // Loading sound effect - play when running one-shot tools, but NOT when streaming (too much noise)
   useEffect(() => {
     let beepTimer: ReturnType<typeof setTimeout> | null = null;
-    const isLoading = isRunning; // Only beep for one-shot tools, not streaming
+    const isLoading = isRunning && !isStreaming;
     
     if (isLoading) {
       console.log('[ToolRunner] Tool running, will beep after 3 seconds if still processing');
@@ -605,6 +611,10 @@ export default function ToolRunner({
         console.log('[ToolRunner] Received message type:', message.type);
         
         if (message.type === 'tool_progress_started') {
+          if (!acceptsStreamingProgressEvent(isStreamingRef.current, message)) {
+            console.log('[ToolProgress] late streaming start ignored:', message.invocation_id);
+            return;
+          }
           console.log(
             '[Progressive] event_received_frontend',
             'invocation_id=', message.invocation_id,
@@ -629,7 +639,7 @@ export default function ToolRunner({
           console.log(
             '[Progressive] event_received_frontend',
             'invocation_id=', message.invocation_id,
-            'model=', message.model || 'none',
+            'model=', progressiveResultModel(message) || 'none',
             'result_index=', message.result_index,
             'final=', Boolean(message.final),
             'stale=', !accepted,
@@ -641,7 +651,9 @@ export default function ToolRunner({
           }
           lastProgressiveResultIndexRef.current = message.result_index;
           if (message.final) {
-            if (!isStreamingRef.current) {
+            if (message.mode === 'streaming') {
+              setIsStreamProcessing(false);
+            } else {
               setIsRunning(progressiveInvocationIsRunning(message));
             }
             return;
@@ -769,6 +781,10 @@ export default function ToolRunner({
             }
           }
         } else if (message.type === 'tool_stream_result') {
+          if (!isStreamingRef.current) {
+            console.log('[Streaming UI] result ignored because streaming is inactive');
+            return;
+          }
           // Streaming result - update continuously
           console.log('[Streaming UI] websocket result received, execution:', message.execution_id);
           if (
@@ -818,10 +834,17 @@ export default function ToolRunner({
             console.log('[ToolRunner] NOT checking similarity - audioEnabled:', audioEnabled, 'result exists:', !!result);
           }
         } else if (message.type === 'streaming_started') {
+          if (!isStreamingRef.current) {
+            console.log('[ToolRunner] Late streaming_started ignored');
+            return;
+          }
           console.log('[ToolRunner] Server confirmed streaming started');
           const mode = message.mode || 'code_execution';
           console.log('[ToolRunner] Streaming mode:', mode);
           setIsStreaming(true);
+          setIsStreamProcessing(false);
+          setIsRunning(false);
+          BeepService.stopLoadingSound();
           lastStreamingExecutionRef.current = 0;
           setIsCustomGptStreaming(mode === 'gemini_live');
           setToolOutput(`Streaming started: ${message.tool_name || 'tool'}${mode === 'gemini_live' ? ' (Gemini Live)' : ''}`);
@@ -833,6 +856,10 @@ export default function ToolRunner({
             });
           }
         } else if (message.type === 'live_followup_response') {
+          if (!isStreamingRef.current) {
+            console.log('[ToolRunner] Late live follow-up response ignored');
+            return;
+          }
           // Handle Gemini Live follow-up responses
           console.log('[ToolRunner] Live follow-up response:', message.text?.substring(0, 100));
           setIsProcessingFollowup(false);
@@ -853,7 +880,12 @@ export default function ToolRunner({
           }
         } else if (message.type === 'streaming_stopped') {
           console.log('[ToolRunner] Server confirmed streaming stopped');
+          isStreamingRef.current = false;
           setIsStreaming(false);
+          setIsStreamProcessing(false);
+          setIsRunning(false);
+          activeProgressiveInvocationRef.current = null;
+          BeepService.stopLoadingSound();
           setIsCustomGptStreaming(false);
           setIsListeningFollowup(false);
           setFollowupTranscript('');
@@ -877,12 +909,19 @@ export default function ToolRunner({
             // Don't update streaming text tracking for status messages
           }
         } else if (message.type === 'tool_stream_error') {
+          if (!isStreamingRef.current) {
+            console.log('[ToolRunner] Late stream error ignored');
+            return;
+          }
           console.log('[ToolRunner] Stream error:', message.error);
           const error = `Stream Error: ${message.error}`;
           setToolOutput(error);
           
           // Stop streaming on error
+          isStreamingRef.current = false;
           setIsStreaming(false);
+          setIsStreamProcessing(false);
+          BeepService.stopLoadingSound();
           
           if (cameraViewRef.current) {
             cameraViewRef.current.stopStreaming();
@@ -1019,6 +1058,7 @@ export default function ToolRunner({
     setToolOutput('Running tool...');
     activeProgressiveInvocationRef.current = null;
     lastProgressiveResultIndexRef.current = 0;
+    progressiveResultsRef.current = [];
 
     // Generate conversation ID if this is a conversation run
     const conversationId = isConversation ? `conv_${Date.now()}` : undefined;
@@ -1079,8 +1119,16 @@ export default function ToolRunner({
       console.warn('[ToolRunner] Camera ref not available');
     }
     
-    // Set state optimistically for immediate UI feedback
+    // Start a fresh session optimistically for immediate UI feedback.
+    isStreamingRef.current = true;
     setIsStreaming(true);
+    setIsStreamProcessing(false);
+    setIsRunning(false);
+    activeProgressiveInvocationRef.current = null;
+    lastProgressiveResultIndexRef.current = 0;
+    progressiveResultsRef.current = [];
+    lastStreamingExecutionRef.current = 0;
+    BeepService.stopLoadingSound();
     setToolOutput('Starting stream...');
     
     const message: any = {
@@ -1119,7 +1167,9 @@ export default function ToolRunner({
       console.error('[ToolRunner] WebSocket not open');
       const errorMsg = 'Error: Not connected to server';
       setToolOutput(errorMsg);
+      isStreamingRef.current = false;
       setIsStreaming(false);  // Revert state on failure
+      setIsStreamProcessing(false);
       
       // Announce error via VoiceOver
       AccessibilityInfo.announceForAccessibility('Not connected to server. Please connect first.');
@@ -1133,6 +1183,17 @@ export default function ToolRunner({
 
   const stopStreamingTool = () => {
     console.log('[ToolRunner] Stopping streaming mode');
+
+    // Invalidate the session before any asynchronous cleanup so late events cannot
+    // update the UI or trigger speech.
+    isStreamingRef.current = false;
+    activeProgressiveInvocationRef.current = null;
+    lastProgressiveResultIndexRef.current = 0;
+    progressiveResultsRef.current = [];
+    lastStreamingExecutionRef.current = 0;
+    setIsStreamProcessing(false);
+    setIsRunning(false);
+    BeepService.stopLoadingSound();
     
     // Stop camera frame streaming automatically
     if (cameraViewRef.current) {
@@ -1237,7 +1298,7 @@ export default function ToolRunner({
                   accessibilityRole="button"
                   accessibilityState={{ disabled: shouldDisableStreamButton }}>
                   <Text style={styles.buttonText}>
-                    {isStreaming ? 'Stop' : 'Stream'}
+                    {isStreaming ? 'Stop Streaming' : 'Start Streaming'}
                   </Text>
                 </TouchableOpacity>
 
@@ -1305,6 +1366,11 @@ export default function ToolRunner({
                   </Text>
                 </TouchableOpacity>
               </View>
+              {isStreaming && isStreamProcessing && (
+                <Text style={styles.streamProcessingStatus} accessibilityLiveRegion="polite">
+                  Analyzing current scene…
+                </Text>
+              )}
 
               {/* Follow-up mic button - shown during custom GPT streaming */}
               {isCustomGptStreaming && isStreaming && (
@@ -1684,6 +1750,12 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.5,
+  },
+  streamProcessingStatus: {
+    color: '#666',
+    fontSize: 12,
+    marginTop: 4,
+    textAlign: 'center',
   },
   runButton: {
     backgroundColor: '#4CAF50',
