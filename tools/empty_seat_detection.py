@@ -33,6 +33,9 @@ CLIP_EMBEDDING_DIM = 512
 HISTOGRAM_FALLBACK_SIZE = (96, 96)
 HISTOGRAM_FALLBACK_BINS = [32, 16]
 HISTOGRAM_FALLBACK_RANGES = [0, 180, 0, 256]
+ANCHOR_BLEND_REFERENCE_WEIGHT = 0.85
+ANCHOR_BLEND_CURRENT_WEIGHT = 0.15
+NORMALIZATION_EPSILON = 1e-10
 
 PROGRESSIVE_MODELS = (
     ("moondream/moondream3-preview", "litellm"),
@@ -102,9 +105,11 @@ def is_same_scene(
 
 
 def _blend_scene_anchor(reference: np.ndarray, current: np.ndarray) -> np.ndarray:
-    blended = (0.85 * reference.astype(np.float32)) + (0.15 * current.astype(np.float32))
+    blended = (
+        ANCHOR_BLEND_REFERENCE_WEIGHT * reference.astype(np.float32)
+    ) + (ANCHOR_BLEND_CURRENT_WEIGHT * current.astype(np.float32))
     norm = float(np.linalg.norm(blended))
-    if norm < 1e-10:
+    if norm < NORMALIZATION_EPSILON:
         return current
     return blended / norm
 
@@ -286,10 +291,10 @@ async def on_frame(runtime, frame):
         same_scene = False
     else:
         anchor_similarity = cosine_similarity(anchor, embedding)
-        previous_similarity = cosine_similarity(cached_embedding, embedding)
+        cached_similarity = cosine_similarity(cached_embedding, embedding)
         same_scene = (
             anchor_similarity >= SCENE_SIMILARITY_THRESHOLD
-            or previous_similarity >= SMALL_MOTION_SIMILARITY_THRESHOLD
+            or cached_similarity >= SMALL_MOTION_SIMILARITY_THRESHOLD
         )
 
     if not same_scene and anchor is not None:
