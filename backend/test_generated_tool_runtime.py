@@ -324,7 +324,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([event for event in emitted if event["partial"]]), 3)
         self.assertEqual(len([event for event in emitted if event["final"]]), 1)
 
-    async def test_scene_hold_does_not_start_extra_precision_run(self):
+    async def test_scene_hold_maintains_single_analysis(self):
         emitted = []
 
         async def emit(event):
