@@ -7,7 +7,7 @@ import asyncio
 import cv2
 import numpy as np
 
-from litellm_utils import call_model, extract_text
+from litellm_utils import call_model, call_openai_responses_model, extract_text
 
 TOOL_NAME = "exit_finder"
 TOOL_PROMPT = (
@@ -19,6 +19,15 @@ TOOL_PROMPT = (
 )
 
 SCENE_SIMILARITY_THRESHOLD = 0.985
+
+# Models run in parallel for streaming; results are emitted as each finishes.
+# Moondream is fastest (quick first answer), Gemini is balanced, GPT-5 is most
+# accurate for ambiguous scenes.
+PROGRESSIVE_MODELS = (
+    ("moondream/moondream3-preview", "litellm"),
+    ("gemini/gemini-3.1-flash-lite-preview", "litellm"),
+    ("gpt-5", "openai_responses"),
+)
 
 
 def _compute_scene_embedding(image: np.ndarray) -> np.ndarray:
@@ -44,8 +53,26 @@ def _is_same_scene(reference: np.ndarray, current: np.ndarray) -> bool:
     return _cosine_similarity(reference, current) >= SCENE_SIMILARITY_THRESHOLD
 
 
+def _call_model(model_name: str, provider: str, image: np.ndarray) -> str:
+    if provider == "openai_responses":
+        return call_openai_responses_model(
+            model_name,
+            TOOL_PROMPT,
+            image,
+            reasoning_effort="medium",
+            timeout=60,
+        )
+    response = call_model(
+        model_name,
+        [{"role": "user", "content": TOOL_PROMPT}],
+        images=[image],
+        metadata={"timeout": 60, "num_retries": 0},
+    )
+    return extract_text(response)
+
+
 async def on_take_photo(runtime, image, input_data):
-    """Analyze one image to locate an exit."""
+    """Analyze one image to locate an exit using a fast, accurate model."""
     del runtime, input_data
     if image is None:
         return "No camera image is available."
@@ -69,7 +96,7 @@ async def on_stream_start(runtime, input_data):
 
 
 async def on_frame(runtime, frame):
-    """Analyze each distinct scene once and emit the exit-finding result."""
+    """Analyze each distinct scene with progressive models and emit results as they finish."""
     if runtime.is_cancelled():
         return
 
@@ -93,32 +120,65 @@ async def on_frame(runtime, frame):
         return
     runtime.set_state("analyzing_generation", generation)
 
-    try:
-        text = await asyncio.to_thread(
-            lambda: extract_text(
-                call_model(
-                    "gemini/gemini-3.1-flash-lite-preview",
-                    [{"role": "user", "content": TOOL_PROMPT}],
-                    [frame.image],
-                    {"timeout": 60, "num_retries": 0},
-                )
+    async def run_model(model_name: str, provider: str):
+        try:
+            text = await asyncio.to_thread(
+                _call_model, model_name, provider, frame.image
             )
-        )
-        if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
-            return
-        if text:
+            return model_name, text, None
+        except Exception as exc:
+            return model_name, "", str(exc)
+
+    tasks = [
+        asyncio.create_task(run_model(model_name, provider))
+        for model_name, provider in PROGRESSIVE_MODELS
+    ]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            model_name, text, error = await completed
+            if (
+                runtime.is_cancelled()
+                or runtime.get_state("scene_generation") != generation
+            ):
+                continue
+            if text:
+                await runtime.emit(
+                    text,
+                    partial=True,
+                    metadata={
+                        "model": model_name,
+                        "scene_generation": generation,
+                        "frame_id": frame.frame_id,
+                    },
+                )
+            elif error:
+                await runtime.emit(
+                    "",
+                    partial=True,
+                    metadata={
+                        "model": model_name,
+                        "error": error,
+                        "scene_generation": generation,
+                    },
+                )
+        if (
+            not runtime.is_cancelled()
+            and runtime.get_state("scene_generation") == generation
+        ):
+            runtime.set_state("completed_generation", generation)
             await runtime.emit(
-                text,
+                "",
                 final=True,
                 metadata={
-                    "model": "gemini/gemini-3.1-flash-lite-preview",
                     "scene_generation": generation,
                     "frame_id": frame.frame_id,
                 },
             )
-        if runtime.get_state("scene_generation") == generation:
-            runtime.set_state("completed_generation", generation)
     finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if runtime.get_state("analyzing_generation") == generation:
             runtime.set_state("analyzing_generation", None)
 
