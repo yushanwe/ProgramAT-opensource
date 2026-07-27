@@ -11,11 +11,12 @@ from litellm_utils import call_model, extract_text
 
 TOOL_NAME = "card_identification"
 TOOL_PROMPT = (
-    "Identify visible playing cards clearly. When one image is available, report "
-    "the card the user is pointing to concisely, such as 'Nine of hearts.' When "
-    "multiple chronological frames are available showing a swipe through cards, "
-    "report all distinct cards in the hand, such as 'Nine of hearts, two of spades, "
-    "jack of diamonds.' If no cards are visible or evidence is insufficient, say so."
+    "Identify visible playing cards clearly. If one card is prominently visible "
+    "or stands out from others (such as being pulled forward), report only that "
+    "card concisely, such as 'Nine of hearts.' If multiple cards are being shown "
+    "in a swipe motion across frames, report all distinct cards seen, such as "
+    "'Nine of hearts, two of spades, jack of diamonds.' If no cards are visible "
+    "or evidence is insufficient, say so."
 )
 
 
@@ -40,11 +41,12 @@ async def on_stream_start(runtime, input_data):
     del input_data
     runtime.set_state("seen_cards", set())
     runtime.set_state("last_result", None)
+    runtime.set_state("last_single_card", None)
     runtime.set_state("frames_processed", 0)
 
 
 async def on_frame(runtime, frame):
-    """Process each frame and accumulate cards from swipe gesture."""
+    """Process each frame for single-card or swipe-gesture detection."""
     if runtime.is_cancelled():
         return
 
@@ -56,7 +58,7 @@ async def on_frame(runtime, frame):
     if not recent_frames:
         return
 
-    # Use multiple frames to understand swipe motion
+    # Use multiple frames to understand context
     images = [f.image for f in recent_frames]
 
     # Call model with recent frames to detect cards
@@ -72,21 +74,40 @@ async def on_frame(runtime, frame):
     # Update frames processed count
     runtime.set_state("frames_processed", frames_processed + 1)
 
-    # Parse detected cards and update seen_cards state
-    seen_cards = runtime.get_state("seen_cards", set())
+    if not text or text.lower() in ["no cards visible", "insufficient evidence"]:
+        return
 
-    # Extract card names from the response
-    # The model should return something like "Nine of hearts, two of spades"
-    if text and text.lower() not in ["no cards visible", "insufficient evidence"]:
-        # Split by common delimiters
-        cards = [card.strip() for card in text.replace(" and ", ", ").split(",")]
+    # Parse the response - check if it's a single card or multiple cards
+    # Split by common delimiters
+    cards = [card.strip() for card in text.replace(" and ", ", ").split(",")]
+    cards = [card for card in cards if card]
+
+    if not cards:
+        return
+
+    # If only one card detected, it's likely a "pulled out" card - report immediately
+    if len(cards) == 1:
+        single_card = cards[0]
+        last_single = runtime.get_state("last_single_card")
+
+        # Only emit if it's a different card than last time
+        if single_card != last_single:
+            runtime.set_state("last_single_card", single_card)
+            await runtime.emit(
+                single_card,
+                partial=True,
+                metadata={"frame_id": frame.frame_id, "mode": "single_card"},
+            )
+    else:
+        # Multiple cards detected - accumulate for swipe mode
+        runtime.set_state("last_single_card", None)  # Clear single card state
+        seen_cards = runtime.get_state("seen_cards", set())
+
         for card in cards:
-            if card:
-                seen_cards.add(card)
+            seen_cards.add(card)
         runtime.set_state("seen_cards", seen_cards)
 
-    # Emit partial result showing accumulated cards
-    if seen_cards:
+        # Emit partial result showing accumulated cards
         accumulated_result = ", ".join(sorted(seen_cards))
         last_result = runtime.get_state("last_result")
         if accumulated_result != last_result:
@@ -94,7 +115,7 @@ async def on_frame(runtime, frame):
             await runtime.emit(
                 accumulated_result,
                 partial=True,
-                metadata={"frame_id": frame.frame_id, "card_count": len(seen_cards)},
+                metadata={"frame_id": frame.frame_id, "card_count": len(seen_cards), "mode": "swipe"},
             )
 
 
