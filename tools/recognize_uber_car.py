@@ -33,7 +33,9 @@ def _scene_fingerprint(image: np.ndarray) -> np.ndarray:
     )
 
 
-def _scene_difference(previous: np.ndarray, current: np.ndarray) -> float | None:
+def _scene_difference(
+    previous: np.ndarray | None, current: np.ndarray | None
+) -> float | None:
     if previous is None or current is None or previous.shape != current.shape:
         return None
     return float(np.mean(np.abs(previous - current)))
@@ -47,12 +49,15 @@ def _normalize_response(text: str) -> str:
 
 
 def _run_model(image: np.ndarray) -> str:
-    response = call_model(
-        MODEL_NAME,
-        [{"role": "user", "content": TOOL_PROMPT}],
-        images=[image],
-        metadata={"timeout": MODEL_TIMEOUT_SECONDS, "num_retries": 0},
-    )
+    try:
+        response = call_model(
+            MODEL_NAME,
+            [{"role": "user", "content": TOOL_PROMPT}],
+            images=[image],
+            metadata={"timeout": MODEL_TIMEOUT_SECONDS, "num_retries": 0},
+        )
+    except Exception:
+        return "Not enough evidence: Unable to analyze the image at this time."
     return _normalize_response(extract_text(response))
 
 
