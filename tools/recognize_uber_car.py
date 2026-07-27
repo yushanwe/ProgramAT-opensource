@@ -12,13 +12,15 @@ from litellm_utils import call_model, extract_text
 
 TOOL_NAME = "recognize_uber_car"
 TOOL_PROMPT = (
-    "For a blind or low-vision user, analyze the visible vehicles using only what "
-    "is in frame. If the user has not confirmed the car yet, respond with one short "
-    "sentence that starts with exactly one of: 'Likely Uber:', 'Unlikely Uber:', or "
-    "'Not enough evidence:'. If the user has confirmed the target car details, switch "
-    "to passenger-door guidance: identify where the passenger-side door appears in "
-    "clock-face direction (9-12 or 1-3 only), estimate distance, and give one concise "
-    "action instruction to reach it. If uncertain, say so plainly."
+    "For a blind or low-vision user, analyze visible vehicles using only the current "
+    "frame. 1) Determine whether the target vehicle is visible and, when relevant, "
+    "whether it likely matches the requested Uber. 2) If confirmed_vehicle is true and "
+    "the target appears visible, locate the passenger-side door and describe direction "
+    "using only 9-12 or 1-3 o'clock plus approximate distance and one concise action to "
+    "reach it. 3) If confirmed_vehicle is false, respond with one short sentence that "
+    "starts with exactly one of: 'Likely Uber:', 'Unlikely Uber:', or "
+    "'Not enough evidence:'. If confirmed_vehicle is true, start with 'Door guidance:' "
+    "or 'Not enough evidence:' when the door cannot be located confidently."
 )
 
 MODEL_NAME = "gemini/gemini-3.1-flash-lite-preview"
@@ -29,6 +31,7 @@ SCENE_DIFF_THRESHOLD = 2.0
 MODEL_TIMEOUT_SECONDS = 45
 
 LOGGER = logging.getLogger(__name__)
+CONFIRMED_VEHICLE_KEY = "confirmed_vehicle"
 
 
 def _scene_fingerprint(image: np.ndarray) -> np.ndarray:
@@ -58,18 +61,8 @@ def _normalize_input_data(input_data: object) -> dict:
     return input_data if isinstance(input_data, dict) else {}
 
 
-def _is_confirmed_vehicle_mode(config: dict) -> bool:
-    return bool(
-        config.get("confirmed_vehicle")
-        or config.get("vehicle_confirmed")
-        or config.get("confirm_target_vehicle")
-    )
-
-
-def _build_user_prompt(config: dict) -> str:
-    if not _is_confirmed_vehicle_mode(config):
-        return TOOL_PROMPT
-
+def _build_request_context(config: dict) -> str:
+    confirmed_vehicle = bool(config.get(CONFIRMED_VEHICLE_KEY, False))
     details = []
     for label, key in (
         ("make", "vehicle_make"),
@@ -81,15 +74,21 @@ def _build_user_prompt(config: dict) -> str:
         if value:
             details.append(f"{label}: {value}")
     details_text = "; ".join(details) if details else "none provided"
-    return f"{TOOL_PROMPT}\nConfirmed target details: {details_text}."
+    return (
+        f"{CONFIRMED_VEHICLE_KEY}: {str(confirmed_vehicle).lower()}. "
+        f"Target vehicle details: {details_text}."
+    )
 
 
-def _run_model(image: np.ndarray, user_prompt: str) -> str:
+def _run_model(image: np.ndarray, request_context: str) -> str:
     try:
         # call_model accepts a list of images; this task uses exactly one frame.
         response = call_model(
             MODEL_NAME,
-            [{"role": "user", "content": user_prompt}],
+            [
+                {"role": "user", "content": TOOL_PROMPT},
+                {"role": "user", "content": request_context},
+            ],
             images=[image],
             metadata={"timeout": MODEL_TIMEOUT_SECONDS, "num_retries": 0},
         )
@@ -104,7 +103,7 @@ async def on_take_photo(runtime, image, input_data):
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return "Not enough evidence: No camera image is available."
     config = _normalize_input_data(input_data)
-    return await asyncio.to_thread(_run_model, image, _build_user_prompt(config))
+    return await asyncio.to_thread(_run_model, image, _build_request_context(config))
 
 
 async def on_stream_start(runtime, input_data):
@@ -113,7 +112,7 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("last_result", None)
     runtime.set_state("processing", False)
     runtime.set_state("generation", 0)
-    runtime.set_state("request_prompt", _build_user_prompt(config))
+    runtime.set_state("request_context", _build_request_context(config))
 
 
 async def on_frame(runtime, frame):
@@ -138,8 +137,10 @@ async def on_frame(runtime, frame):
     runtime.set_state("processing", True)
 
     try:
-        prompt = runtime.get_state("request_prompt", TOOL_PROMPT)
-        result = await asyncio.to_thread(_run_model, image, prompt)
+        request_context = runtime.get_state(
+            "request_context", f"{CONFIRMED_VEHICLE_KEY}: false."
+        )
+        result = await asyncio.to_thread(_run_model, image, request_context)
         if runtime.is_cancelled() or runtime.get_state("generation") != generation:
             return
         if result == runtime.get_state("last_result"):
