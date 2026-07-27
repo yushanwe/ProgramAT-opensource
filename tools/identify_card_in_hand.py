@@ -62,7 +62,7 @@ async def on_frame(runtime, frame):
     try:
         recent_frames = runtime.get_recent_frames(seconds=_HISTORY_WINDOW_SECONDS)
         if not recent_frames:
-            recent_frames = [frame]
+            return
 
         images = [f.image for f in recent_frames if f.image is not None]
         if not images:
@@ -87,5 +87,5 @@ async def on_frame(runtime, frame):
 
 
 async def on_stream_stop(runtime):
-    """Clean up streaming state."""
-    runtime.set_state("analysis_in_progress", False)
+    """Clean up all streaming state."""
+    runtime.clear_state()
