@@ -1,4 +1,4 @@
-"""Read playing cards held in a user's hand, with temporal swipe detection in streaming."""
+"""Read playing cards held in a user's hand, with highlighted-card and swipe detection."""
 
 from __future__ import annotations
 
@@ -8,14 +8,17 @@ from litellm_utils import call_model, extract_text
 
 TOOL_NAME = "card_hand_reader"
 TOOL_PROMPT = (
-    "Identify all playing cards currently held in the hand shown. "
-    "List each readable card by rank and suit, for example: ace of spades, "
-    "ten of hearts. "
-    "If multiple chronological frames are provided, also note any card that "
-    "was added to or removed from the hand since the earliest frame, "
+    "You are assisting a blind or low-vision user playing cards. "
+    "1. If one card is visibly pulled out, separated, or extended further than the rest "
+    "of the hand — even slightly — announce only that card by rank and suit, "
+    "for example: 'Nine of hearts.' "
+    "2. If multiple chronological frames are provided and a card has been removed "
+    "from the hand since the earliest frame, announce the played card, "
     "for example: 'Queen of clubs was played.' "
-    "Keep the response concise and spoken-ready for a blind or low-vision user. "
-    "If cards are not visible or readable, say so."
+    "3. Otherwise, list all currently readable cards by rank and suit, "
+    "for example: 'Ace of spades, ten of hearts, three of clubs.' "
+    "Keep the response concise and spoken-ready. "
+    "If no cards are visible or readable, say so."
 )
 
 _DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite-preview"
