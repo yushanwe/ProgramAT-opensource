@@ -19,7 +19,10 @@ TOOL_PROMPT = (
 )
 
 MODEL_NAME = "gemini/gemini-3.1-flash-lite-preview"
+# Mean grayscale pixel delta (0-255) required to treat the latest frame as a new scene.
 SCENE_DIFF_THRESHOLD = 2.0
+# Keep responses quick enough for live guidance while allowing occasional slower calls.
+MODEL_TIMEOUT_SECONDS = 45
 
 
 def _scene_fingerprint(image: np.ndarray) -> np.ndarray:
@@ -48,7 +51,7 @@ def _run_model(image: np.ndarray) -> str:
         MODEL_NAME,
         [{"role": "user", "content": TOOL_PROMPT}],
         images=[image],
-        metadata={"timeout": 45, "num_retries": 0},
+        metadata={"timeout": MODEL_TIMEOUT_SECONDS, "num_retries": 0},
     )
     return _normalize_response(extract_text(response))
 
@@ -109,4 +112,3 @@ async def on_frame(runtime, frame):
 async def on_stream_stop(runtime):
     runtime.set_state("generation", int(runtime.get_state("generation", 0)) + 1)
     runtime.set_state("processing", False)
-
