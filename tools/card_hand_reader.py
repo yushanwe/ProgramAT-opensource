@@ -20,7 +20,6 @@ TOOL_PROMPT = (
 
 _DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite-preview"
 _RECENT_FRAME_SECONDS = 4
-_MIN_CHANGE_FRAMES = 2
 
 
 async def on_take_photo(runtime, image, input_data):
