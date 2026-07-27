@@ -14,8 +14,9 @@ TOOL_NAME = "recognize_uber_car"
 TOOL_PROMPT = (
     "For a blind or low-vision user, analyze visible vehicles using only the current "
     "frame. 1) Determine whether the target vehicle is visible and, when relevant, "
-    "whether it likely matches the requested Uber. 2) If the user says the target car is "
-    "already confirmed and the target appears visible, locate the passenger-side door and describe direction "
+    "whether it likely matches the requested Uber. 2) If the request context indicates the "
+    "target car is already confirmed and the target appears visible, locate the passenger-side "
+    "door and describe direction "
     "using only 9-12 or 1-3 o'clock plus approximate distance and one concise action to "
     "reach it. 3) If the target is not yet confirmed, respond with one short sentence that "
     "starts with exactly one of: 'Likely Uber:', 'Unlikely Uber:', or "
@@ -135,7 +136,7 @@ async def on_frame(runtime, frame):
 
     try:
         request_context = runtime.get_state(
-            "request_context", f"{CONFIRMED_VEHICLE_KEY}: false."
+            "request_context", _build_request_context({})
         )
         result = await asyncio.to_thread(_run_model, image, request_context)
         if runtime.is_cancelled() or runtime.get_state("generation") != generation:
