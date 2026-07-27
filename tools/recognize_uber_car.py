@@ -16,8 +16,8 @@ TOOL_PROMPT = (
     "frame. 1) Determine whether the target vehicle is visible and, when relevant, "
     "whether it likely matches the requested Uber. 2) If the request context indicates the "
     "target car is already confirmed and the target appears visible, locate the passenger-side "
-    "door and describe direction "
-    "using only 9-12 or 1-3 o'clock plus approximate distance and one concise action to "
+    "door and describe its direction using only 9-12 or 1-3 o'clock plus approximate "
+    "distance and one concise action to "
     "reach it. 3) If the target is not yet confirmed, respond with one short sentence that "
     "starts with exactly one of: 'Likely Uber:', 'Unlikely Uber:', or "
     "'Not enough evidence:'. If the target is confirmed, start with 'Door guidance:' "
@@ -33,6 +33,12 @@ MODEL_TIMEOUT_SECONDS = 45
 
 LOGGER = logging.getLogger(__name__)
 CONFIRMED_VEHICLE_KEY = "confirmed_vehicle"
+VEHICLE_DETAIL_FIELDS = (
+    ("make", "vehicle_make"),
+    ("model", "vehicle_model"),
+    ("color", "vehicle_color"),
+    ("plate", "vehicle_plate"),
+)
 
 
 def _scene_fingerprint(image: np.ndarray) -> np.ndarray:
@@ -58,19 +64,14 @@ def _normalize_response(text: str) -> str:
     return "Not enough evidence: I can't confirm whether this is your Uber from this view."
 
 
-def _normalize_input_data(input_data: object) -> dict:
+def _ensure_dict(input_data: object) -> dict:
     return input_data if isinstance(input_data, dict) else {}
 
 
 def _build_request_context(config: dict) -> str:
     confirmed_vehicle = bool(config.get(CONFIRMED_VEHICLE_KEY, False))
     details = []
-    for label, key in (
-        ("make", "vehicle_make"),
-        ("model", "vehicle_model"),
-        ("color", "vehicle_color"),
-        ("plate", "vehicle_plate"),
-    ):
+    for label, key in VEHICLE_DETAIL_FIELDS:
         value = str(config.get(key, "")).strip()
         if value:
             details.append(f"{label}: {value}")
@@ -100,12 +101,12 @@ async def on_take_photo(runtime, image, input_data):
     del runtime
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return "Not enough evidence: No camera image is available."
-    config = _normalize_input_data(input_data)
+    config = _ensure_dict(input_data)
     return await asyncio.to_thread(_run_model, image, _build_request_context(config))
 
 
 async def on_stream_start(runtime, input_data):
-    config = _normalize_input_data(input_data)
+    config = _ensure_dict(input_data)
     runtime.set_state("scene_fingerprint", None)
     runtime.set_state("last_result", None)
     runtime.set_state("processing", False)
