@@ -12,11 +12,13 @@ from litellm_utils import call_model, extract_text
 
 TOOL_NAME = "recognize_uber_car"
 TOOL_PROMPT = (
-    "For a blind or low-vision user, decide whether the visible vehicle is likely "
-    "their Uber ride based only on visible evidence such as Uber signs/decals, "
-    "readable license plate details, and pickup context. Respond with one short "
-    "sentence that starts with exactly one of: 'Likely Uber:', 'Unlikely Uber:', "
-    "or 'Not enough evidence:'. If no vehicle is visible, say so clearly."
+    "For a blind or low-vision user, analyze the visible vehicles using only what "
+    "is in frame. If the user has not confirmed the car yet, respond with one short "
+    "sentence that starts with exactly one of: 'Likely Uber:', 'Unlikely Uber:', or "
+    "'Not enough evidence:'. If the user has confirmed the target car details, switch "
+    "to passenger-door guidance: identify where the passenger-side door appears in "
+    "clock-face direction (9-12 or 1-3 only), estimate distance, and give one concise "
+    "action instruction to reach it. If uncertain, say so plainly."
 )
 
 MODEL_NAME = "gemini/gemini-3.1-flash-lite-preview"
@@ -52,12 +54,42 @@ def _normalize_response(text: str) -> str:
     return "Not enough evidence: I can't confirm whether this is your Uber from this view."
 
 
-def _run_model(image: np.ndarray) -> str:
+def _normalize_input_data(input_data: object) -> dict:
+    return input_data if isinstance(input_data, dict) else {}
+
+
+def _is_confirmed_vehicle_mode(config: dict) -> bool:
+    return bool(
+        config.get("confirmed_vehicle")
+        or config.get("vehicle_confirmed")
+        or config.get("confirm_target_vehicle")
+    )
+
+
+def _build_user_prompt(config: dict) -> str:
+    if not _is_confirmed_vehicle_mode(config):
+        return TOOL_PROMPT
+
+    details = []
+    for label, key in (
+        ("make", "vehicle_make"),
+        ("model", "vehicle_model"),
+        ("color", "vehicle_color"),
+        ("plate", "vehicle_plate"),
+    ):
+        value = str(config.get(key, "")).strip()
+        if value:
+            details.append(f"{label}: {value}")
+    details_text = "; ".join(details) if details else "none provided"
+    return f"{TOOL_PROMPT}\nConfirmed target details: {details_text}."
+
+
+def _run_model(image: np.ndarray, user_prompt: str) -> str:
     try:
         # call_model accepts a list of images; this task uses exactly one frame.
         response = call_model(
             MODEL_NAME,
-            [{"role": "user", "content": TOOL_PROMPT}],
+            [{"role": "user", "content": user_prompt}],
             images=[image],
             metadata={"timeout": MODEL_TIMEOUT_SECONDS, "num_retries": 0},
         )
@@ -68,18 +100,20 @@ def _run_model(image: np.ndarray) -> str:
 
 
 async def on_take_photo(runtime, image, input_data):
-    del runtime, input_data
+    del runtime
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         return "Not enough evidence: No camera image is available."
-    return await asyncio.to_thread(_run_model, image)
+    config = _normalize_input_data(input_data)
+    return await asyncio.to_thread(_run_model, image, _build_user_prompt(config))
 
 
 async def on_stream_start(runtime, input_data):
-    del input_data
+    config = _normalize_input_data(input_data)
     runtime.set_state("scene_fingerprint", None)
     runtime.set_state("last_result", None)
     runtime.set_state("processing", False)
     runtime.set_state("generation", 0)
+    runtime.set_state("request_prompt", _build_user_prompt(config))
 
 
 async def on_frame(runtime, frame):
@@ -104,7 +138,8 @@ async def on_frame(runtime, frame):
     runtime.set_state("processing", True)
 
     try:
-        result = await asyncio.to_thread(_run_model, image)
+        prompt = runtime.get_state("request_prompt", TOOL_PROMPT)
+        result = await asyncio.to_thread(_run_model, image, prompt)
         if runtime.is_cancelled() or runtime.get_state("generation") != generation:
             return
         if result == runtime.get_state("last_result"):
