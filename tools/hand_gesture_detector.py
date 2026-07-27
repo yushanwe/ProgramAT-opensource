@@ -12,9 +12,11 @@ TOOL_PROMPT = (
     "For a blind or low-vision user, identify the visible hand gesture. When you "
     "receive multiple chronological frames, use the full sequence to recognize "
     "motion gestures such as waving hello or moving one finger side to side for "
-    "no/incorrect. When you receive one image, only report a clearly visible "
-    "static hand posture and say that motion cannot be confirmed from one image. "
-    "Reply with one concise spoken sentence. If no clear gesture is visible, say "
+    "no/incorrect. Also recognize words spelled by multiple consecutive hand "
+    "gestures, for example L-O-V-E means the word love. When you receive one "
+    "image, only report a clearly visible static hand posture and say that motion "
+    "or multi-gesture spelling cannot be confirmed from one image. Reply with one "
+    "concise spoken sentence. If no clear gesture or spelled word is visible, say "
     "\"No clear hand gesture detected.\""
 )
 
@@ -62,7 +64,7 @@ async def on_frame(runtime, frame):
     if runtime.get_state("last_processed_frame_id") == frame.frame_id:
         return
 
-    recent_frames = runtime.get_recent_frames(seconds=6) or []
+    recent_frames = runtime.get_recent_frames(seconds=12) or []
     if not recent_frames:
         recent_frames = [frame]
     ordered_frames = _sort_frames_chronologically(recent_frames)
@@ -92,4 +94,3 @@ async def on_frame(runtime, frame):
 
 async def on_stream_stop(runtime):
     runtime.clear_state()
-
