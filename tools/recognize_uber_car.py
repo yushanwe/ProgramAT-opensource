@@ -14,12 +14,12 @@ TOOL_NAME = "recognize_uber_car"
 TOOL_PROMPT = (
     "For a blind or low-vision user, analyze visible vehicles using only the current "
     "frame. 1) Determine whether the target vehicle is visible and, when relevant, "
-    "whether it likely matches the requested Uber. 2) If confirmed_vehicle is true and "
-    "the target appears visible, locate the passenger-side door and describe direction "
+    "whether it likely matches the requested Uber. 2) If the user says the target car is "
+    "already confirmed and the target appears visible, locate the passenger-side door and describe direction "
     "using only 9-12 or 1-3 o'clock plus approximate distance and one concise action to "
-    "reach it. 3) If confirmed_vehicle is false, respond with one short sentence that "
+    "reach it. 3) If the target is not yet confirmed, respond with one short sentence that "
     "starts with exactly one of: 'Likely Uber:', 'Unlikely Uber:', or "
-    "'Not enough evidence:'. If confirmed_vehicle is true, start with 'Door guidance:' "
+    "'Not enough evidence:'. If the target is confirmed, start with 'Door guidance:' "
     "or 'Not enough evidence:' when the door cannot be located confidently."
 )
 
@@ -75,7 +75,7 @@ def _build_request_context(config: dict) -> str:
             details.append(f"{label}: {value}")
     details_text = "; ".join(details) if details else "none provided"
     return (
-        f"{CONFIRMED_VEHICLE_KEY}: {str(confirmed_vehicle).lower()}. "
+        f"Vehicle confirmation: {'yes' if confirmed_vehicle else 'no'}. "
         f"Target vehicle details: {details_text}."
     )
 
@@ -85,10 +85,7 @@ def _run_model(image: np.ndarray, request_context: str) -> str:
         # call_model accepts a list of images; this task uses exactly one frame.
         response = call_model(
             MODEL_NAME,
-            [
-                {"role": "user", "content": TOOL_PROMPT},
-                {"role": "user", "content": request_context},
-            ],
+            [{"role": "user", "content": f"{TOOL_PROMPT}\n{request_context}"}],
             images=[image],
             metadata={"timeout": MODEL_TIMEOUT_SECONDS, "num_retries": 0},
         )
