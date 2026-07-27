@@ -21,14 +21,12 @@ TOOL_PROMPT = (
 async def on_take_photo(runtime, image, input_data):
     """Identify the vehicle in the center of the scene using a single model call."""
     del runtime, input_data
-    if image is None:
-        return "No camera image is available."
     response = await asyncio.to_thread(
         call_model,
         "gemini/gemini-3.1-flash-lite-preview",
         [{"role": "user", "content": TOOL_PROMPT}],
         [image],
-        {"timeout": 60, "num_retries": 0},
+        {"timeout": 60},
     )
     return extract_text(response)
 
