@@ -33,9 +33,9 @@ def _scene_fingerprint(image: np.ndarray) -> np.ndarray:
     )
 
 
-def _scene_difference(previous: np.ndarray, current: np.ndarray) -> float:
+def _scene_difference(previous: np.ndarray, current: np.ndarray) -> float | None:
     if previous is None or current is None or previous.shape != current.shape:
-        return float("inf")
+        return None
     return float(np.mean(np.abs(previous - current)))
 
 
@@ -80,12 +80,13 @@ async def on_frame(runtime, frame):
 
     current_fingerprint = await asyncio.to_thread(_scene_fingerprint, image)
     previous_fingerprint = runtime.get_state("scene_fingerprint")
-    if _scene_difference(previous_fingerprint, current_fingerprint) < SCENE_DIFF_THRESHOLD:
+    scene_difference = _scene_difference(previous_fingerprint, current_fingerprint)
+    if scene_difference is not None and scene_difference < SCENE_DIFF_THRESHOLD:
         return
     if runtime.get_state("processing"):
         return
 
-    generation = int(runtime.get_state("generation", 0)) + 1
+    generation = runtime.get_state("generation", 0) + 1
     runtime.set_state("generation", generation)
     runtime.set_state("processing", True)
 
@@ -110,5 +111,5 @@ async def on_frame(runtime, frame):
 
 
 async def on_stream_stop(runtime):
-    runtime.set_state("generation", int(runtime.get_state("generation", 0)) + 1)
+    runtime.set_state("generation", runtime.get_state("generation", 0) + 1)
     runtime.set_state("processing", False)
