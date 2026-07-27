@@ -28,17 +28,20 @@ TOOL_PROMPT = (
 )
 
 SCENE_SIMILARITY_THRESHOLD = 0.982
+_HIST_HUE_BINS = 32
+_HIST_SAT_BINS = 16
+_HIST_SIZE = _HIST_HUE_BINS * _HIST_SAT_BINS
 
 
 def _scene_embedding(image: np.ndarray) -> np.ndarray:
     """Compact HSV histogram embedding for scene-change detection."""
     if image is None or not isinstance(image, np.ndarray) or image.size == 0:
-        return np.zeros(512, dtype=np.float32)
+        return np.zeros(_HIST_SIZE, dtype=np.float32)
     small = cv2.resize(image, (96, 96), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [32, 16], [0, 180, 0, 256]).astype(
-        np.float32
-    ).reshape(-1)
+    hist = cv2.calcHist(
+        [hsv], [0, 1], None, [_HIST_HUE_BINS, _HIST_SAT_BINS], [0, 180, 0, 256]
+    ).astype(np.float32).reshape(-1)
     norm = float(np.linalg.norm(hist))
     return hist / norm if norm else hist
 
@@ -53,6 +56,17 @@ def _same_scene(ref: np.ndarray, cur: np.ndarray) -> bool:
     return _cosine_sim(ref, cur) >= SCENE_SIMILARITY_THRESHOLD
 
 
+def _analyze_frame(image: np.ndarray) -> str:
+    """Call the vision model and return navigation guidance text."""
+    response = call_model(
+        "gemini/gemini-3.1-flash-lite-preview",
+        [{"role": "user", "content": TOOL_PROMPT}],
+        [image],
+        {"timeout": 60, "num_retries": 0},
+    )
+    return extract_text(response)
+
+
 # ---------------------------------------------------------------------------
 # Take Photo entry point
 # ---------------------------------------------------------------------------
@@ -62,14 +76,7 @@ async def on_take_photo(runtime, image, input_data):
     del runtime, input_data
     if image is None:
         return "No camera image available."
-    response = await asyncio.to_thread(
-        call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
-        [{"role": "user", "content": TOOL_PROMPT}],
-        [image],
-        {"timeout": 60, "num_retries": 0},
-    )
-    result = extract_text(response)
+    result = await asyncio.to_thread(_analyze_frame, image)
     return result if result else "No exit detected. Try slowly turning to scan the room."
 
 
@@ -78,7 +85,7 @@ async def on_take_photo(runtime, image, input_data):
 # ---------------------------------------------------------------------------
 
 async def on_stream_start(runtime, input_data):
-    """Initialise per-session state."""
+    """Initialize per-session state."""
     del input_data
     runtime.set_state("scene_anchor", None)
     runtime.set_state("scene_generation", 0)
@@ -114,16 +121,7 @@ async def on_frame(runtime, frame):
     runtime.set_state("analyzing_generation", generation)
 
     try:
-        text = await asyncio.to_thread(
-            lambda: extract_text(
-                call_model(
-                    "gemini/gemini-3.1-flash-lite-preview",
-                    [{"role": "user", "content": TOOL_PROMPT}],
-                    [frame.image],
-                    {"timeout": 60, "num_retries": 0},
-                )
-            )
-        )
+        text = await asyncio.to_thread(_analyze_frame, frame.image)
 
         if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
             return
