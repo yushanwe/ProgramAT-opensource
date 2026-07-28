@@ -6050,11 +6050,21 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         if provider == 'codex' and mention_copilot:
             source_issue = issue
             source_issue_number = issue_number
-            branch = str(getattr(getattr(associated_pr, 'head', None), 'ref', ''))
+            target_pr = associated_pr
+            branch = str(getattr(getattr(target_pr, 'head', None), 'ref', ''))
+            head_repository = str(
+                getattr(
+                    getattr(getattr(target_pr, 'head', None), 'repo', None),
+                    'full_name',
+                    '',
+                )
+            )
             codex_pr_number = getattr(associated_pr, 'number', None)
             if is_pr:
                 pull = pull_target or repo.get_pull(issue_number)
+                target_pr = pull
                 branch = pull.head.ref
+                head_repository = pull.head.repo.full_name
                 codex_pr_number = pull.number
                 match = re.search(r'(?i)(?:fixes|closes)\s+#(\d+)', f"{pull.title} {pull.body or ''}")
                 if match:
@@ -6067,10 +6077,11 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 update_text=comment_text,
                 existing_branch=branch,
                 existing_pr_number=codex_pr_number,
+                existing_head_repository=head_repository,
             )
         
         # Send success notification to client
-        if connected_clients:
+        if connected_clients and not (provider == 'codex' and mention_copilot):
             success_data = {
                 'type': 'issue_updated',
                 'message': f"Comment added to issue #{issue_number}" + (f" and PR #{pr_number}" if pr_number else ""),
@@ -6583,7 +6594,11 @@ async def _broadcast_codex_event(payload: dict) -> None:
             'provider': 'codex',
             'timestamp': datetime.now().isoformat(),
         }
-    elif event in {'jsonl', 'stderr', 'worktree_ready', 'changes_inspected', 'validation'}:
+    elif event in {
+        'jsonl', 'stderr', 'run_context', 'codex_changed_paths',
+        'worktree_status', 'changes_inspected', 'validation',
+        'commit_created', 'push_started', 'remote_verified',
+    }:
         line = payload.get('line') or json.dumps(
             payload.get('data') or {
                 key: value for key, value in payload.items()
@@ -6600,6 +6615,17 @@ async def _broadcast_codex_event(payload: dict) -> None:
             'timestamp': datetime.now().isoformat(),
         }
     elif event == 'completed':
+        await _broadcast_ws({
+            'type': 'issue_updated',
+            'provider': 'codex',
+            'issue_number': payload.get('issue_number'),
+            'pr_number': payload.get('pr_number'),
+            'pr_url': payload.get('pr_url'),
+            'commit_sha': payload.get('commit_sha'),
+            'remote_branch_sha': payload.get('remote_branch_sha'),
+            'message': f"Codex pushed a verified update to PR #{payload.get('pr_number')}.",
+            'timestamp': datetime.now().isoformat(),
+        })
         await _broadcast_ws({
             'type': 'copilot_pr_found',
             'provider': 'codex',
@@ -6641,6 +6667,7 @@ def _launch_codex(
     update_text: str = '',
     existing_branch: str = '',
     existing_pr_number: Optional[int] = None,
+    existing_head_repository: str = '',
 ) -> None:
     """Start one isolated Codex run without blocking issue/comment handling."""
     if CODE_AGENT != 'codex':
@@ -6662,6 +6689,7 @@ def _launch_codex(
             update_text=update_text,
             existing_branch=existing_branch,
             existing_pr_number=existing_pr_number,
+            existing_head_repository=existing_head_repository,
             log_callback=_broadcast_codex_event,
         )
         logger.info("[Codex] Run for issue #%s finished: %s", issue_number, result)
