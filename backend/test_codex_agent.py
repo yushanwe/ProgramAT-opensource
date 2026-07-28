@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -54,6 +55,29 @@ class TestCodexAgent(unittest.TestCase):
             process.terminate.assert_called_once()
         finally:
             codex_agent.active_runs.clear()
+
+    def test_completed_file_change_survives_cli_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            tool = worktree / "tools" / "card_identifier.py"
+            tool.parent.mkdir()
+            tool.write_text("updated\n", encoding="utf-8")
+            captured = {}
+            event = {
+                "type": "item.completed",
+                "item": {
+                    "type": "file_change",
+                    "changes": [{"path": str(tool), "kind": "update"}],
+                },
+            }
+
+            self.assertEqual(
+                codex_agent._capture_file_changes(event, worktree, captured), []
+            )
+            tool.write_text("original\n", encoding="utf-8")
+            codex_agent._restore_file_changes(worktree, captured)
+
+            self.assertEqual(tool.read_text(encoding="utf-8"), "updated\n")
 
 
 if __name__ == "__main__":
