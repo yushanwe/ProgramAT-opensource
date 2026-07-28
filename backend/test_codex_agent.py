@@ -1,5 +1,7 @@
 import asyncio
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -64,14 +66,81 @@ class TestCodexAgent(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             codex_agent._remote_sha(output, "refs/heads/main")
 
-    def test_status_paths_handles_updates_and_renames(self):
+    def test_git_name_only_path_has_no_status_prefix(self):
         self.assertEqual(
-            codex_agent._status_paths(
-                " M tools/card_identifier.py\n"
-                "R  tools/old.py -> tools/new.py\n"
-            ),
-            ["tools/card_identifier.py", "tools/new.py"],
+            codex_agent._normalize_git_paths("tools/card_identifier.py\n"),
+            ["tools/card_identifier.py"],
         )
+
+    def test_modified_tool_proceeds_through_validation_commit_and_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = root / "remote.git"
+            worktree = root / "worktree"
+
+            def git(*args, cwd=root):
+                return subprocess.run(
+                    ("git", *args),
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
+
+            git("init", "--bare", str(remote))
+            git("init", str(worktree))
+            git("config", "user.name", "Codex Test", cwd=worktree)
+            git("config", "user.email", "codex@example.test", cwd=worktree)
+            git("config", "commit.gpgsign", "false", cwd=worktree)
+            git("checkout", "-b", "codex/issue-199", cwd=worktree)
+            tool = worktree / "tools" / "card_identifier.py"
+            tool.parent.mkdir()
+            tool.write_text("VALUE = 1\n", encoding="utf-8")
+            git("add", "tools/card_identifier.py", cwd=worktree)
+            git("commit", "-m", "initial", cwd=worktree)
+            git(
+                "push", str(remote), "HEAD:refs/heads/codex/issue-199",
+                cwd=worktree,
+            )
+            remote_before = git(
+                "rev-parse", "refs/heads/codex/issue-199", cwd=remote
+            )
+
+            tool.write_text("VALUE = 2\n", encoding="utf-8")
+            status = git("status", "--short", cwd=worktree)
+            changed = codex_agent._normalize_git_paths(
+                git(
+                    "diff", "--name-only", "--diff-filter=ACMR",
+                    "HEAD", "--", "tools/", cwd=worktree,
+                )
+            )
+            python_tools = [
+                path for path in changed
+                if path.startswith("tools/") and path.endswith(".py")
+            ]
+
+            self.assertEqual(status, "M tools/card_identifier.py")
+            self.assertEqual(changed, ["tools/card_identifier.py"])
+            self.assertEqual(python_tools, ["tools/card_identifier.py"])
+            subprocess.run(
+                (sys.executable, "-m", "py_compile", *python_tools),
+                cwd=worktree,
+                check=True,
+            )
+            git("add", "--", *python_tools, cwd=worktree)
+            git("commit", "-m", "update card identifier", cwd=worktree)
+            commit_sha = git("rev-parse", "HEAD", cwd=worktree)
+            git(
+                "push", str(remote), "HEAD:refs/heads/codex/issue-199",
+                cwd=worktree,
+            )
+            remote_after = git(
+                "rev-parse", "refs/heads/codex/issue-199", cwd=remote
+            )
+
+            self.assertNotEqual(remote_before, remote_after)
+            self.assertEqual(remote_after, commit_sha)
 
 
 if __name__ == "__main__":
