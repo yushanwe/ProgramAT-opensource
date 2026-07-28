@@ -74,10 +74,15 @@ class TestCodexAgent(unittest.TestCase):
             self.assertEqual(
                 codex_agent._capture_file_changes(event, worktree, captured), []
             )
+            # The completion event may race the actual file flush.
+            tool.write_text("updated after event\n", encoding="utf-8")
+            codex_agent._refresh_file_changes(worktree, captured)
             tool.write_text("original\n", encoding="utf-8")
             codex_agent._restore_file_changes(worktree, captured)
 
-            self.assertEqual(tool.read_text(encoding="utf-8"), "updated\n")
+            self.assertEqual(
+                tool.read_text(encoding="utf-8"), "updated after event\n"
+            )
 
 
 if __name__ == "__main__":

@@ -6606,7 +6606,10 @@ async def _broadcast_codex_event(payload: dict) -> None:
             'provider': 'codex',
             'timestamp': datetime.now().isoformat(),
         }
-    elif event in {'jsonl', 'stderr', 'worktree_ready', 'changes_inspected', 'validation'}:
+    elif event in {
+        'jsonl', 'stderr', 'worktree_ready', 'changes_captured',
+        'changes_inspected', 'validation',
+    }:
         line = payload.get('line') or json.dumps(
             payload.get('data') or {
                 key: value for key, value in payload.items()

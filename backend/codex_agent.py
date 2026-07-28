@@ -92,6 +92,18 @@ def _restore_file_changes(
             changed_path.write_bytes(content)
 
 
+def _refresh_file_changes(
+    worktree: Path,
+    captured: dict[str, Optional[bytes]],
+) -> None:
+    """Refresh announced paths after Codex has had time to flush the edit."""
+    for relative in list(captured):
+        changed_path = worktree / relative
+        captured[relative] = (
+            changed_path.read_bytes() if changed_path.exists() else None
+        )
+
+
 async def _command(
     *args: str,
     cwd: Path,
@@ -281,6 +293,10 @@ async def run_issue(
 
             async def read_stdout() -> None:
                 async for raw in run.process.stdout:
+                    # A file_change completion event can arrive just before the
+                    # edited bytes become visible. Later events provide a safe
+                    # opportunity to refresh every announced path.
+                    _refresh_file_changes(worktree, captured_changes)
                     line = raw.decode("utf-8", errors="replace").rstrip()
                     if not line:
                         continue
@@ -322,6 +338,10 @@ async def run_issue(
             # Codex CLI 0.136 may restore tracked files while closing a session.
             # Preserve the completed file_change events from the disposable
             # worktree so backend validation sees exactly what Codex produced.
+            await emit(
+                "changes_captured",
+                changed_files=sorted(captured_changes),
+            )
             _restore_file_changes(worktree, captured_changes)
 
             status = await _checked("git", "status", "--porcelain", cwd=worktree)
