@@ -47,49 +47,48 @@ def _github_repo_url(repository: str) -> str:
     return f"https://github.com/{repository}.git"
 
 
-def _capture_file_changes(
-    event: dict,
-    worktree: Path,
-    captured: dict[str, Optional[bytes]],
-) -> list[str]:
-    """Snapshot completed Codex edits before older CLIs can restore tracked files."""
+def _event_changed_paths(event: dict, worktree: Path) -> tuple[list[str], list[str]]:
+    """Return worktree-relative paths announced by a Codex file-change event."""
     item = event.get("item") if isinstance(event, dict) else None
     if (
         event.get("type") != "item.completed"
         or not isinstance(item, dict)
         or item.get("type") != "file_change"
     ):
-        return []
+        return [], []
 
+    changed = []
     ignored = []
     for change in item.get("changes") or []:
         raw_path = change.get("path", "")
         try:
-            changed_path = Path(raw_path).resolve()
+            candidate = Path(raw_path)
+            changed_path = (
+                candidate if candidate.is_absolute() else worktree / candidate
+            ).resolve()
             relative = changed_path.relative_to(worktree.resolve())
         except (OSError, ValueError):
             ignored.append(raw_path)
             continue
-        captured[relative.as_posix()] = (
-            None
-            if change.get("kind") == "delete" or not changed_path.exists()
-            else changed_path.read_bytes()
-        )
-    return ignored
+        changed.append(relative.as_posix())
+    return changed, ignored
 
 
-def _restore_file_changes(
-    worktree: Path,
-    captured: dict[str, Optional[bytes]],
-) -> None:
-    for relative, content in captured.items():
-        changed_path = worktree / relative
-        if content is None:
-            if changed_path.exists():
-                changed_path.unlink()
-        else:
-            changed_path.parent.mkdir(parents=True, exist_ok=True)
-            changed_path.write_bytes(content)
+def _remote_sha(ls_remote_output: str, ref: str) -> str:
+    for line in ls_remote_output.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == ref:
+            return fields[0]
+    raise RuntimeError(f"Remote branch does not exist: {ref}")
+
+
+def _status_paths(status: str) -> list[str]:
+    paths = []
+    for line in status.splitlines():
+        path = line[3:].split(" -> ")[-1].strip()
+        if path:
+            paths.append(path)
+    return paths
 
 
 async def _command(
@@ -188,6 +187,7 @@ async def run_issue(
     update_text: str = "",
     existing_branch: str = "",
     existing_pr_number: Optional[int] = None,
+    existing_head_repository: str = "",
     log_callback: Optional[LogCallback] = None,
 ) -> dict:
     """Run Codex in an isolated worktree, validate, commit, push, and create/update a PR."""
@@ -215,7 +215,14 @@ async def run_issue(
         worktree_root.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env["GH_TOKEN"] = github_token
-        publish_url = _github_repo_url(github_repo)
+        if existing_pr_number is not None and (
+            not existing_branch or not existing_head_repository
+        ):
+            raise RuntimeError(
+                "An existing PR update requires its head repository and head branch."
+            )
+        head_repository = existing_head_repository or github_repo
+        publish_url = _github_repo_url(head_repository)
         fetched_ref = f"refs/codex-agent/{run_id}"
         if codex_home is not None:
             env["CODEX_HOME"] = str(codex_home)
@@ -239,26 +246,53 @@ async def run_issue(
         issue_file: Optional[Path] = None
         last_message: Optional[Path] = None
         try:
-            await emit("starting", branch=branch)
+            await emit("starting", branch=branch, pr_number=existing_pr_number)
             source_branch = existing_branch or base_branch
+            remote_branch_ref = f"refs/heads/{source_branch}"
+            remote_before = _remote_sha(
+                await _checked(
+                    "git", "ls-remote", publish_url, remote_branch_ref,
+                    cwd=repo_root, env=env,
+                ),
+                remote_branch_ref,
+            )
             await _checked(
                 "git", "fetch", publish_url,
-                f"refs/heads/{source_branch}:{fetched_ref}",
+                f"{remote_branch_ref}:{fetched_ref}",
                 cwd=repo_root, env=env,
             )
             await _checked(
-                "git", "worktree", "add", "--force", "-B", branch,
+                "git", "worktree", "add", "--force", "--detach",
                 str(worktree), fetched_ref,
                 cwd=repo_root,
             )
-            await emit("worktree_ready", worktree=str(worktree))
+            head_before = await _checked("git", "rev-parse", "HEAD", cwd=worktree)
+            branch_state = await _checked(
+                "git", "rev-parse", "--abbrev-ref", "HEAD", cwd=worktree
+            )
+            if head_before != remote_before:
+                raise RuntimeError(
+                    f"Fetched worktree SHA {head_before} does not match remote "
+                    f"branch SHA {remote_before}."
+                )
+            await emit(
+                "run_context",
+                pr_number=existing_pr_number,
+                pr_head_repository=head_repository,
+                pr_head_branch=source_branch,
+                remote_fetch_ref=f"{remote_branch_ref}:{fetched_ref}",
+                worktree=str(worktree),
+                worktree_head_sha_before=head_before,
+                current_branch=branch_state,
+                detached_head=branch_state == "HEAD",
+            )
 
             issue_file = temp_dir / "issue.md"
             issue_file.write_text(body, encoding="utf-8")
             last_message = temp_dir / "last-message.txt"
 
             prompt = build_prompt(issue_number, title, body, update_text)
-            captured_changes: dict[str, Optional[bytes]] = {}
+            announced_changed_paths: set[str] = set()
             args = [
                 codex_binary, "exec", "--cd", str(worktree),
                 "--sandbox", "workspace-write", "--json",
@@ -289,9 +323,9 @@ async def run_issue(
                     except json.JSONDecodeError:
                         event = {"raw": line}
                     run.events.append(event)
-                    for ignored_path in _capture_file_changes(
-                        event, worktree, captured_changes
-                    ):
+                    changed, ignored = _event_changed_paths(event, worktree)
+                    announced_changed_paths.update(changed)
+                    for ignored_path in ignored:
                         await emit(
                             "stderr",
                             line=f"Ignored file change outside worktree: {ignored_path}",
@@ -319,17 +353,14 @@ async def run_issue(
             if exit_code:
                 raise RuntimeError(f"Codex exited with {exit_code}: {stderr[-2000:]}")
 
-            # Codex CLI 0.136 may restore tracked files while closing a session.
-            # Preserve the completed file_change events from the disposable
-            # worktree so backend validation sees exactly what Codex produced.
-            _restore_file_changes(worktree, captured_changes)
+            await emit(
+                "codex_changed_paths",
+                changed_paths=sorted(announced_changed_paths),
+            )
 
-            status = await _checked("git", "status", "--porcelain", cwd=worktree)
-            changed_files = []
-            for line in status.splitlines():
-                path = line[3:].split(" -> ")[-1].strip()
-                if path:
-                    changed_files.append(path)
+            status = await _checked("git", "status", "--short", cwd=worktree)
+            await emit("worktree_status", status_short=status)
+            changed_files = _status_paths(status)
             tool_files = [
                 path for path in changed_files
                 if path.startswith("tools/") and path.endswith(".py")
@@ -371,23 +402,67 @@ async def run_issue(
                 )
 
             await _checked("git", "add", "--", *tool_files, cwd=worktree)
+            staged_code, staged_diff, staged_err = await _command(
+                "git", "diff", "--cached", "--exit-code", "--", *tool_files,
+                cwd=worktree,
+            )
+            if staged_code == 0 or not staged_diff.strip():
+                raise RuntimeError("The worktree does not contain a real staged diff.")
+            if staged_code != 1:
+                raise RuntimeError(f"Could not inspect staged diff: {staged_err.strip()}")
             await _checked(
                 "git", "commit", "-m", f"Implement tool for issue #{issue_number}",
                 cwd=worktree,
             )
+            commit_sha = await _checked("git", "rev-parse", "HEAD", cwd=worktree)
+            if commit_sha == head_before:
+                raise RuntimeError("git commit did not create a new commit.")
+            await emit("commit_created", commit_sha=commit_sha)
+            push_refspec = f"HEAD:refs/heads/{branch}"
+            await emit(
+                "push_started",
+                repository=head_repository,
+                push_refspec=push_refspec,
+            )
             await _checked(
-                "git", "push", publish_url, f"HEAD:refs/heads/{branch}",
+                "git", "push", publish_url, push_refspec,
                 cwd=worktree, env=env,
+            )
+            pushed_ref = f"refs/heads/{branch}"
+            remote_after = _remote_sha(
+                await _checked(
+                    "git", "ls-remote", publish_url, pushed_ref,
+                    cwd=worktree, env=env,
+                ),
+                pushed_ref,
+            )
+            if remote_after == remote_before:
+                raise RuntimeError("Push succeeded but the remote PR branch SHA did not change.")
+            if remote_after != commit_sha:
+                raise RuntimeError(
+                    f"Remote PR branch is at {remote_after}, not created commit {commit_sha}."
+                )
+            await emit(
+                "remote_verified",
+                remote_branch_sha_before=remote_before,
+                remote_branch_sha_after=remote_after,
+                commit_sha=commit_sha,
+                push_refspec=push_refspec,
             )
 
             pr_number = existing_pr_number
             pr_url = ""
             if pr_number is None:
+                head_owner = head_repository.split("/", 1)[0]
+                pr_head = (
+                    branch if head_repository == github_repo
+                    else f"{head_owner}:{branch}"
+                )
                 pr_url = await _checked(
                     "gh", "pr", "create",
                     "--repo", github_repo,
                     "--base", base_branch,
-                    "--head", branch,
+                    "--head", pr_head,
                     "--title", f"{title} (Fixes #{issue_number})",
                     "--body", (
                         f"Implements the requested ProgramAT tool.\n\n"
@@ -410,6 +485,8 @@ async def run_issue(
                 pr_url=pr_url,
                 final_message=final_message,
                 changed_files=changed_files,
+                commit_sha=commit_sha,
+                remote_branch_sha=remote_after,
             )
             return {
                 "status": "completed",
@@ -418,6 +495,8 @@ async def run_issue(
                 "pr_number": pr_number,
                 "pr_url": pr_url,
                 "changed_files": changed_files,
+                "commit_sha": commit_sha,
+                "remote_branch_sha": remote_after,
                 "validation": validation_out,
                 "final_message": final_message,
             }
