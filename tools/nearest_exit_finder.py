@@ -8,6 +8,7 @@ Features:
 - Detects exit doors, exit signs, and emergency exits
 - Provides clear directional guidance using clock positions (9-12, 1-3)
 - Offers distance estimates and movement instructions
+- Adaptive accuracy: fast by default, escalates when scene is ambiguous
 - Streaming mode processes changed scenes only
 - Audio-optimized output for text-to-speech
 
@@ -70,11 +71,44 @@ def is_same_scene(
     return cosine_similarity(reference, current) >= threshold
 
 
+def needs_escalation(response_text: str) -> bool:
+    """Check if the response indicates uncertainty requiring more accurate analysis."""
+    if not response_text:
+        return True
+
+    lower_text = response_text.lower()
+
+    # Uncertainty indicators
+    uncertainty_phrases = [
+        "no exit",
+        "cannot see",
+        "unclear",
+        "uncertain",
+        "might be",
+        "possibly",
+        "appears to be",
+        "seems like",
+        "difficult to tell",
+        "not visible",
+        "insufficient",
+        "ambiguous",
+        "hard to determine",
+    ]
+
+    return any(phrase in lower_text for phrase in uncertainty_phrases)
+
+
 async def on_take_photo(runtime, image, input_data):
-    """Analyze one current image for nearest exit and provide directions."""
+    """Analyze one current image for nearest exit and provide directions.
+
+    Uses conditional cascade: fast model first, escalates to accurate model
+    when the result indicates uncertainty or ambiguity.
+    """
     del runtime, input_data
     if image is None:
         return "No camera image available"
+
+    # Fast tier: try Gemini Flash Lite first
     response = await asyncio.to_thread(
         call_model,
         "gemini/gemini-3.1-flash-lite-preview",
@@ -82,7 +116,21 @@ async def on_take_photo(runtime, image, input_data):
         [image],
         {"timeout": 60, "num_retries": 0},
     )
-    return extract_text(response)
+    result_text = extract_text(response)
+
+    # Check if we need more accurate analysis
+    if needs_escalation(result_text):
+        # Accurate tier: escalate to Gemini Flash for better analysis
+        response = await asyncio.to_thread(
+            call_model,
+            "gemini/gemini-3.1-flash",
+            [{"role": "user", "content": TOOL_PROMPT}],
+            [image],
+            {"timeout": 60, "num_retries": 0},
+        )
+        result_text = extract_text(response)
+
+    return result_text
 
 
 async def on_stream_start(runtime, input_data):
@@ -94,7 +142,11 @@ async def on_stream_start(runtime, input_data):
 
 
 async def on_frame(runtime, frame):
-    """Process changed scenes only to provide updated exit directions."""
+    """Process changed scenes only to provide updated exit directions.
+
+    Uses conditional cascade: fast model first, escalates to accurate model
+    when the result indicates uncertainty or ambiguity.
+    """
     if runtime.is_cancelled():
         return
 
@@ -120,7 +172,7 @@ async def on_frame(runtime, frame):
     runtime.set_state("analyzing_generation", generation)
 
     try:
-        # Analyze the current frame for exits
+        # Fast tier: analyze with Gemini Flash Lite first
         response = await asyncio.to_thread(
             call_model,
             "gemini/gemini-3.1-flash-lite-preview",
@@ -137,6 +189,26 @@ async def on_frame(runtime, frame):
             return
 
         text = extract_text(response)
+
+        # Check if we need more accurate analysis
+        if needs_escalation(text):
+            # Accurate tier: escalate to Gemini Flash
+            response = await asyncio.to_thread(
+                call_model,
+                "gemini/gemini-3.1-flash",
+                [{"role": "user", "content": TOOL_PROMPT}],
+                [frame.image],
+                {"timeout": 60, "num_retries": 0},
+            )
+
+            # Check again if scene changed or cancelled
+            if (
+                runtime.is_cancelled()
+                or runtime.get_state("scene_generation") != generation
+            ):
+                return
+
+            text = extract_text(response)
 
         # Emit the result
         await runtime.emit(
@@ -164,6 +236,7 @@ __all__ = [
     "compute_scene_embedding",
     "cosine_similarity",
     "is_same_scene",
+    "needs_escalation",
     "on_take_photo",
     "on_stream_start",
     "on_frame",
