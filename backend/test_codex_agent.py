@@ -1,6 +1,5 @@
 import asyncio
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -56,33 +55,23 @@ class TestCodexAgent(unittest.TestCase):
         finally:
             codex_agent.active_runs.clear()
 
-    def test_completed_file_change_survives_cli_restore(self):
-        with tempfile.TemporaryDirectory() as directory:
-            worktree = Path(directory)
-            tool = worktree / "tools" / "card_identifier.py"
-            tool.parent.mkdir()
-            tool.write_text("updated\n", encoding="utf-8")
-            captured = {}
-            event = {
-                "type": "item.completed",
-                "item": {
-                    "type": "file_change",
-                    "changes": [{"path": str(tool), "kind": "update"}],
-                },
-            }
+    def test_remote_sha_requires_the_exact_branch(self):
+        output = "abc123\trefs/heads/codex/issue-42\n"
+        self.assertEqual(
+            codex_agent._remote_sha(output, "refs/heads/codex/issue-42"),
+            "abc123",
+        )
+        with self.assertRaises(RuntimeError):
+            codex_agent._remote_sha(output, "refs/heads/main")
 
-            self.assertEqual(
-                codex_agent._capture_file_changes(event, worktree, captured), []
-            )
-            # The completion event may race the actual file flush.
-            tool.write_text("updated after event\n", encoding="utf-8")
-            codex_agent._refresh_file_changes(worktree, captured)
-            tool.write_text("original\n", encoding="utf-8")
-            codex_agent._restore_file_changes(worktree, captured)
-
-            self.assertEqual(
-                tool.read_text(encoding="utf-8"), "updated after event\n"
-            )
+    def test_status_paths_handles_updates_and_renames(self):
+        self.assertEqual(
+            codex_agent._status_paths(
+                " M tools/card_identifier.py\n"
+                "R  tools/old.py -> tools/new.py\n"
+            ),
+            ["tools/card_identifier.py", "tools/new.py"],
+        )
 
 
 if __name__ == "__main__":
