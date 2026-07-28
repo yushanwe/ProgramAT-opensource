@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import uuid
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -47,33 +48,6 @@ def _github_repo_url(repository: str) -> str:
     return f"https://github.com/{repository}.git"
 
 
-def _event_changed_paths(event: dict, worktree: Path) -> tuple[list[str], list[str]]:
-    """Return worktree-relative paths announced by a Codex file-change event."""
-    item = event.get("item") if isinstance(event, dict) else None
-    if (
-        event.get("type") != "item.completed"
-        or not isinstance(item, dict)
-        or item.get("type") != "file_change"
-    ):
-        return [], []
-
-    changed = []
-    ignored = []
-    for change in item.get("changes") or []:
-        raw_path = change.get("path", "")
-        try:
-            candidate = Path(raw_path)
-            changed_path = (
-                candidate if candidate.is_absolute() else worktree / candidate
-            ).resolve()
-            relative = changed_path.relative_to(worktree.resolve())
-        except (OSError, ValueError):
-            ignored.append(raw_path)
-            continue
-        changed.append(relative.as_posix())
-    return changed, ignored
-
-
 def _remote_sha(ls_remote_output: str, ref: str) -> str:
     for line in ls_remote_output.splitlines():
         fields = line.split()
@@ -82,13 +56,33 @@ def _remote_sha(ls_remote_output: str, ref: str) -> str:
     raise RuntimeError(f"Remote branch does not exist: {ref}")
 
 
-def _status_paths(status: str) -> list[str]:
+def _normalize_git_paths(output: str) -> list[str]:
+    """Normalize Git name-only output without interpreting status columns."""
     paths = []
-    for line in status.splitlines():
-        path = line[3:].split(" -> ")[-1].strip()
-        if path:
+    for raw_path in output.splitlines():
+        path = Path(raw_path.strip()).as_posix()
+        if path and path != "." and not Path(path).is_absolute():
             paths.append(path)
-    return paths
+    return sorted(set(paths))
+
+
+async def _changed_python_tools(worktree: Path) -> tuple[str, list[str], list[str]]:
+    """Inspect the worktree using Git-relative paths as the sole authority."""
+    status = await _checked("git", "status", "--short", cwd=worktree)
+    tracked = await _checked(
+        "git", "diff", "--name-only", "--diff-filter=ACMR",
+        "HEAD", "--", "tools/", cwd=worktree,
+    )
+    untracked = await _checked(
+        "git", "ls-files", "--others", "--exclude-standard",
+        "--", "tools/", cwd=worktree,
+    )
+    changed = _normalize_git_paths("\n".join((tracked, untracked)))
+    python_tools = [
+        path for path in changed
+        if path.startswith("tools/") and path.endswith(".py")
+    ]
+    return status, changed, python_tools
 
 
 async def _command(
@@ -249,13 +243,26 @@ async def run_issue(
             await emit("starting", branch=branch, pr_number=existing_pr_number)
             source_branch = existing_branch or base_branch
             remote_branch_ref = f"refs/heads/{source_branch}"
-            remote_before = _remote_sha(
+            ls_remote_before = _remote_sha(
                 await _checked(
                     "git", "ls-remote", publish_url, remote_branch_ref,
                     cwd=repo_root, env=env,
                 ),
                 remote_branch_ref,
             )
+            remote_before = ls_remote_before
+            if existing_pr_number is not None:
+                remote_before = await _checked(
+                    "gh", "api",
+                    f"repos/{head_repository}/git/ref/heads/"
+                    f"{quote(source_branch, safe='')}",
+                    "--jq", ".object.sha",
+                    cwd=repo_root, env=env,
+                )
+                if remote_before != ls_remote_before:
+                    raise RuntimeError(
+                        "GitHub API and git ls-remote disagree about the PR head SHA."
+                    )
             await _checked(
                 "git", "fetch", publish_url,
                 f"{remote_branch_ref}:{fetched_ref}",
@@ -292,7 +299,6 @@ async def run_issue(
             last_message = temp_dir / "last-message.txt"
 
             prompt = build_prompt(issue_number, title, body, update_text)
-            announced_changed_paths: set[str] = set()
             args = [
                 codex_binary, "exec", "--cd", str(worktree),
                 "--sandbox", "workspace-write", "--json",
@@ -323,13 +329,6 @@ async def run_issue(
                     except json.JSONDecodeError:
                         event = {"raw": line}
                     run.events.append(event)
-                    changed, ignored = _event_changed_paths(event, worktree)
-                    announced_changed_paths.update(changed)
-                    for ignored_path in ignored:
-                        await emit(
-                            "stderr",
-                            line=f"Ignored file change outside worktree: {ignored_path}",
-                        )
                     await emit("jsonl", data=event)
 
             async def read_stderr() -> str:
@@ -353,30 +352,24 @@ async def run_issue(
             if exit_code:
                 raise RuntimeError(f"Codex exited with {exit_code}: {stderr[-2000:]}")
 
-            await emit(
-                "codex_changed_paths",
-                changed_paths=sorted(announced_changed_paths),
-            )
-
-            status = await _checked("git", "status", "--short", cwd=worktree)
+            status, changed_files, tool_files = await _changed_python_tools(worktree)
             await emit("worktree_status", status_short=status)
-            changed_files = _status_paths(status)
-            tool_files = [
-                path for path in changed_files
-                if path.startswith("tools/") and path.endswith(".py")
-            ]
-            unrelated = [path for path in changed_files if path not in tool_files]
+            untracked_output = await _checked(
+                "git", "ls-files", "--others", "--exclude-standard",
+                "--", "tools/", cwd=worktree,
+            )
             if not tool_files:
                 raise RuntimeError("Codex did not create or modify a Python file in tools/.")
-            if unrelated:
+            non_python_tools = [path for path in changed_files if path not in tool_files]
+            if non_python_tools:
                 raise RuntimeError(
-                    "Codex modified files outside the requested Python tool: "
-                    + ", ".join(unrelated)
+                    "Codex modified non-Python files under tools/: "
+                    + ", ".join(non_python_tools)
                 )
 
             diff = await _checked("git", "diff", "--", *tool_files, cwd=worktree)
             for path in tool_files:
-                if f"?? {path}" in status:
+                if path in _normalize_git_paths(untracked_output):
                     diff += f"\n--- /dev/null\n+++ b/{path}\n"
                     diff += (worktree / path).read_text(encoding="utf-8")
             await emit("changes_inspected", changed_files=changed_files, diff=diff)
@@ -429,12 +422,11 @@ async def run_issue(
                 cwd=worktree, env=env,
             )
             pushed_ref = f"refs/heads/{branch}"
-            remote_after = _remote_sha(
-                await _checked(
-                    "git", "ls-remote", publish_url, pushed_ref,
-                    cwd=worktree, env=env,
-                ),
-                pushed_ref,
+            remote_after = await _checked(
+                "gh", "api",
+                f"repos/{head_repository}/git/ref/heads/{quote(branch, safe='')}",
+                "--jq", ".object.sha",
+                cwd=worktree, env=env,
             )
             if remote_after == remote_before:
                 raise RuntimeError("Push succeeded but the remote PR branch SHA did not change.")
