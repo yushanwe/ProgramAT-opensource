@@ -6595,7 +6595,7 @@ async def _broadcast_codex_event(payload: dict) -> None:
             'timestamp': datetime.now().isoformat(),
         }
     elif event in {
-        'jsonl', 'stderr', 'run_context', 'codex_changed_paths',
+        'jsonl', 'stderr', 'run_context',
         'worktree_status', 'changes_inspected', 'validation',
         'commit_created', 'push_started', 'remote_verified',
     }:
