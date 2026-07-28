@@ -1,8 +1,9 @@
-"""Identify Uber Car Details - Make, Model, Color, and License Plate.
+"""Identify Uber Car Details and Provide Navigation to Passenger Door.
 
 Helps blind users identify their Uber by analyzing the car in the middle of the scene
-and reporting its make, model, color, and license plate number in a concise,
-speech-ready format.
+and reporting its make, model, color, and license plate number. After the car remains
+stable in view for several frames, automatically switches to navigation mode and
+provides spatial guidance to the passenger-side door using clock-face directions.
 """
 
 from __future__ import annotations
@@ -21,6 +22,15 @@ TOOL_PROMPT = (
     "'[Color] [Make] [Model] with license plate [Number]'. For example: 'White Toyota "
     "Camry with license plate ABC123'. If any detail is unclear or unavailable, state "
     "what you can determine and note uncertainty for the rest."
+)
+
+NAVIGATION_PROMPT = (
+    "A blind user has confirmed this is their Uber. Locate the passenger-side door "
+    "(right side if facing the front of the vehicle). Report its position using "
+    "clock-face directions (9-12-3 only, relative to the camera), approximate distance, "
+    "and brief guidance on how to reach it. For example: 'Passenger door is at 2 o'clock, "
+    "about 3 meters away. Move slightly right and forward.' If the door is not clearly "
+    "visible, guide toward the visible side of the vehicle."
 )
 
 
@@ -80,49 +90,105 @@ async def on_stream_start(runtime, input_data):
     del input_data
     runtime.set_state("scene_anchor", None)
     runtime.set_state("last_result", None)
+    runtime.set_state("mode", "identification")
+    runtime.set_state("stable_frames", 0)
+    runtime.set_state("car_details", None)
 
 
 async def on_frame(runtime, frame):
-    """Process each distinct scene change and identify car details.
+    """Process each frame for car identification and navigation guidance.
 
-    Only analyzes when the scene changes significantly to avoid redundant
-    processing of the same car view. Uses latest frame for car identification.
+    Operates in two modes:
+    1. Identification: Detects car details on scene changes
+    2. Navigation: After car is stable for 3 frames, provides door location guidance
     """
     if runtime.is_cancelled():
         return
 
     embedding = await asyncio.to_thread(_compute_scene_embedding, frame.image)
     anchor = runtime.get_state("scene_anchor")
+    mode = runtime.get_state("mode", "identification")
+    stable_frames = runtime.get_state("stable_frames", 0)
 
-    # Check if this is a new scene
-    if anchor is not None and _is_same_scene(anchor, embedding):
-        # Same scene, skip processing
-        return
+    # Check if this is the same scene
+    is_same = anchor is not None and _is_same_scene(anchor, embedding)
 
-    # New scene detected, update anchor
-    runtime.set_state("scene_anchor", embedding)
+    if is_same:
+        # Same scene - increment stability counter
+        stable_frames += 1
+        runtime.set_state("stable_frames", stable_frames)
 
-    # Analyze the car in the new scene
-    response = await asyncio.to_thread(
-        call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
-        [{"role": "user", "content": TOOL_PROMPT}],
-        [frame.image],
-        {"timeout": 60, "num_retries": 0},
-    )
-    result_text = extract_text(response)
+        # After 3 stable frames in identification mode, switch to navigation
+        if mode == "identification" and stable_frames >= 3:
+            runtime.set_state("mode", "navigation")
+            mode = "navigation"
+            # Continue to navigation processing below
+        elif mode == "identification":
+            # Still in identification mode, skip processing
+            return
+    else:
+        # New scene detected - reset to identification mode
+        runtime.set_state("scene_anchor", embedding)
+        runtime.set_state("stable_frames", 0)
+        runtime.set_state("mode", "identification")
+        mode = "identification"
+        stable_frames = 0
 
-    # Check if cancelled during processing
-    if runtime.is_cancelled():
-        return
+    # Process based on current mode
+    if mode == "identification" or (mode == "navigation" and stable_frames == 3):
+        # Run identification (either new scene or first time entering navigation)
+        if mode == "identification":
+            prompt = TOOL_PROMPT
+        else:
+            # Transitioning to navigation - run identification one more time
+            prompt = TOOL_PROMPT
 
-    # Store and emit the result
-    runtime.set_state("last_result", result_text)
-    await runtime.emit(
-        result_text,
-        final=True,
-        metadata={"frame_id": frame.frame_id},
-    )
+        response = await asyncio.to_thread(
+            call_model,
+            "gemini/gemini-3.1-flash-lite-preview",
+            [{"role": "user", "content": prompt}],
+            [frame.image],
+            {"timeout": 60, "num_retries": 0},
+        )
+        result_text = extract_text(response)
+
+        if runtime.is_cancelled():
+            return
+
+        runtime.set_state("last_result", result_text)
+        runtime.set_state("car_details", result_text)
+
+        await runtime.emit(
+            result_text,
+            final=True,
+            metadata={"frame_id": frame.frame_id, "mode": mode},
+        )
+
+    elif mode == "navigation" and stable_frames > 3:
+        # Navigation mode - provide guidance to passenger door
+        # Only update every 2-3 frames to avoid too frequent updates
+        if stable_frames % 3 != 0:
+            return
+
+        response = await asyncio.to_thread(
+            call_model,
+            "gemini/gemini-3.1-flash-lite-preview",
+            [{"role": "user", "content": NAVIGATION_PROMPT}],
+            [frame.image],
+            {"timeout": 60, "num_retries": 0},
+        )
+        result_text = extract_text(response)
+
+        if runtime.is_cancelled():
+            return
+
+        runtime.set_state("last_result", result_text)
+
+        await runtime.emit(
+            result_text,
+            final=True,
+            metadata={"frame_id": frame.frame_id, "mode": "navigation"},
+        )
 
 
 async def on_stream_stop(runtime):
