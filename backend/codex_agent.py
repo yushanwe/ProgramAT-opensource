@@ -47,6 +47,51 @@ def _github_repo_url(repository: str) -> str:
     return f"https://github.com/{repository}.git"
 
 
+def _capture_file_changes(
+    event: dict,
+    worktree: Path,
+    captured: dict[str, Optional[bytes]],
+) -> list[str]:
+    """Snapshot completed Codex edits before older CLIs can restore tracked files."""
+    item = event.get("item") if isinstance(event, dict) else None
+    if (
+        event.get("type") != "item.completed"
+        or not isinstance(item, dict)
+        or item.get("type") != "file_change"
+    ):
+        return []
+
+    ignored = []
+    for change in item.get("changes") or []:
+        raw_path = change.get("path", "")
+        try:
+            changed_path = Path(raw_path).resolve()
+            relative = changed_path.relative_to(worktree.resolve())
+        except (OSError, ValueError):
+            ignored.append(raw_path)
+            continue
+        captured[relative.as_posix()] = (
+            None
+            if change.get("kind") == "delete" or not changed_path.exists()
+            else changed_path.read_bytes()
+        )
+    return ignored
+
+
+def _restore_file_changes(
+    worktree: Path,
+    captured: dict[str, Optional[bytes]],
+) -> None:
+    for relative, content in captured.items():
+        changed_path = worktree / relative
+        if content is None:
+            if changed_path.exists():
+                changed_path.unlink()
+        else:
+            changed_path.parent.mkdir(parents=True, exist_ok=True)
+            changed_path.write_bytes(content)
+
+
 async def _command(
     *args: str,
     cwd: Path,
@@ -213,9 +258,10 @@ async def run_issue(
             last_message = temp_dir / "last-message.txt"
 
             prompt = build_prompt(issue_number, title, body, update_text)
+            captured_changes: dict[str, Optional[bytes]] = {}
             args = [
                 codex_binary, "exec", "--cd", str(worktree),
-                "--sandbox", "workspace-write", "--json", "--ephemeral",
+                "--sandbox", "workspace-write", "--json",
                 "--output-last-message", str(last_message),
             ]
             if model:
@@ -243,6 +289,13 @@ async def run_issue(
                     except json.JSONDecodeError:
                         event = {"raw": line}
                     run.events.append(event)
+                    for ignored_path in _capture_file_changes(
+                        event, worktree, captured_changes
+                    ):
+                        await emit(
+                            "stderr",
+                            line=f"Ignored file change outside worktree: {ignored_path}",
+                        )
                     await emit("jsonl", data=event)
 
             async def read_stderr() -> str:
@@ -265,6 +318,11 @@ async def run_issue(
                 return {"status": "cancelled", "run_id": run_id}
             if exit_code:
                 raise RuntimeError(f"Codex exited with {exit_code}: {stderr[-2000:]}")
+
+            # Codex CLI 0.136 may restore tracked files while closing a session.
+            # Preserve the completed file_change events from the disposable
+            # worktree so backend validation sees exactly what Codex produced.
+            _restore_file_changes(worktree, captured_changes)
 
             status = await _checked("git", "status", "--porcelain", cwd=worktree)
             changed_files = []
