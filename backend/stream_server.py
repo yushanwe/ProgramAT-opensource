@@ -6135,6 +6135,7 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
     ideation_answer = ''
     token = ''
     choice = ''  # 'keep_brainstorming' or 'start_building'
+    brainstormingEnabled = True  # default to True for backward compatibility
 
     try:
         reader = await request.multipart()
@@ -6147,6 +6148,7 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                     ideation_answer = meta.get('ideation_answer', '')
                     token = meta.get('token', '')
                     choice = meta.get('choice', '')  # 'keep_brainstorming' or 'start_building'
+                    brainstormingEnabled = meta.get('brainstormingEnabled', True)
                 except Exception:
                     text = raw.decode('utf-8', errors='replace')
             elif part.name == 'video':
@@ -6257,7 +6259,7 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 status=500,
             )
 
-        if not choice:
+        if brainstormingEnabled and not choice:
             # Generate ideation question and return it for the client to present.
             await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Coming up with a follow-up question…'})
             try:
@@ -6276,6 +6278,8 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
             }
             logger.info("Sending ideation question via HTTP (token=%s)", new_token)
             return web.json_response({'status': 'ideation', 'question': question, 'token': new_token})
+        elif not brainstormingEnabled:
+            logger.info("Brainstorming disabled; proceeding directly to issue creation")
 
     # --- Fill template and create GitHub issue (reached from Shape B) ---
     try:
