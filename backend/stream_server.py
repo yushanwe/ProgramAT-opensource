@@ -3953,9 +3953,11 @@ def fetch_open_issues():
         
         # Fetch open issues (limit to 50 most recent)
         issues = repo.get_issues(state='open', sort='updated', direction='desc')
-        
+
         issue_list = []
-        for issue in issues[:50]:  # Limit to 50 issues
+        for i, issue in enumerate(issues):
+            if i >= 50:
+                break
             issue_list.append({
                 'number': issue.number,
                 'title': issue.title,
@@ -3999,6 +4001,31 @@ def fetch_pr_title(pr_number: int) -> str:
     except Exception as e:
         logger.error(f"Failed to fetch title for PR #{pr_number}: {e}")
         return f"PR #{pr_number}"
+
+
+def _fallback_issue_title(parsed_data: dict, raw_text: str) -> str:
+    """Build a non-empty GitHub issue title when the parser leaves it blank."""
+    candidates = [
+        parsed_data.get('title'),
+        parsed_data.get('description'),
+        parsed_data.get('example_usage'),
+        _original_request_fallback(parsed_data),
+        raw_text,
+    ]
+
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            candidate = ' '.join(str(item) for item in candidate)
+        elif candidate is None:
+            candidate = ''
+        elif not isinstance(candidate, str):
+            candidate = str(candidate)
+
+        normalized = ' '.join(candidate.split()).strip(' .:-')
+        if normalized:
+            return normalized[:256]
+
+    return "Visual assistive tool request"
 
 
 def fetch_pr_tools(pr_number: int) -> list:
@@ -5853,16 +5880,11 @@ async def create_github_issue(text: str):
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO)
         
-        # Create issue with parsed title and filled template
-        title = parsed_data.get('title', text[:100])
-        
-        # Ensure title is a string (AI might return unexpected formats)
-        if isinstance(title, list):
-            title = ' '.join(str(item) for item in title)
-        elif not isinstance(title, str):
-            title = str(title)
-        
-        # Truncate title if too long (GitHub has a limit)
+        # Create issue with parsed title and filled template.
+        # The parser occasionally leaves title blank, so always normalize
+        # through a fallback chain before calling GitHub.
+        title = _fallback_issue_title(parsed_data, text)
+
         if len(title) > 256:
             title = title[:253] + '...'
         
