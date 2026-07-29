@@ -13,7 +13,7 @@ This is a React Native app that facilitates AT creation, iteration, and testing 
 ## Getting Started
 
 For the GPU-free hosted NVIDIA short-video streaming path, see
-[docs/NVIDIA_RTVI_STREAMING.md](docs/NVIDIA_RTVI_STREAMING.md). It requires
+[docs/HOSTED_VIDEO_STREAMING.md](docs/HOSTED_VIDEO_STREAMING.md). It requires
 FFmpeg and a hosted NVIDIA API key, but no local GPU, RTVI, RTSP, or Docker.
 
 ### Prerequisites

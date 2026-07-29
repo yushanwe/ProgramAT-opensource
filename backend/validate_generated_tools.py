@@ -209,7 +209,7 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
     return failures
 
 
-def validate_rtvi_streaming_tool(
+def validate_temporal_streaming_tool(
     tool_text: str, issue_text: str, rel_path: Path
 ) -> List[str]:
     """Require hosted-video tools to remain declarative and runtime-owned."""
@@ -222,9 +222,9 @@ def validate_rtvi_streaming_tool(
         return []
     failures = []
     if not isinstance(constants.get('TOOL_NAME'), str):
-        failures.append(f"{rel_path}: RTVI tools require one string TOOL_NAME.")
+        failures.append(f"{rel_path}: temporal tools require one string TOOL_NAME.")
     if not isinstance(constants.get('TOOL_PROMPT'), str) or not constants.get('TOOL_PROMPT', '').strip():
-        failures.append(f"{rel_path}: RTVI tools require one non-empty string TOOL_PROMPT.")
+        failures.append(f"{rel_path}: temporal tools require one non-empty string TOOL_PROMPT.")
     video_config = constants.get('VIDEO_CONFIG')
     required_settings = {
         'window_seconds', 'interval_seconds', 'minimum_span_seconds',
@@ -279,7 +279,7 @@ def validate_rtvi_streaming_tool(
     found = sorted(set(found) | (forbidden & imported))
     if found:
         failures.append(
-            f"{rel_path}: RTVI runtime owns streaming; forbidden tool symbols: "
+            f"{rel_path}: temporal streaming runtime owns execution; forbidden tool symbols: "
             + ', '.join(found)
         )
     module_state = [
@@ -291,7 +291,7 @@ def validate_rtvi_streaming_tool(
         }
     ]
     if module_state:
-        failures.append(f"{rel_path}: RTVI tools must not keep module state: {module_state}")
+        failures.append(f"{rel_path}: temporal tools must not keep module state: {module_state}")
     allowed_names = {
         'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
     }
@@ -307,7 +307,7 @@ def validate_rtvi_streaming_tool(
         non_declarative.append(type(node).__name__)
     if non_declarative:
         failures.append(
-            f"{rel_path}: RTVI tools may contain only declarative constants: "
+            f"{rel_path}: temporal tools may contain only declarative constants: "
             + ', '.join(non_declarative)
         )
     return failures
@@ -357,7 +357,7 @@ def validate_files(paths: Iterable[Path], issue_text: Optional[str] = None) -> L
         failures.extend(validate_no_stringified_copilot_results(text, rel_path))
         if issue_text:
             failures.extend(validate_take_photo_tool(text, issue_text, rel_path))
-            failures.extend(validate_rtvi_streaming_tool(text, issue_text, rel_path))
+            failures.extend(validate_temporal_streaming_tool(text, issue_text, rel_path))
 
     return failures
 

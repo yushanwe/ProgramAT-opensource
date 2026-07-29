@@ -35,7 +35,7 @@ the first, two uniformly spaced middle, and last real frame, then saves the
 exact request as `backend/debug/last_hosted_images/frame-00.jpg` through
 `frame-03.jpg` plus `metadata.json`. It does not invoke FFmpeg or create an MP4.
 
-On 2026-07-20, `nvidia/nemotron-nano-12b-v2-vl` accepted a 29,215-byte H.264
+On July 20, 2026, `nvidia/nemotron-nano-12b-v2-vl` accepted a 29,215-byte H.264
 MP4 through `/v1/chat/completions` using this content item:
 
 ```json
@@ -80,7 +80,7 @@ returns it, advertised video models, and IDs in
 `NVIDIA_VIDEO_COMPARISON_MODELS`. It prints raw output, parsed cards,
 validation/correctness, and latency for each model.
 
-For app testing, restart the backend, select `played_card_rtvi`, start streaming,
+For app testing, restart the backend, select `played_card`, start streaming,
 keep the cards visible for at least five seconds, play one card, wait for hosted
 inference, then stop streaming. With Gemini, expected logs show the four source
 indices and timestamps, JPEG preprocessing and byte size, image-token usage,
