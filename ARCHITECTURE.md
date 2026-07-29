@@ -250,7 +250,7 @@ AudioOutputService.speak()     setToolOutput() → UI text
 - Creates issues from `.github/ISSUE_TEMPLATE/` templates
 - Fills templates with Gemini-parsed field data
 - Adds comments to existing issues (update mode)
-- Mentions `@copilot` for code-change requests
+- Mentions `@claude` for code-change requests
 - Polls GitHub for new PRs after Copilot issue creation (`pending_copilot_issues`)
 
 ### Message Types

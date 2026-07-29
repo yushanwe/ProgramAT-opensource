@@ -116,8 +116,6 @@ from generated_tool_runtime import (
     load_generated_tool,
 )
 from validate_generated_tools import validate_generated_tool_source
-from codex_agent import cancel_run as cancel_codex_run
-from codex_agent import run_issue as run_codex_issue
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / 'tools'
 if str(TOOLS_DIR) not in sys.path:
@@ -136,7 +134,6 @@ logger = logging.getLogger(__name__)
 BRAINSTORMING_ENABLED = os.environ.get(
     'BRAINSTORMING_ENABLED', 'false'
 ).strip().lower() in {'1', 'true', 'yes', 'on'}
-CODE_AGENT = os.environ.get('CODE_AGENT', 'codex').strip().lower()
 
 
 def _normalize_custom_gpt_value(value) -> str:
@@ -510,13 +507,6 @@ SERVER_CAPABILITIES = _validate_config()
 GITHUB_TOKEN = _fetch_github_token()
 GITHUB_REPO = os.environ.get('GITHUB_REPO', '')  # Format: owner/repo
 PAUSE_DURATION = float(os.environ.get('PAUSE_DURATION', '5.0'))  # seconds to wait before creating issue
-CODEX_BINARY = os.environ.get('CODEX_BINARY', shutil.which('codex') or 'codex')
-CODEX_HOME = Path(os.environ['CODEX_HOME']) if os.environ.get('CODEX_HOME') else None
-CODEX_MODEL = os.environ.get('CODEX_MODEL', '')
-CODEX_BASE_BRANCH = os.environ.get('CODEX_BASE_BRANCH', 'main')
-CODEX_WORKTREE_ROOT = Path(
-    os.environ.get('CODEX_WORKTREE_ROOT', '/tmp/programat-codex-worktrees')
-)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # LiteLLM / Gemini Configuration
@@ -3754,1024 +3744,48 @@ async def _process_entry_batch(websocket, session_id: str, pr_or_session: str, e
 
 
 async def fetch_copilot_sessions() -> list:
-    """
-    Fetch active Copilot coding agent tasks for the repository.
-    Uses `gh agent-task list` CLI command.
-    
-    Note: gh agent-task list doesn't support --json, so we parse text output
-    or just return empty and rely on PR-based lookup instead.
-    
-    Returns:
-        List of session dictionaries (may be empty if parsing fails)
-    """
-    try:
-        # gh agent-task list doesn't have --json flag, so we'll return empty
-        # and rely on the PR number based lookup in poll_for_copilot_session
-        logger.info("fetch_copilot_sessions called - using PR-based lookup instead")
-        return []
-        
-    except Exception as e:
-        logger.error(f"Error fetching Copilot sessions: {e}")
-        return []
+    """Return no remote code-agent sessions; Claude execution lives in GitHub Actions."""
+    return []
 
 
 async def stream_copilot_session_logs(websocket, client_id: str, pr_number_or_session: str, pr_number: int = None, skip_wait: bool = False, _last_summary_time=None, _skip_lines: int = 0, _start_entry_count: int = 0):
-    """
-    Stream Copilot agent task logs to a client using `gh agent-task view --follow`.
-    
-    Args:
-        websocket: WebSocket connection to send logs to
-        client_id: Client identifier for tracking
-        pr_number_or_session: PR number or session ID to stream logs for
-        pr_number: Explicit PR number (optional, used when pr_number_or_session is a session ID)
-        skip_wait: If True, skip the 45-second initialization wait (caller already confirmed session exists)
-        _last_summary_time: Internal: carry forward last summary time on reconnect to prevent rapid-fire summaries
-        _skip_lines: Internal: number of log lines to skip on reconnect (already processed)
-        _start_entry_count: Internal: starting entry count on reconnect (continue numbering)
-    """
-    global active_copilot_streams
-    
-    logger.info(f"Starting Copilot agent task log stream for {client_id}, pr/session: {pr_number_or_session}, pr_number: {pr_number}")
-    
-    try:
-        # Create clean environment for gh CLI - remove token env vars so it uses OAuth from gh auth login
-        # PAT tokens (GITHUB_TOKEN) don't work with agent-task, it requires OAuth credentials
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        session_id = str(pr_number_or_session)
-        
-        # If given a PR number, first fetch the session ID
-        if session_id.isdigit():
-            import pty
-            import fcntl
-            import re
-            
-            pr_number = int(session_id)  # Store the PR number
-            logger.info(f"PR number provided, fetching session ID for PR #{session_id}")
-            
-            # Wait for the session to initialize on GitHub's side before querying
-            # Skip this wait if the caller already confirmed the session exists
-            if not skip_wait:
-                logger.info("Waiting 45 seconds for GitHub to initialize the Copilot session...")
-                await asyncio.sleep(45)
-            else:
-                logger.info("Skipping 45-second wait (session already confirmed)")
-            
-            # Use Python's pty module to create a real PTY and send enter after delay
-            logger.info(f"Creating PTY for: gh agent-task view {session_id} -R {GITHUB_REPO}")
-            
-            # Create a PTY
-            master, slave = pty.openpty()
-            
-            # Spawn the gh command in the PTY
-            proc = await asyncio.create_subprocess_exec(
-                'gh', 'agent-task', 'view', str(session_id),
-                '-R', GITHUB_REPO,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                env=env
-            )
-            
-            # Close slave in parent process
-            os.close(slave)
-            
-            # Send multiple enters with delays to ensure we catch the prompt
-            # First wait for gh to query and display sessions
-            logger.info("Waiting 0.8 seconds then sending first enter...")
-            await asyncio.sleep(0.8)
-            os.write(master, b'\r\n')
-            logger.info("Sent first enter, waiting 0.3 seconds...")
-            await asyncio.sleep(0.3)
-            os.write(master, b'\r\n')
-            logger.info("Sent second enter to PTY")
-            
-            # Read output
-            output = b''
-            try:
-                # Set non-blocking
-                flags = fcntl.fcntl(master, fcntl.F_GETFL)
-                fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                
-                # Read with timeout
-                for _ in range(50):  # 5 seconds total
-                    await asyncio.sleep(0.1)
-                    try:
-                        chunk = os.read(master, 4096)
-                        if chunk:
-                            output += chunk
-                    except OSError:
-                        pass
-                    
-                    # Check if process has exited
-                    if proc.returncode is not None:
-                        break
-            finally:
-                os.close(master)
-                
-            # Wait for process to complete
-            await proc.wait()
-            
-            logger.info(f"Command completed with return code: {proc.returncode}")
-            output_str = output.decode('utf-8', errors='replace')
-            logger.info(f"Output length: {len(output_str)}")
-            
-            # Parse session ID from output - look for UUID pattern
-            uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-            matches = re.findall(uuid_pattern, output_str)
-            logger.info(f"Found {len(matches)} UUID matches in output")
-            
-            if matches:
-                session_id = matches[0]
-                logger.info(f"Selected most recent session: {session_id}")
-            else:
-                logger.error(f"Could not find session ID in output: {output_str[:200]}")
-                await websocket.send(json.dumps({
-                    'type': 'copilot_session_error',
-                    'pr_or_session': str(pr_number),
-                    'error': 'Could not find session ID for this PR'
-                }))
-                return
-        
-        # Spawn the gh CLI process with --follow and --log for continuous streaming
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            session_id,
-            '-R', GITHUB_REPO,
-            '--follow',
-            '--log',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        
-        # Create or get session in database with PR number
-        if pr_number is not None:
-            logger.info(f"Creating session {session_id} for PR #{pr_number} in database")
-            copilot_db.create_session(session_id, pr_number)
-        else:
-            logger.warning(f"Session {session_id} created without PR number - will not be queryable by PR")
-        
-        # Store process reference for cleanup
-        active_copilot_streams[client_id] = {
-            'process': proc,
-            'pr_or_session': pr_number_or_session,
-            'started_at': datetime.now(),
-            'session_id': session_id
-        }
-        
-        # Notify client that streaming has started
-        print(f"\n{'='*60}\n🤖 Copilot Session Started: {session_id}\n{'='*60}", flush=True)
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_stream_started',
-            'pr_or_session': str(pr_number_or_session),
-            'session_id': session_id,
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        # Entry tracking state
-        current_entry_lines = []
-        entry_buffer = []  # Buffer of complete entries
-        entry_count = _start_entry_count  # Continue from where we left off on reconnect
-        log_index = _skip_lines  # Continue log index from reconnect
-        prev_line = ""
-        in_code_section = False
-        lines_seen = 0  # Count lines seen this invocation (for skip logic)
-        last_summary_time = _last_summary_time or datetime.now()  # Don't fire immediately on first run
-        summary_interval = 30  # Generate summary every 30 seconds
-        check_interval = 5  # Check for new entries every 5 seconds
-        max_entry_lines = 50  # Force a boundary if an entry exceeds this many lines
-        
-        # Background task to periodically generate summaries
-        async def periodic_summarizer():
-            """Check every 5 seconds, summarize if 30 seconds have passed since last summary."""
-            nonlocal entry_buffer, last_summary_time
-            while True:
-                try:
-                    await asyncio.sleep(check_interval)
-                    now = datetime.now()
-                    
-                    # Only summarize if we have entries
-                    if not entry_buffer:
-                        continue
-                    
-                    # If first batch or 30 seconds have passed since last summary
-                    if last_summary_time is None:
-                        time_since_last = float('inf')
-                    else:
-                        time_since_last = (now - last_summary_time).total_seconds()
-                    
-                    if time_since_last >= summary_interval:
-                        # Copy and clear buffer
-                        entries_to_process = entry_buffer.copy()
-                        entry_buffer.clear()
-                        last_summary_time = now
-                        
-                        if not entries_to_process:
-                            continue
-                        
-                        logger.info(f"Periodic summarizer: Processing {len(entries_to_process)} entries ({time_since_last:.1f}s since last summary)")
-                        
-                        # Cap total text size to avoid overwhelming the summarizer
-                        # Any entries that don't fit go back in the buffer for next cycle
-                        total_chars = sum(len(e.get('text', '')) for e in entries_to_process)
-                        if total_chars > 15000:
-                            kept = []
-                            deferred = []
-                            char_count = 0
-                            for entry in entries_to_process:
-                                entry_text = entry.get('text', '')
-                                if char_count + len(entry_text) > 15000 and kept:
-                                    # This entry and all remaining go back in the buffer
-                                    deferred.append(entry)
-                                else:
-                                    kept.append(entry)
-                                    char_count += len(entry_text)
-                            # Put un-processed entries back in the buffer for next cycle
-                            if deferred:
-                                entry_buffer = deferred + entry_buffer
-                                logger.info(f"Capped at {len(kept)} entries ({char_count} chars), deferred {len(deferred)} entries to next cycle")
-                            entries_to_process = kept
-                        
-                        if entries_to_process:
-                            await _process_entry_batch(websocket, session_id, pr_number_or_session, entries_to_process)
-                        
-                        logger.info(f"Summary complete, next in {summary_interval}s")
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Error in periodic summarizer: {e}")
-        
-        # Start the periodic summarizer task
-        summarizer_task = asyncio.create_task(periodic_summarizer())
-        
-        try:
-            # Read and forward log lines as they arrive
-            while True:
-                line = await proc.stdout.readline()
-                
-                if not line:
-                    # Process ended or EOF - stop the periodic summarizer first
-                    summarizer_task.cancel()
-                    try:
-                        await summarizer_task
-                    except asyncio.CancelledError:
-                        pass
-                    
-                    # Flush any remaining entry
-                    if current_entry_lines:
-                        entry_text = '\n'.join(current_entry_lines)
-                        entry_buffer.append({
-                            'entry_num': entry_count,
-                            'lines': current_entry_lines[:],
-                            'text': entry_text,
-                            'is_code': in_code_section
-                        })
-                        entry_count += 1
-                        
-                        # Store in DB using batch insert (non-blocking)
-                        batch = [(session_id, log_index + i, line_text, in_code_section, entry_count - 1) 
-                                for i, line_text in enumerate(current_entry_lines)]
-                        asyncio.create_task(async_insert_logs_batch(batch))
-                        log_index += len(current_entry_lines)
-                    
-                    # Summarize any remaining entries
-                    if entry_buffer:
-                        await _process_entry_batch(websocket, session_id, pr_number_or_session, entry_buffer)
-                        entry_buffer.clear()  # Clear after final summary
-                    
-                    break
-                
-                log_line = line.decode('utf-8', errors='replace').rstrip()
-                
-                if log_line:
-                    lines_seen += 1
-                    
-                    # Skip lines already processed in previous invocation (reconnect)
-                    if lines_seen <= _skip_lines:
-                        prev_line = log_line
-                        continue
-                    
-                    # Print to terminal for server-side visibility
-                    print(f"  {log_line}", flush=True)
-                    
-                    # Send raw log to client
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_log',
-                        'pr_or_session': str(pr_number_or_session),
-                        'line': log_line,
-                        'timestamp': datetime.now().isoformat()
-                    }))
-                    
-                    # Track code fence state (```)
-                    if log_line.strip().startswith('```'):
-                        in_code_section = not in_code_section  # Toggle
-                    
-                    # Check if this line looks like code
-                    line_is_code = looks_like_code(log_line) or in_code_section
-                    
-                    # Detect entry boundary OR force boundary if entry is too large
-                    force_boundary = len(current_entry_lines) >= max_entry_lines
-                    natural_boundary = is_entry_boundary(log_line, prev_line)
-                    
-                    if (natural_boundary or force_boundary) and current_entry_lines:
-                        if force_boundary and not natural_boundary:
-                            logger.debug(f"Forcing entry boundary at {len(current_entry_lines)} lines")
-                        
-                        # Complete the current entry
-                        entry_text = '\n'.join(current_entry_lines)
-                        entry_buffer.append({
-                            'entry_num': entry_count,
-                            'lines': current_entry_lines[:],
-                            'text': entry_text,
-                            'is_code': in_code_section
-                        })
-                        
-                        # Store in DB using batch insert (non-blocking)
-                        batch = [(session_id, log_index + i, line_text, in_code_section, entry_count) 
-                                for i, line_text in enumerate(current_entry_lines)]
-                        asyncio.create_task(async_insert_logs_batch(batch))
-                        log_index += len(current_entry_lines)
-                        
-                        entry_count += 1
-                        current_entry_lines = []
-                        # Note: Don't reset in_code_section here - it persists across entries
-                    
-                    # Add line to current entry
-                    if log_line.strip():  # Don't add blank lines
-                        current_entry_lines.append(log_line)
-                    
-                    prev_line = log_line
-        finally:
-            # Cancel the summarizer task when done
-            summarizer_task.cancel()
-            try:
-                await summarizer_task
-            except asyncio.CancelledError:
-                pass
-
-        
-        # Check for any stderr output
-        stderr_output = await proc.stderr.read()
-        if stderr_output:
-            stderr_text = stderr_output.decode('utf-8', errors='replace').strip()
-            if stderr_text:
-                # Print to terminal
-                print(f"⚠️  STDERR: {stderr_text}", flush=True)
-                logger.warning(f"Copilot agent task stderr: {stderr_text}")
-                # Only send as error if it looks like an actual error (not just warnings/info)
-                if any(err_word in stderr_text.lower() for err_word in ['error', 'failed', 'fatal']):
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_error',
-                        'pr_or_session': str(pr_number_or_session),
-                        'error': stderr_text,
-                        'timestamp': datetime.now().isoformat()
-                    }))
-        
-        # Get exit code
-        exit_code = await proc.wait()
-        
-        logger.info(f"gh agent-task view exited with code {exit_code} for session {session_id}")
-        
-        # Check if the session is actually complete or if it's still running
-        # (This can happen when a sub-agent finishes but the parent is still active)
-        try:
-            # Query the session status
-            status_proc = await asyncio.create_subprocess_exec(
-                'gh', 'agent-task', 'view',
-                session_id,
-                '-R', GITHUB_REPO,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
-            stdout, stderr = await status_proc.communicate()
-            output = stdout.decode('utf-8', errors='replace')
-            
-            # Check if session shows as "in progress" or "active"
-            is_still_active = any(status in output.lower() for status in ['in progress', 'active', 'running'])
-            
-            if is_still_active:
-                if exit_code == 0:
-                    # Session is still active - the --follow just ended (likely due to sub-agent completion)
-                    logger.info(f"Session {session_id} is still active, restarting follow stream...")
-                    print(f"  🔄 Sub-agent completed, continuing to follow parent session...", flush=True)
-                else:
-                    # Non-zero exit but session still active - connection issue, try to reconnect
-                    logger.warning(f"Session {session_id} is still active but stream exited with code {exit_code}, reconnecting...")
-                    print(f"  🔄 Connection lost, attempting to reconnect to active session...", flush=True)
-                
-                # Restart the follow by calling stream_copilot_session_logs recursively
-                # Use the same websocket and parameters, carry forward summary timing
-                await stream_copilot_session_logs(websocket, client_id, session_id, pr_number, skip_wait=True, _last_summary_time=last_summary_time, _skip_lines=lines_seen, _start_entry_count=entry_count)
-                return  # Exit this instance, the recursive call handles the rest
-                
-        except Exception as e:
-            logger.warning(f"Could not check session status: {e}, assuming complete")
-        
-        # Determine session status based on exit code and whether we got any logs
-        # Get log count to see if we captured anything
-        logs_count = copilot_db.get_log_count(session_id)
-        
-        if exit_code == 0:
-            status = 'completed'
-        elif logs_count > 0:
-            # We got some logs but stream ended abnormally - mark as partial, not failed
-            status = 'partial'
-            logger.info(f"Session {session_id} recording ended early (exit {exit_code}) but captured {logs_count} log entries - marking as partial")
-        else:
-            # No logs captured and non-zero exit
-            status = 'failed'
-            
-        copilot_db.update_session_status(session_id, status, exit_code)
-        
-        # Notify client that streaming has ended
-        print(f"{'='*60}\n✅ Copilot Session Ended (exit code: {exit_code})\n{'='*60}\n", flush=True)
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_stream_ended',
-            'pr_or_session': str(pr_number_or_session),
-            'session_id': session_id,
-            'exit_code': exit_code,
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        logger.info(f"Copilot agent task log stream ended for {client_id}, exit code: {exit_code}")
-        
-    except asyncio.CancelledError:
-        logger.info(f"Copilot agent task stream cancelled for {client_id}")
-        raise
-    except Exception as e:
-        logger.error(f"Error streaming Copilot agent task logs: {e}")
-        try:
-            await websocket.send(json.dumps({
-                'type': 'copilot_session_error',
-                'pr_or_session': str(pr_number_or_session),
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }))
-        except:
-            pass  # Connection may already be closed
-    finally:
-        # Cleanup
-        if client_id in active_copilot_streams:
-            stream_info = active_copilot_streams[client_id]
-            if stream_info.get('process'):
-                try:
-                    stream_info['process'].terminate()
-                    await asyncio.wait_for(stream_info['process'].wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    stream_info['process'].kill()
-                except:
-                    pass
-            del active_copilot_streams[client_id]
+    await websocket.send(json.dumps({
+        'type': 'copilot_session_error',
+        'pr_or_session': str(pr_number_or_session),
+        'error': 'Remote code-agent session streaming is no longer supported on this branch.',
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def stop_copilot_session_stream(client_id: str):
-    """
-    Stop an active Copilot session stream for a client.
-    
-    Args:
-        client_id: Client identifier
-    """
-    global active_copilot_streams
-
-    if CODE_AGENT == 'codex' and await cancel_codex_run():
-        logger.info("Cancelled active Codex run at the client's request")
-        return
-    
-    if client_id not in active_copilot_streams:
-        logger.warning(f"No active Copilot stream for {client_id}")
-        return
-    
-    stream_info = active_copilot_streams[client_id]
-    
-    # Cancel the streaming task if it exists
-    if 'task' in stream_info and stream_info['task']:
-        stream_info['task'].cancel()
-    
-    # Terminate the subprocess
-    if stream_info.get('process'):
-        try:
-            stream_info['process'].terminate()
-            await asyncio.wait_for(stream_info['process'].wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            stream_info['process'].kill()
-        except Exception as e:
-            logger.error(f"Error stopping Copilot stream process: {e}")
-    
-    if client_id in active_copilot_streams:
-        del active_copilot_streams[client_id]
-    
-    logger.info(f"Stopped Copilot session stream for {client_id}")
+    active_copilot_streams.pop(client_id, None)
 
 
 async def fetch_and_store_pr_sessions(websocket, client_id: str, pr_number: int):
-    """
-    Fetch sessions for a PR and return them to the client.
-    
-    Note: GitHub CLI doesn't provide a way to list historical sessions.
-    We can only access:
-    1. Sessions already stored in our database from previous live streaming
-    2. The currently active session (if any) by streaming it live
-    
-    Args:
-        websocket: WebSocket connection to send updates to
-        client_id: Client identifier
-        pr_number: PR number to fetch sessions for
-    """
-    logger.info(f"Fetching sessions for PR #{pr_number}")
-    
-    try:
-        # Check database for existing sessions
-        sessions = copilot_db.get_sessions_for_pr(pr_number)
-        
-        if sessions:
-            logger.info(f"Found {len(sessions)} session(s) in database for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': sessions,
-                'timestamp': datetime.now().isoformat()
-            }))
-            return
-        
-        # No sessions in DB - check if there's an active session we can fetch
-        logger.info(f"No sessions in DB for PR #{pr_number}, checking for active session")
-        
-        # Try to get active session by running gh agent-task view
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            str(pr_number),
-            '-R', GITHUB_REPO,
-            '--log',  # Just get log info, not streaming
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            # No active session for this PR
-            logger.info(f"No active session found for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': [],
-                'timestamp': datetime.now().isoformat()
-            }))
-            return
-        
-        # Parse output to extract session ID
-        output = stdout.decode('utf-8', errors='replace')
-        import re
-        uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-        session_ids = re.findall(uuid_pattern, output)
-        
-        if session_ids:
-            session_id = session_ids[0]  # Use first found session ID
-            logger.info(f"Found active session {session_id} for PR #{pr_number}, creating in DB")
-            
-            # Create session in database
-            copilot_db.create_session(session_id, pr_number)
-            
-            # Fetch logs for this session without streaming
-            await fetch_and_store_session_logs(session_id, pr_number)
-            
-            # Get sessions from database and send to client
-            sessions = copilot_db.get_sessions_for_pr(pr_number)
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': sessions,
-                'timestamp': datetime.now().isoformat()
-            }))
-        else:
-            logger.info(f"Could not extract session ID for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': [],
-                'timestamp': datetime.now().isoformat()
-            }))
-        
-    except Exception as e:
-        logger.error(f"Error fetching sessions for PR #{pr_number}: {e}")
-        await websocket.send(json.dumps({
-            'type': 'error',
-            'message': f'Failed to fetch sessions: {str(e)}',
-            'timestamp': datetime.now().isoformat()
-        }))
+    await websocket.send(json.dumps({
+        'type': 'pr_sessions_list',
+        'pr_number': pr_number,
+        'sessions': [],
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def fetch_and_store_session_logs(session_id: str, pr_number: int):
-    """
-    Fetch logs for a specific session from GitHub and store in database.
-    Uses gh agent-task view --log (without --follow) to get historical logs.
-    
-    Args:
-        session_id: Copilot session ID
-        pr_number: Associated PR number
-    """
-    logger.info(f"Fetching historical logs for session {session_id}")
-    
-    try:
-        # Create clean environment for gh CLI
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        # Run gh agent-task view with --log but WITHOUT --follow for historical data
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            session_id,
-            '-R', GITHUB_REPO,
-            '--log',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        
-        # Process logs line by line
-        current_entry_lines = []
-        entry_buffer = []
-        entry_count = 0
-        log_index = 0
-        prev_line = ""
-        in_code_section = False
-        max_entry_lines = 50  # Force boundary if entry exceeds this
-        
-        while True:
-            line = await proc.stdout.readline()
-            
-            if not line:
-                # EOF - flush any remaining entry
-                if current_entry_lines:
-                    entry_text = '\n'.join(current_entry_lines)
-                    entry_buffer.append({
-                        'entry_num': entry_count,
-                        'lines': current_entry_lines[:],
-                        'text': entry_text,
-                        'is_code': in_code_section
-                    })
-                    entry_count += 1
-                    
-                    # Store in DB using batch insert (non-blocking)
-                    batch = [(session_id, log_index + i, line_text, in_code_section, entry_count - 1) 
-                            for i, line_text in enumerate(current_entry_lines)]
-                    asyncio.create_task(async_insert_logs_batch(batch))
-                    log_index += len(current_entry_lines)
-                
-                # Summarize any remaining entries
-                if entry_buffer:
-                    await _process_historical_batch(session_id, entry_buffer)
-                
-                break
-            
-            log_line = line.decode('utf-8', errors='replace').rstrip()
-            
-            if log_line:
-                # Track code fence state (```)
-                if log_line.strip().startswith('```'):
-                    in_code_section = not in_code_section  # Toggle
-                
-                # Check if this line looks like code
-                line_is_code = looks_like_code(log_line) or in_code_section
-                
-                # Detect entry boundary or force if too large
-                force_boundary = len(current_entry_lines) >= max_entry_lines
-                natural_boundary = is_entry_boundary(log_line, prev_line)
-                
-                if (natural_boundary or force_boundary) and current_entry_lines:
-                    # Complete the current entry
-                    entry_text = '\n'.join(current_entry_lines)
-                    entry_buffer.append({
-                        'entry_num': entry_count,
-                        'lines': current_entry_lines[:],
-                        'text': entry_text,
-                        'is_code': in_code_section
-                    })
-                    
-                    # Store in DB using batch insert (non-blocking)
-                    batch = [(session_id, log_index + i, line_text, in_code_section, entry_count) 
-                            for i, line_text in enumerate(current_entry_lines)]
-                    asyncio.create_task(async_insert_logs_batch(batch))
-                    log_index += len(current_entry_lines)
-                    
-                    entry_count += 1
-                    current_entry_lines = []
-                    # Don't reset in_code_section - it persists across entries
-                    
-                    # For historical logs, batch every 10 entries to avoid too many summaries
-                    if len(entry_buffer) >= 10:
-                        await _process_historical_batch(session_id, entry_buffer[:10])
-                        entry_buffer = entry_buffer[10:]
-                
-                # Add line to current entry
-                if log_line.strip():
-                    current_entry_lines.append(log_line)
-                
-                prev_line = log_line
-        
-        # Get exit code
-        exit_code = await proc.wait()
-        
-        # Determine session status based on exit code and whether we got any logs
-        if exit_code == 0:
-            status = 'completed'
-        elif log_index > 0:
-            # We got some logs but stream ended abnormally - mark as partial, not failed
-            status = 'partial'
-            logger.info(f"Session {session_id} fetch ended early (exit {exit_code}) but captured {log_index} log entries - marking as partial")
-        else:
-            # No logs captured and non-zero exit
-            status = 'failed'
-            
-        copilot_db.update_session_status(session_id, status, exit_code)
-        
-        logger.info(f"Stored {log_index} log lines and {entry_count} entries for session {session_id}")
-        
-    except Exception as e:
-        logger.error(f"Error fetching logs for session {session_id}: {e}")
+    return
 
 
 async def _process_historical_batch(session_id: str, entries: list):
-    """
-    Process a batch of historical entries: generate summary and store in DB.
-    Similar to _process_entry_batch but without WebSocket sending.
-    
-    Args:
-        session_id: Copilot session ID
-        entries: List of entry dicts
-    """
-    if not entries:
-        return
-    
-    # Generate summary (including code now)
-    loop = asyncio.get_event_loop()
-    try:
-        summary = await loop.run_in_executor(None, summarize_entries_sync, entries)
-        
-        # Get entry range
-        start_entry = entries[0]['entry_num']
-        end_entry = entries[-1]['entry_num']
-        
-        # Store summary in database
-        copilot_db.insert_summary(session_id, summary, start_entry, end_entry)
-        
-        logger.info(f"Generated summary for historical entries {start_entry}-{end_entry}: {summary[:50]}...")
-        
-    except Exception as e:
-        logger.error(f"Error processing historical batch: {e}")
+    return
 
 
 async def poll_for_copilot_session_on_pr(pr_number: int, websocket, client_id: str):
-    """
-    Poll for a Copilot agent task on a specific PR (used when commenting on existing PRs).
-    Much simpler than poll_for_copilot_session since we already know the PR number.
-    
-    Args:
-        pr_number: The PR number where @copilot was mentioned
-        websocket: WebSocket connection to stream logs to
-        client_id: Client identifier
-    """
-    logger.info(f"Polling for Copilot session on PR #{pr_number}")
-    
-    max_wait = 120  # Wait up to 2 minutes for session to start
-    poll_interval = 5  # Check every 5 seconds
-    start_time = datetime.now()
-    
-    try:
-        # Notify client we're watching
-        await websocket.send(json.dumps({
-            'type': 'copilot_watching',
-            'pr_number': pr_number,
-            'message': f'Waiting for Copilot session to start on PR #{pr_number}...',
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        # Create clean environment for gh CLI
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        while (datetime.now() - start_time).total_seconds() < max_wait:
-            try:
-                # Check if session exists for this PR using gh agent-task list
-                proc = await asyncio.create_subprocess_exec(
-                    'gh', 'agent-task', 'list',
-                    '--limit', '50',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env
-                )
-                stdout, stderr = await proc.communicate()
-                stdout_text = stdout.decode('utf-8', errors='replace').strip()
-                
-                # Look for our PR in the output
-                if f'#{pr_number}' in stdout_text and 'program-at/ProgramAT' in stdout_text:
-                    logger.info(f"Found session on PR #{pr_number}, starting stream")
-                    
-                    # Notify client
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_starting',
-                        'pr_number': pr_number,
-                        'message': f'Copilot session found, streaming logs...',
-                        'timestamp': datetime.now().isoformat()
-                    }))
-                    
-                    # Start streaming logs - stream function will extract the session ID
-                    # skip_wait=True because we already confirmed the session exists via agent-task list
-                    await stream_copilot_session_logs(
-                        websocket,
-                        client_id,
-                        str(pr_number),  # Pass PR number, function will get session ID
-                        pr_number=pr_number,
-                        skip_wait=True
-                    )
-                    return
-                else:
-                    logger.debug(f"No session yet on PR #{pr_number}, waiting...")
-                    
-            except Exception as e:
-                logger.warning(f"Error checking for session on PR #{pr_number}: {e}")
-            
-            await asyncio.sleep(poll_interval)
-        
-        # Timeout
-        logger.info(f"Timed out waiting for Copilot session on PR #{pr_number}")
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_timeout',
-            'pr_number': pr_number,
-            'message': f'No Copilot session started within {max_wait} seconds',
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-    except Exception as e:
-        logger.error(f"Error polling for session on PR #{pr_number}: {e}")
+    await websocket.send(json.dumps({
+        'type': 'copilot_session_timeout',
+        'pr_number': pr_number,
+        'message': 'Remote code-agent session polling is no longer supported on this branch.',
+        'timestamp': datetime.now().isoformat()
+    }))
 
-
-async def poll_for_copilot_session(issue_number: int, websocket, client_id: str):
-    """
-    Poll for a code-agent PR associated with a newly created issue.
-    Copilot sessions additionally stream through gh agent-task; Claude stops at
-    PR discovery because GitHub Actions is its authoritative execution log.
-    
-    Args:
-        issue_number: The GitHub issue number to monitor
-        websocket: WebSocket connection to stream logs to
-        client_id: Client identifier
-    """
-    global pending_copilot_issues
-    
-    agent_name = 'Claude' if CODE_AGENT == 'claude' else 'Copilot'
-    logger.info(f"Starting to poll for {agent_name} work for issue #{issue_number}")
-    
-    max_poll_duration = 600  # Poll for up to 10 minutes
-    poll_interval = 15  # Check every 15 seconds
-    session_poll_interval = 5  # Check for session more frequently once PR is found
-    start_time = datetime.now()
-    found_pr = None
-    
-    # Helper to send to websocket, tolerating disconnects
-    async def _safe_send(msg_dict):
-        """Send JSON to the websocket. Returns False if send failed (client gone)."""
-        nonlocal websocket
-        # Refresh websocket from pending_copilot_issues in case client reconnected
-        info = pending_copilot_issues.get(issue_number)
-        if info and info.get('websocket'):
-            websocket = info['websocket']
-        try:
-            await websocket.send(json.dumps(msg_dict))
-            return True
-        except Exception:
-            logger.debug(f"WebSocket send failed for issue #{issue_number} poll (client disconnected)")
-            return False
-    
-    try:
-        # Preserve the existing event name for frontend compatibility.
-        await _safe_send({
-            'type': 'copilot_watching',
-            'issue_number': issue_number,
-            'message': f'Watching for {agent_name} to create a PR for issue #{issue_number}...',
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        while (datetime.now() - start_time).total_seconds() < max_poll_duration:
-            # Check if client disconnected
-            if issue_number not in pending_copilot_issues:
-                logger.info(f"Stopped polling for issue #{issue_number} - removed from pending")
-                return
-            
-            try:
-                # If we haven't found a PR yet, look for one
-                if not found_pr:
-                    g = Github(GITHUB_TOKEN)
-                    repo = g.get_repo(GITHUB_REPO)
-                    pulls = repo.get_pulls(state='open', sort='created', direction='desc')
-                    
-                    for pr in list(pulls)[:10]:  # Check recent PRs
-                        pr_text = f"{pr.title} {pr.body or ''}"
-                        if f"#{issue_number}" in pr_text or f"Fixes #{issue_number}" in pr_text or f"Closes #{issue_number}" in pr_text:
-                            logger.info(f"Found PR #{pr.number} for issue #{issue_number}")
-                            found_pr = pr
-                            
-                            # Store PR number in pending info for reconnecting clients
-                            if issue_number in pending_copilot_issues:
-                                pending_copilot_issues[issue_number]['pr_number'] = pr.number
-                            
-                            # Notify client about PR (tolerate disconnects)
-                            await _safe_send({
-                                'type': 'copilot_pr_found',
-                                'issue_number': issue_number,
-                                'pr_number': pr.number,
-                                'pr_title': pr.title,
-                                'pr_url': pr.html_url,
-                                'message': (
-                                    f'{agent_name} created PR #{pr.number}: {pr.title}.'
-                                    if CODE_AGENT == 'claude'
-                                    else f'Copilot created PR #{pr.number}: {pr.title}. Waiting for agent session to start...'
-                                ),
-                                'timestamp': datetime.now().isoformat()
-                            })
-                            break
-                
-                # If we found a PR, try to stream its session
-                # The stream function will use gh agent-task list to find the session ID
-                if found_pr:
-                    if CODE_AGENT == 'claude':
-                        logger.info(
-                            f"Claude PR #{found_pr.number} found; detailed logs remain in GitHub Actions"
-                        )
-                        pending_copilot_issues.pop(issue_number, None)
-                        return
-
-                    logger.info(f"Found PR #{found_pr.number}, attempting to stream session")
-                    
-                    # Refresh websocket from pending info (client may have reconnected)
-                    info = pending_copilot_issues.get(issue_number)
-                    if info and info.get('websocket'):
-                        websocket = info['websocket']
-                        client_id = info.get('client_id', client_id)
-                    
-                    # Remove from pending (done polling, about to stream)
-                    if issue_number in pending_copilot_issues:
-                        del pending_copilot_issues[issue_number]
-                    
-                    # Notify client session is starting (tolerate disconnects)
-                    await _safe_send({
-                        'type': 'copilot_session_starting',
-                        'pr_number': found_pr.number,
-                        'message': f'Agent session found, streaming logs...',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    # Start streaming - pass PR number, stream function will extract session ID
-                    # skip_wait=True because poll already confirmed the session exists
-                    await stream_copilot_session_logs(
-                        websocket, 
-                        client_id, 
-                        str(found_pr.number),  # Pass PR number as string
-                        pr_number=found_pr.number,  # Explicitly pass PR number for database
-                        skip_wait=True
-                    )
-                    return
-                    
-                    # Session not ready, wait shorter interval
-                    await asyncio.sleep(session_poll_interval)
-                    continue
-                
-            except Exception as e:
-                logger.warning(f"Error polling for Copilot agent task: {e}")
-            
-            await asyncio.sleep(poll_interval)
-        
-        # Timeout reached
-        logger.info(f"Stopped polling for issue #{issue_number} - timeout reached")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
-        
-        await _safe_send({
-            'type': 'copilot_watch_timeout',
-            'issue_number': issue_number,
-            'message': f'Timed out waiting for {agent_name} to create a PR for issue #{issue_number}',
-            'timestamp': datetime.now().isoformat()
-        })
-        
-    except asyncio.CancelledError:
-        logger.info(f"Copilot polling cancelled for issue #{issue_number}")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
-        raise
-    except Exception as e:
-        logger.error(f"Error in poll_for_copilot_session: {e}")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
 
 
 def fetch_open_prs():
@@ -5897,8 +4911,8 @@ Return ONLY a valid JSON object:
 
 def should_mention_copilot(text: str) -> bool:
     """
-    Determine if the text is asking for code changes (should mention @copilot)
-    vs just status updates or issue selection (should not mention @copilot).
+    Determine if the text is asking for code changes that should trigger Claude
+    vs just status updates or issue selection.
     
     Args:
         text: The comment text to analyze
@@ -5945,33 +4959,12 @@ def build_copilot_comment(
     provider: Optional[str] = None,
 ) -> tuple[str, bool]:
     """Build an agent-triggering comment while preserving the legacy helper name."""
-    selected_provider = provider or CODE_AGENT
-    mention = '@claude' if selected_provider == 'claude' else '@copilot'
+    mention = '@claude'
     if not trigger_required or re.search(
         rf'(?i)(?<![\w-]){re.escape(mention)}\b', comment_text
     ):
         return comment_text, False
     return f"{mention}\n\n{comment_text}", True
-
-
-def is_copilot_target(issue) -> bool:
-    """Return whether an existing GitHub issue/PR belongs to a Copilot workflow."""
-    identities = [getattr(getattr(issue, 'user', None), 'login', '')]
-    identities.extend(getattr(assignee, 'login', '') for assignee in (getattr(issue, 'assignees', None) or []))
-    labels = [getattr(label, 'name', '') for label in (getattr(issue, 'labels', None) or [])]
-    return any('copilot' in str(value).lower() for value in (*identities, *labels))
-
-
-def _manual_agent_label(issue) -> str:
-    labels = {
-        str(getattr(label, 'name', '')).lower()
-        for label in (getattr(issue, 'labels', None) or [])
-    }
-    if 'ready-for-copilot' in labels:
-        return 'copilot'
-    if 'ready-for-claude' in labels:
-        return 'claude'
-    return ''
 
 
 async def update_github_issue(issue_number: int, comment_text: str, mention_copilot: bool = True):
@@ -5999,21 +4992,6 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
 
         is_pr = issue.pull_request is not None
         target_kind = "PR" if is_pr else "issue"
-        provider = _manual_agent_label(issue) or CODE_AGENT
-        pull_target = None
-        if is_pr and provider == 'codex':
-            try:
-                pull_target = repo.get_pull(issue_number)
-                head_ref = pull_target.head.ref
-                if head_ref.startswith('claude/'):
-                    provider = 'claude'
-                elif head_ref.startswith('copilot/'):
-                    provider = 'copilot'
-                elif head_ref.startswith('codex/'):
-                    provider = 'codex'
-            except Exception as e:
-                logger.warning("Could not inspect PR #%s provider: %s", issue_number, e)
-
         # Claude should continue an existing PR, not start a second issue run.
         pr_number = issue_number if is_pr else None
         pr_url = issue.html_url if is_pr else None
@@ -6031,31 +5009,16 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 _log_to_all_sessions("WARNING", f"Could not find PR for issue #{issue_number}: {e}")
                 logger.warning(f"Could not find PR for issue #{issue_number}: {e}")
 
-        if associated_pr is not None:
-            provider = _manual_agent_label(associated_pr) or (
-                'codex' if str(getattr(getattr(associated_pr, 'head', None), 'ref', '')).startswith('codex/')
-                else provider
-            )
-        trigger_required = mention_copilot and (
-            provider == 'claude'
-            or (
-                provider == 'copilot'
-                and (
-                    is_copilot_target(issue)
-                    or str(getattr(getattr(pull_target, 'head', None), 'ref', '')).startswith('copilot/')
-                )
-            )
-        )
+        trigger_required = mention_copilot
         issue_trigger_required = trigger_required and associated_pr is None
         final_comment, mention_added = build_copilot_comment(
             comment_text,
             issue_trigger_required if not is_pr else trigger_required,
-            provider,
         )
         preview = ' '.join(final_comment.split())[:240]
         decision_log = (
             f"GitHub comment decision: target={target_kind} #{issue_number}, "
-            f"agent={provider}, trigger_required={trigger_required}, "
+            f"agent=claude, trigger_required={trigger_required}, "
             f"mention_added_automatically={mention_added}, preview={preview!r}"
         )
         _log_to_all_sessions("INFO", decision_log)
@@ -6071,7 +5034,7 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         # sole triggering mention so the same request cannot start two runs.
         if associated_pr is not None:
             try:
-                pr_comment, _ = build_copilot_comment(comment_text, trigger_required, provider)
+                pr_comment, _ = build_copilot_comment(comment_text, trigger_required)
                 associated_pr.create_issue_comment(pr_comment)
                 _log_to_all_sessions("INFO", f"GitHub API: Added comment to associated PR #{pr_number}")
                 logger.info(f"Added comment to associated PR #{pr_number}")
@@ -6079,41 +5042,8 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 _log_to_all_sessions("WARNING", f"Could not add comment to PR for issue #{issue_number}: {e}")
                 logger.warning(f"Could not add comment to PR for issue #{issue_number}: {e}")
 
-        if provider == 'codex' and mention_copilot:
-            source_issue = issue
-            source_issue_number = issue_number
-            target_pr = associated_pr
-            branch = str(getattr(getattr(target_pr, 'head', None), 'ref', ''))
-            head_repository = str(
-                getattr(
-                    getattr(getattr(target_pr, 'head', None), 'repo', None),
-                    'full_name',
-                    '',
-                )
-            )
-            codex_pr_number = getattr(associated_pr, 'number', None)
-            if is_pr:
-                pull = pull_target or repo.get_pull(issue_number)
-                target_pr = pull
-                branch = pull.head.ref
-                head_repository = pull.head.repo.full_name
-                codex_pr_number = pull.number
-                match = re.search(r'(?i)(?:fixes|closes)\s+#(\d+)', f"{pull.title} {pull.body or ''}")
-                if match:
-                    source_issue_number = int(match.group(1))
-                    source_issue = repo.get_issue(source_issue_number)
-            _launch_codex(
-                issue_number=source_issue_number,
-                title=source_issue.title,
-                body=source_issue.body or '',
-                update_text=comment_text,
-                existing_branch=branch,
-                existing_pr_number=codex_pr_number,
-                existing_head_repository=head_repository,
-            )
-        
         # Send success notification to client
-        if connected_clients and not (provider == 'codex' and mention_copilot):
+        if connected_clients:
             success_data = {
                 'type': 'issue_updated',
                 'message': f"Comment added to issue #{issue_number}" + (f" and PR #{pr_number}" if pr_number else ""),
@@ -6605,119 +5535,6 @@ async def _broadcast_ws(data: dict) -> None:
                 logger.warning(f"Failed to broadcast to client: {result}")
 
 
-async def _broadcast_codex_event(payload: dict) -> None:
-    """Map local Codex events onto the existing frontend-compatible transport."""
-    event = payload.get('event')
-    run_id = payload.get('run_id')
-    if event == 'starting':
-        message = {
-            'type': 'copilot_session_stream_started',
-            'session_id': run_id,
-            'pr_or_session': run_id,
-            'provider': 'codex',
-            'timestamp': datetime.now().isoformat(),
-        }
-    elif event in {
-        'jsonl', 'stderr', 'run_context',
-        'worktree_status', 'changes_inspected', 'validation',
-        'commit_created', 'push_started', 'remote_verified',
-    }:
-        line = payload.get('line') or json.dumps(
-            payload.get('data') or {
-                key: value for key, value in payload.items()
-                if key not in {'event', 'run_id'}
-            },
-            ensure_ascii=False,
-        )
-        message = {
-            'type': 'copilot_session_log',
-            'pr_or_session': run_id,
-            'session_id': run_id,
-            'provider': 'codex',
-            'line': line,
-            'timestamp': datetime.now().isoformat(),
-        }
-    elif event == 'completed':
-        await _broadcast_ws({
-            'type': 'issue_updated',
-            'provider': 'codex',
-            'issue_number': payload.get('issue_number'),
-            'pr_number': payload.get('pr_number'),
-            'pr_url': payload.get('pr_url'),
-            'commit_sha': payload.get('commit_sha'),
-            'remote_branch_sha': payload.get('remote_branch_sha'),
-            'message': f"Codex pushed a verified update to PR #{payload.get('pr_number')}.",
-            'timestamp': datetime.now().isoformat(),
-        })
-        await _broadcast_ws({
-            'type': 'copilot_pr_found',
-            'provider': 'codex',
-            'issue_number': payload.get('issue_number'),
-            'pr_number': payload.get('pr_number'),
-            'pr_url': payload.get('pr_url'),
-            'message': f"Codex completed PR #{payload.get('pr_number')}.",
-            'timestamp': datetime.now().isoformat(),
-        })
-        message = {
-            'type': 'copilot_session_stream_ended',
-            'session_id': run_id,
-            'pr_or_session': run_id,
-            'provider': 'codex',
-            'exit_code': 0,
-            'timestamp': datetime.now().isoformat(),
-        }
-    elif event in {'failed', 'cancelled'}:
-        message = {
-            'type': 'copilot_session_error' if event == 'failed' else 'copilot_session_stream_ended',
-            'session_id': run_id,
-            'pr_or_session': run_id,
-            'provider': 'codex',
-            'exit_code': None if event == 'cancelled' else 1,
-            'error': payload.get('error'),
-            'cancelled': event == 'cancelled',
-            'timestamp': datetime.now().isoformat(),
-        }
-    else:
-        return
-    await _broadcast_ws(message)
-
-
-def _launch_codex(
-    *,
-    issue_number: int,
-    title: str,
-    body: str,
-    update_text: str = '',
-    existing_branch: str = '',
-    existing_pr_number: Optional[int] = None,
-    existing_head_repository: str = '',
-) -> None:
-    """Start one isolated Codex run without blocking issue/comment handling."""
-    if CODE_AGENT != 'codex':
-        return
-
-    async def _run() -> None:
-        result = await run_codex_issue(
-            repo_root=REPO_ROOT,
-            issue_number=issue_number,
-            title=title,
-            body=body,
-            github_repo=GITHUB_REPO,
-            github_token=GITHUB_TOKEN,
-            codex_binary=CODEX_BINARY,
-            codex_home=CODEX_HOME,
-            model=CODEX_MODEL,
-            base_branch=CODEX_BASE_BRANCH,
-            worktree_root=CODEX_WORKTREE_ROOT,
-            update_text=update_text,
-            existing_branch=existing_branch,
-            existing_pr_number=existing_pr_number,
-            existing_head_repository=existing_head_repository,
-            log_callback=_broadcast_codex_event,
-        )
-        logger.info("[Codex] Run for issue #%s finished: %s", issue_number, result)
-
-    asyncio.create_task(_run())
 
 
 async def create_github_issue(text: str):
@@ -6981,18 +5798,7 @@ async def create_github_issue(text: str):
         _log_to_all_sessions("INFO", f"GitHub API: Created issue #{issue.number}: {title} (url: {issue.html_url})")
         logger.info(f"Created GitHub issue #{issue.number}: {title[:50]}... (type: {issue_type})")
 
-        if CODE_AGENT == 'codex':
-            _launch_codex(
-                issue_number=issue.number,
-                title=issue.title,
-                body=body,
-            )
-        elif CODE_AGENT == 'claude':
-            issue.add_to_labels('ready-for-claude')
-        elif CODE_AGENT == 'copilot':
-            issue.add_to_labels('ready-for-copilot')
-        else:
-            logger.error("Unsupported CODE_AGENT=%r; issue created without an agent", CODE_AGENT)
+        issue.add_to_labels('ready-for-claude')
         
         # Send success notification to client
         if connected_clients:
@@ -7004,9 +5810,7 @@ async def create_github_issue(text: str):
             }
             await _broadcast_ws(success_data)
             
-            # Copilot retains its remote agent-task polling. Codex reports its
-            # local subprocess lifecycle directly, and Claude logs live in Actions.
-            for ws in connected_clients if CODE_AGENT == 'copilot' else []:
+            for ws in connected_clients:
                 try:
                     ws_client_id = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
                     
@@ -7022,9 +5826,9 @@ async def create_github_issue(text: str):
                     asyncio.create_task(
                         poll_for_copilot_session(issue.number, ws, ws_client_id)
                     )
-                    logger.info(f"Started code-agent PR polling for issue #{issue.number}")
+                    logger.info(f"Started Claude PR polling for issue #{issue.number}")
                 except Exception as e:
-                    logger.error(f"Error starting Copilot poll for client: {e}")
+                    logger.error(f"Error starting Claude poll for client: {e}")
         
     except Exception as e:
         import traceback
@@ -9286,161 +8090,6 @@ monitored_sessions = set()  # Track session IDs we're already monitoring
 monitored_prs = set()  # Track PR numbers we've checked
 
 
-async def monitor_copilot_sessions():
-    """
-    Background task to continuously monitor for new Copilot sessions and capture their logs.
-    Checks:
-    1. All open PRs for Copilot agent tasks
-    2. Recent @copilot comments that spawn sessions
-    3. Any active sessions we haven't captured yet
-    
-    This ensures we have historical logs for all sessions, even if no one explicitly requests them.
-    """
-    global monitored_sessions, monitored_prs
-    
-    if not GITHUB_TOKEN:
-        logger.warning("GitHub token not available, skipping Copilot session monitoring")
-        return
-    
-    logger.info("Starting background Copilot session monitoring")
-    check_interval = 60  # Check every minute
-    
-    # Create clean environment for gh CLI
-    env = os.environ.copy()
-    env.pop('GH_TOKEN', None)
-    env.pop('GITHUB_TOKEN', None)
-    
-    while True:
-        try:
-            await asyncio.sleep(check_interval)
-            
-            g = Github(GITHUB_TOKEN)
-            repo = g.get_repo(GITHUB_REPO)
-            
-            # 1. Check all open PRs for Copilot sessions
-            pulls = repo.get_pulls(state='open', sort='updated', direction='desc')
-            for pr in list(pulls)[:20]:  # Check 20 most recently updated PRs
-                if pr.number in monitored_prs:
-                    continue  # Already checked this PR
-                
-                try:
-                    # Check if PR has Copilot agent activity (created by copilot or mentions copilot)
-                    is_copilot_pr = (
-                        pr.user.login == 'github-actions[bot]' or
-                        'copilot' in (pr.title + (pr.body or '')).lower() or
-                        any('copilot' in comment.body.lower() for comment in pr.get_issue_comments()[:10])
-                    )
-                    
-                    if is_copilot_pr:
-                        logger.info(f"Found potential Copilot PR #{pr.number}: {pr.title}")
-                        
-                        # Try to find session ID for this PR
-                        proc = await asyncio.create_subprocess_exec(
-                            'gh', 'agent-task', 'view',
-                            str(pr.number),
-                            '-R', GITHUB_REPO,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=env
-                        )
-                        stdout, stderr = await proc.communicate()
-                        output = stdout.decode('utf-8', errors='replace')
-                        
-                        # Extract session ID from output
-                        import re
-                        uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-                        matches = re.findall(uuid_pattern, output)
-                        
-                        if matches:
-                            session_id = matches[0]
-                            if session_id not in monitored_sessions:
-                                logger.info(f"Starting background capture for session {session_id} (PR #{pr.number})")
-                                monitored_sessions.add(session_id)
-                                monitored_prs.add(pr.number)
-                                
-                                # Start background log capture (no websocket needed)
-                                asyncio.create_task(
-                                    capture_session_logs_background(session_id, pr.number)
-                                )
-                        else:
-                            # Mark as checked even if no session found
-                            monitored_prs.add(pr.number)
-                            
-                except Exception as e:
-                    logger.warning(f"Error checking PR #{pr.number} for Copilot session: {e}")
-            
-            # 2. Check for recent @copilot comments
-            # Get recent issue comments (issues include PRs in GitHub API)
-            issues = repo.get_issues(state='open', sort='updated', direction='desc')
-            for issue in list(issues)[:30]:  # Check 30 most recent
-                try:
-                    comments = issue.get_comments()
-                    for comment in list(comments)[-5:]:  # Last 5 comments
-                        if '@copilot' in comment.body.lower():
-                            # This might have spawned a session
-                            pr_number = issue.number if issue.pull_request else None
-                            if pr_number and pr_number not in monitored_prs:
-                                logger.info(f"Found @copilot comment in PR #{pr_number}, checking for session...")
-                                monitored_prs.add(pr_number)
-                                
-                                # Check for session (same logic as above)
-                                proc = await asyncio.create_subprocess_exec(
-                                    'gh', 'agent-task', 'view',
-                                    str(pr_number),
-                                    '-R', GITHUB_REPO,
-                                    stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.PIPE,
-                                    env=env
-                                )
-                                stdout, stderr = await proc.communicate()
-                                output = stdout.decode('utf-8', errors='replace')
-                                
-                                matches = re.findall(uuid_pattern, output)
-                                if matches:
-                                    session_id = matches[0]
-                                    if session_id not in monitored_sessions:
-                                        logger.info(f"Starting background capture for @copilot session {session_id} (PR #{pr_number})")
-                                        monitored_sessions.add(session_id)
-                                        asyncio.create_task(
-                                            capture_session_logs_background(session_id, pr_number)
-                                        )
-                except Exception as e:
-                    logger.warning(f"Error checking issue #{issue.number} for @copilot comments: {e}")
-            
-            logger.debug(f"Background monitor: Tracking {len(monitored_sessions)} sessions, {len(monitored_prs)} PRs")
-            
-        except Exception as e:
-            logger.error(f"Error in monitor_copilot_sessions: {e}", exc_info=True)
-            await asyncio.sleep(check_interval)
-
-
-async def capture_session_logs_background(session_id: str, pr_number: int):
-    """
-    Capture logs for a Copilot session in the background (no WebSocket client needed).
-    Stores everything in the database for later retrieval.
-    
-    Args:
-        session_id: Copilot session ID
-        pr_number: Associated PR number
-    """
-    global monitored_sessions
-    
-    logger.info(f"Background log capture started for session {session_id} (PR #{pr_number})")
-    
-    try:
-        # Create session in database
-        copilot_db.create_session(session_id, pr_number)
-        
-        # Fetch and store historical logs
-        await fetch_and_store_session_logs(session_id, pr_number)
-        
-        logger.info(f"Background log capture completed for session {session_id}")
-        
-    except Exception as e:
-        logger.error(f"Error in background log capture for session {session_id}: {e}")
-    finally:
-        # Keep session in monitored_sessions so we don't try to capture it again
-        pass
 
 
 async def main():
@@ -9450,20 +8099,6 @@ async def main():
     logger.info(f"Starting backend server on {HOST}:{PORT}")
     logger.info(f"Frame saving: {'enabled' if SAVE_FRAMES else 'disabled'}")
     logger.info(f"GitHub issue creation: {'enabled' if GITHUB_TOKEN else 'disabled'}")
-    logger.info(
-        "Code agent: provider=%s codex_binary=%s codex_home=%s codex_model=%s base_branch=%s worktree_root=%s",
-        CODE_AGENT,
-        CODEX_BINARY,
-        CODEX_HOME or '<inherited>',
-        CODEX_MODEL or '<Codex profile default>',
-        CODEX_BASE_BRANCH,
-        CODEX_WORKTREE_ROOT,
-    )
-    if CODE_AGENT not in {'codex', 'claude', 'copilot'}:
-        logger.warning("Unsupported CODE_AGENT=%r", CODE_AGENT)
-    if CODE_AGENT == 'codex' and not shutil.which(CODEX_BINARY):
-        logger.warning("Codex executable is not available: %s", CODEX_BINARY)
-
     logger.info(
         "[Streaming] streaming_executor=%s nvidia_hosted_active=%s "
         "streaming_policy=%s",
@@ -9495,14 +8130,11 @@ async def main():
     # Start background tasks independently for resilience
     asyncio.create_task(broadcast_stats())
     asyncio.create_task(monitor_text_pause())
-    # Background Copilot monitoring disabled - we poll specific PRs when user comments with @copilot
 
     # Keep server running
     try:
         await asyncio.Future()  # Run forever
     finally:
-        while await cancel_codex_run():
-            pass
         for client_id in list(active_hosted_nvidia_sessions):
             await _cleanup_hosted_nvidia_session(client_id, reason='server_shutdown')
         await hosted_nvidia_client.close()
