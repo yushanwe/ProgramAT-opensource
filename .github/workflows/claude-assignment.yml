@@ -73,9 +73,11 @@ jobs:
             return response.data.body || "";
 
       - name: Ask Claude to implement the VAT issue
+        id: claude
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           base_branch: main
           branch_prefix: claude/issue-${{ github.event.issue.number }}-
           track_progress: true
@@ -105,10 +107,10 @@ jobs:
       - name: Create PR if Claude pushed a branch but did not open one
         if: github.event.issue.pull_request == null
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.claude.outputs.github_token || github.token }}
           TARGET_NUMBER: ${{ github.event.issue.number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
-          REPO: ${{ github.repository }}
+          CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
         run: |
           existing_pr="$(gh pr list --state open --limit 100 --json number,title,body,headRefName \
             --jq ".[] | select(((.title // \"\") + \" \" + (.body // \"\")) | contains(\"#$TARGET_NUMBER\")) | .number" \
@@ -118,13 +120,9 @@ jobs:
             exit 0
           fi
 
-          branch_prefix="claude/issue-${TARGET_NUMBER}-"
-          branch_name="$(gh api "repos/$REPO/branches?per_page=100" \
-            --jq ".[] | select(.name | startswith(\"$branch_prefix\")) | .name" \
-            | tail -n 1)"
-          if [ -z "$branch_name" ]; then
-            echo "No Claude branch found for issue #$TARGET_NUMBER; leaving verification to the next step."
-            exit 0
+          if [ -z "$CLAUDE_BRANCH" ]; then
+            echo "::error::Claude finished without exposing a branch name, so the workflow cannot auto-create the PR."
+            exit 1
           fi
 
           pr_title="Fixes #$TARGET_NUMBER: $ISSUE_TITLE"
@@ -136,7 +134,7 @@ jobs:
           )"
 
           gh pr create \
-            --head "$branch_name" \
+            --head "$CLAUDE_BRANCH" \
             --base main \
             --title "$pr_title" \
             --body "$pr_body"
