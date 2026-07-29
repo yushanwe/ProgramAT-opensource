@@ -1,89 +1,54 @@
 # tools/ — ProgramAT vision tools
 
-Each `.py` file here is one assistive tool. The backend loads a tool's source,
-`exec()`s it against a single camera frame, and speaks the result to a blind user.
-Tools never import each other and never touch app/backend WebSocket layer — they
-get an image, they return text. (`litellm_utils.py` is a shared helper, not a tool.) 
-You should only touch the network if making a call to a model or API.
+Each Python file is one assistive tool. The backend executes it with a camera
+image and speaks the returned value. Tools do not use WebSockets or import one
+another.
 
-## The contract
+Expose `main(image, input_data)` with exactly two parameters. `image` is an
+OpenCV BGR array and `input_data` is a dictionary. Return concise,
+audio-friendly text; do not print.
 
-A tool MUST define a function — `main` by convention (`run` and `process_image`
-also work):
+For a take-photo tool, use this shape:
 
 ```python
-def main(image, input_data=None):
-    ...
-    return result
+from litellm_utils import call_take_photo_vlm
+
+TOOL_NAME = "tool_name"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = "One concise task-specific fused prompt."
+
+
+def main(image, input_data):
+    if image is None:
+        return "No camera image is available."
+    return call_take_photo_vlm(
+        image=image, prompt=TOOL_PROMPT, tool_name=TOOL_NAME
+    )
 ```
 
-- **Exactly two parameters.** The server checks the signature and silently skips a
-  `main` with any other arity — the tool then does nothing.
-- **`image`** is an OpenCV `numpy` array in **BGR** order, and may be `None`. Always
-  guard it, and convert BGR→RGB before sending it to an LLM or PIL.
-- **`input_data`** is always a `dict`. Read config with `.get()`; assume nothing.
-- **Return** a plain `str` (spoken via TTS) or a `dict` with `text` and/or `audio`.
-  `audio` is `{'type', 'text', 'rate', 'interrupt'}`, where `type` is one of
-  `speech`, `beep_high`, `beep_low`, `success`, `warning`, `error`. Other dict keys
-  are ignored. Return `""` to stay silent.
+Make exactly one helper call and return it directly. Do not add another model or
+specialist call, verification pass, fallback model, model name, or provider SDK.
+Author one concise fused prompt following the detailed guidance in
+`.github/copilot-instructions.md`.
 
-## Rules that prevent silent failure
+Static `take_photo` tools may also stream; each selected frame is processed
+independently through the same one-image prompt. Static tools must not declare
+`VIDEO_CONFIG` or keep temporal state.
 
-- **Never `print()`.** The server captures stdout and reads it aloud to the user.
-  Return information; don't print it.
-- **Never raise.** Streaming-mode exceptions are swallowed with no feedback. Catch
-  errors and return an error string or an `audio` dict with `type: 'error'`.
-- **Cache heavy models** in the injected `yolo_model_cache` global —
-  `globals().get('yolo_model_cache', {})` — not on every call. Reloading a model
-  per frame makes streaming unusable. `door_detection.py` shows the pattern.
-- **Streaming etiquette:** when run per frame, return `""` when nothing changed, or
-  the user hears the same thing every ~500ms. Streaming output is capped at ~15 words.
-- **Model-backed work:** treat capability categories as declarations, not
-  implementation requirements. Assume each generated tool implements one
-  user-facing task. If the issue enumerates multiple stages, execute one
-  `copilot_llm_call()` per stage and explicitly pass useful artifact fields to
-  the next call. Use the existing backend model router
-  through the existing tool-facing client for capability execution. Do
-  not implement routing, create routers, create capability registries, create
-  detector/OCR/LLM wrappers, concrete detector functions, model-backed
-  inference, model loading, or provider calls inside a generated tool.
-  Do not choose candidate implementations inside the generated tool.
-  Import `copilot_llm_call` from `model_router_client` for every stage.
-  Canonical categories for new tools are `general_reasoning`, `ocr`,
-  `object_detection_localization`, `structured_visual_understanding`,
-  `spatial_reasoning`, `navigation`, `camera_motion`, and
-  `temporal_reasoning`. Use only these category names. Include
-  `metadata={"tool_name": "...", "route_text": "..."}` for routing logs.
-  For `object_detection_localization`, also provide
-  `metadata={"target_labels": ["requested label"]}`. Do not
-  drop those labels in later navigation calls. Pass the same `target_labels`
-  with the target-filtered detection artifact. For exit-finding tools, use
-  `["exit", "door", "doorway", "exit sign"]`.
-  hardcode provider/model names, detector names, provider-specific
-  `DEFAULT_MODEL` constants, `COCO_CLASSES`, direct `litellm.completion()`
-  calls, `YOLO(...)` calls, detector library imports, provider SDK imports,
-  `.pt` file loading, or model-file discovery logic. If the approved API cannot
-  support the needed capability, add support to the centralized backend router
-  instead of implementing it inside the tool.
-- **Imports:** `import litellm_utils` bare (the server makes `tools/` the import
-  root). Wrap optional dependencies in `try/except ImportError` — missing pip
-  packages are auto-installed by the backend.
-- Keep output short and audio-friendly: positional, body-relative language.
+For `hosted_video_streaming`, declare `TOOL_NAME`, `EXECUTION_MODE`,
+`TOOL_PROMPT`, required literal `VIDEO_CONFIG`, and optional literal
+`OUTPUT_CONFIG` only. The prompt must describe the chronological evidence to
+compare. The shared runtime owns the continuous video
+session and output filtering. Do not import take-photo helpers or implement
+buffering, FFmpeg, model calls, asynchronous loops, or before/after state.
 
-## Examples to copy from
+Temporal input and output schema are separate decisions. Generic temporal
+recognition tools should request one concise plain-text result. Declare
+`OUTPUT_CONFIG = {"schema": "played_card_event"}` only for played-card detection;
+never use card fields for sign language or another unrelated task.
 
-- `object_recognition.py` — simple detection-style tool returning a plain string.
-- `door_detection.py` — streaming, temporal smoothing, clock-face navigation.
-- `scene_description.py`, `clothing_recognition.py` — routed vision-language tools.
-- `appearance_check.py` — the most complete example: two-pass detect→verify,
-  robust JSON parsing, fail-closed safety. Study it before writing an LLM tool.
-
-## Adding a tool
-
-1. Create `tools/your_tool.py` with `main(image, input_data)`.
-2. Write a `backend/test_<tool>.py` script and verify with `python test_<tool>.py`.
-3. Compose planner-produced stages explicitly with ordered `copilot_llm_call()`
-   invocations. The tool owns artifact passing; the backend chooses the first
-   configured implementation for each atomic capability call.
-4. `MODEL_SETUP.md` covers model files; `.github/copilot-instructions.md` has the
-   full tool-generation spec. `CONTRIBUTING.md` has the PR and review process.
+Take Photo works for temporal tools through the shared runtime and supplies one
+current image to the same `TOOL_PROMPT`. Write temporal prompts to use ordered
+motion evidence when multiple frames exist, use only visible static evidence
+with one frame, and return a task-specific uncertainty response rather than
+inventing unseen motion.

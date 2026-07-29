@@ -10,9 +10,6 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-import yaml
-
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = REPO_ROOT / "tools"
 
@@ -39,47 +36,6 @@ ALLOWED_SHARED_TOOL_FILES = {
     "model_router_client.py",
 }
 
-CAPABILITY_PROFILES_PATH = REPO_ROOT / "backend" / "capability_profiles.yaml"
-
-
-def _load_canonical_task_categories() -> frozenset[str]:
-    with CAPABILITY_PROFILES_PATH.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    capabilities = data.get("capabilities", {})
-    if not isinstance(capabilities, dict) or not capabilities:
-        raise ValueError(f"No capabilities configured in {CAPABILITY_PROFILES_PATH}")
-    return frozenset(str(name) for name in capabilities)
-
-
-CANONICAL_TASK_CATEGORIES = _load_canonical_task_categories()
-
-
-def _extract_task_stages_section(issue_text: str) -> str:
-    match = re.search(r"^##\s+Task\s+Stages\s*$", issue_text, re.IGNORECASE | re.MULTILINE)
-    if not match:
-        return ""
-
-    start = match.end()
-    remainder = issue_text[start:]
-    next_header = re.search(r"^##\s+", remainder, re.MULTILINE)
-    if next_header:
-        return remainder[: next_header.start()]
-    return remainder
-
-
-def extract_stage_capabilities(issue_text: str) -> List[str]:
-    section = _extract_task_stages_section(issue_text)
-    if not section:
-        return []
-
-    capabilities: List[str] = []
-    for cap in re.findall(r"^\s*(?:[-*]\s*)?Capability\s*:\s*`?([a-z_]+)`?\s*$", section, re.IGNORECASE | re.MULTILINE):
-        capability = cap.strip()
-        if capability in CANONICAL_TASK_CATEGORIES:
-            capabilities.append(capability)
-    return capabilities
-
-
 def _extract_string_constants(tree: ast.AST) -> dict[str, str]:
     constants: dict[str, str] = {}
     if not isinstance(tree, ast.Module):
@@ -90,6 +46,23 @@ def _extract_string_constants(tree: ast.AST) -> dict[str, str]:
             target = node.targets[0]
             if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 constants[target.id] = node.value.value
+    return constants
+
+
+def _extract_literal_constants(tree: ast.AST) -> dict[str, object]:
+    constants: dict[str, object] = {}
+    if not isinstance(tree, ast.Module):
+        return constants
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        try:
+            constants[target.id] = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            continue
     return constants
 
 
@@ -178,40 +151,165 @@ def validate_no_stringified_copilot_results(tool_text: str, rel_path: Path) -> L
     return failures
 
 
-def validate_stage_enforcement(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
-    failures: List[str] = []
-    stage_capabilities = extract_stage_capabilities(issue_text)
-    if not stage_capabilities:
-        return failures
+def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
+    """Enforce the unified single-call take-photo generation contract."""
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+    constants = _extract_literal_constants(tree)
+    if constants.get('EXECUTION_MODE') != 'take_photo':
+        return []
 
-    actual_capabilities = extract_copilot_llm_task_categories(tool_text)
-    if actual_capabilities != stage_capabilities:
-        failures.append(
-            f"{rel_path}: ordered copilot_llm_call capabilities {actual_capabilities} do not match "
-            f"Task Stages {stage_capabilities}."
+    vlm_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "call_take_photo_vlm"
         )
-
+    ]
+    failures = []
+    if len(vlm_calls) != 1:
+        failures.append(
+            f"{rel_path}: take-photo tools require exactly one call_take_photo_vlm() call; "
+            f"found {len(vlm_calls)}."
+        )
+    tool_prompt = constants.get("TOOL_PROMPT")
+    if tool_prompt is None:
+        failures.append(f"{rel_path}: take-photo tools require one string TOOL_PROMPT constant.")
+    if "TOOL_NAME" not in constants:
+        failures.append(f"{rel_path}: take-photo tools require one string TOOL_NAME constant.")
+    if constants.get('EXECUTION_MODE') != 'take_photo':
+        failures.append(f"{rel_path}: static tools require EXECUTION_MODE = 'take_photo'.")
+    if 'VIDEO_CONFIG' in constants:
+        failures.append(f"{rel_path}: static tools must not declare temporal VIDEO_CONFIG.")
+    prompt_uses = []
+    for call in vlm_calls:
+        prompt_keyword = next((kw for kw in call.keywords if kw.arg == "prompt"), None)
+        prompt_uses.append(
+            prompt_keyword is not None
+            and isinstance(prompt_keyword.value, ast.Name)
+            and prompt_keyword.value.id == "TOOL_PROMPT"
+        )
+    if prompt_uses != [True]:
+        failures.append(f"{rel_path}: take-photo tools must pass TOOL_PROMPT directly as the helper prompt.")
+    tool_name_uses = []
+    for call in vlm_calls:
+        keyword = next((kw for kw in call.keywords if kw.arg == "tool_name"), None)
+        tool_name_uses.append(
+            keyword is not None
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "TOOL_NAME"
+        )
+    if tool_name_uses != [True]:
+        failures.append(f"{rel_path}: take-photo tools must pass TOOL_NAME directly as tool_name.")
+    if extract_copilot_llm_task_categories(tool_text):
+        failures.append(f"{rel_path}: take-photo tools must not call copilot_llm_call().")
     return failures
 
 
-def validate_canonical_task_categories(tool_text: str, rel_path: Path) -> List[str]:
-    failures: List[str] = []
-    categories = extract_copilot_llm_task_categories(tool_text)
-    unresolved_indexes = [index + 1 for index, category in enumerate(categories) if category is None]
-
-    if unresolved_indexes:
+def validate_temporal_streaming_tool(
+    tool_text: str, issue_text: str, rel_path: Path
+) -> List[str]:
+    """Require hosted-video tools to remain declarative and runtime-owned."""
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+    constants = _extract_literal_constants(tree)
+    if constants.get('EXECUTION_MODE') != 'hosted_video_streaming':
+        return []
+    failures = []
+    if not isinstance(constants.get('TOOL_NAME'), str):
+        failures.append(f"{rel_path}: temporal tools require one string TOOL_NAME.")
+    if not isinstance(constants.get('TOOL_PROMPT'), str) or not constants.get('TOOL_PROMPT', '').strip():
+        failures.append(f"{rel_path}: temporal tools require one non-empty string TOOL_PROMPT.")
+    video_config = constants.get('VIDEO_CONFIG')
+    required_settings = {
+        'window_seconds', 'interval_seconds', 'minimum_span_seconds',
+        'minimum_unique_frames',
+    }
+    if not isinstance(video_config, dict):
+        failures.append(f"{rel_path}: temporal tools require a literal VIDEO_CONFIG dictionary.")
+    else:
+        missing = sorted(required_settings - set(video_config))
+        if missing:
+            failures.append(f"{rel_path}: temporal VIDEO_CONFIG is missing: {', '.join(missing)}.")
+        else:
+            try:
+                window = float(video_config['window_seconds'])
+                interval = float(video_config['interval_seconds'])
+                minimum_span = float(video_config['minimum_span_seconds'])
+                minimum_frames = int(video_config['minimum_unique_frames'])
+                if (window <= 0 or interval <= 0 or minimum_span <= 0
+                        or minimum_span > window or minimum_frames < 2):
+                    raise ValueError
+            except (TypeError, ValueError):
+                failures.append(f"{rel_path}: temporal VIDEO_CONFIG settings are invalid.")
+    prompt = str(constants.get('TOOL_PROMPT') or '').casefold()
+    temporal_terms = (
+        'chronological', 'early', 'late', 'before', 'after', 'sequence',
+        'duration', 'state change', 'changed', 'recent frames', 'video',
+        'what just happened', 'history', 'multiple moments',
+    )
+    if prompt and not any(term in prompt for term in temporal_terms):
         failures.append(
-            f"{rel_path}: copilot_llm_call() missing resolvable capability at call(s) {unresolved_indexes}."
+            f"{rel_path}: temporal TOOL_PROMPT must explain chronological or state-change evidence."
         )
-
-    for index, category in enumerate(categories):
-        if category is None:
-            continue
-        if category not in CANONICAL_TASK_CATEGORIES:
+    output_config = constants.get('OUTPUT_CONFIG') or {}
+    if isinstance(output_config, dict) and output_config.get('schema') == 'played_card_event':
+        card_terms = ('played card', 'played_card', 'before_cards', 'after_cards')
+        if not any(term in prompt for term in card_terms):
             failures.append(
-                f"{rel_path}: non-canonical capability '{category}' in copilot_llm_call #{index + 1}."
+                f"{rel_path}: played_card_event may only be used by a card-specific prompt."
             )
-
+    forbidden = {
+        'call_take_photo_vlm', 'copilot_llm_call', 'RtspPublisher',
+        'NvidiaRtviClient', 'asyncio', 're', 'requests', 'aiohttp', 'ffmpeg',
+    }
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    found = sorted(forbidden & used)
+    imported = {
+        alias.name.split('.')[0]
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    found = sorted(set(found) | (forbidden & imported))
+    if found:
+        failures.append(
+            f"{rel_path}: temporal streaming runtime owns execution; forbidden tool symbols: "
+            + ', '.join(found)
+        )
+    module_state = [
+        target.id
+        for node in tree.body if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name)
+        and target.id not in {
+            'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
+        }
+    ]
+    if module_state:
+        failures.append(f"{rel_path}: temporal tools must not keep module state: {module_state}")
+    allowed_names = {
+        'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
+    }
+    non_declarative = []
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if isinstance(node, ast.Assign) and all(
+            isinstance(target, ast.Name) and target.id in allowed_names
+            for target in node.targets
+        ):
+            continue
+        non_declarative.append(type(node).__name__)
+    if non_declarative:
+        failures.append(
+            f"{rel_path}: temporal tools may contain only declarative constants: "
+            + ', '.join(non_declarative)
+        )
     return failures
 
 
@@ -256,10 +354,10 @@ def validate_files(paths: Iterable[Path], issue_text: Optional[str] = None) -> L
                 line_number = text.count("\n", 0, match.start()) + 1
                 failures.append(f"{rel_path}:{line_number}: forbidden generated-tool pattern: {label}")
 
-        failures.extend(validate_canonical_task_categories(text, rel_path))
         failures.extend(validate_no_stringified_copilot_results(text, rel_path))
         if issue_text:
-            failures.extend(validate_stage_enforcement(text, issue_text, rel_path))
+            failures.extend(validate_take_photo_tool(text, issue_text, rel_path))
+            failures.extend(validate_temporal_streaming_tool(text, issue_text, rel_path))
 
     return failures
 
@@ -269,7 +367,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("paths", nargs="*", help="Specific tool files to validate.")
     parser.add_argument("--changed", metavar="BASE_REF", help="Validate changed tools relative to BASE_REF.")
     parser.add_argument("--all", action="store_true", help="Validate all Python tool files.")
-    parser.add_argument("--issue-file", help="Optional issue markdown/body file used for Task Stages validation.")
+    parser.add_argument("--issue-file", help="Optional issue markdown/body used for mode validation.")
     args = parser.parse_args(argv)
 
     paths: List[Path] = []
@@ -286,17 +384,13 @@ def main(argv: List[str] | None = None) -> int:
 
     failures = validate_files(paths, issue_text=issue_text)
     if failures:
-        print("Generated tools must use model_router_client capability interfaces for LLM/VLM operations.")
-        print("Do not implement detection, OCR, VLM, LLM, model loading, provider calls, or model discovery in tool files.")
-        print(
-            "When Task Stages are provided, compose one ordered copilot_llm_call() per stage."
-        )
+        print("Generated tool validation failed.")
         print()
         for failure in failures:
             print(failure)
         return 1
 
-    print("Generated tool router guardrails passed.")
+    print("Generated tool guardrails passed.")
     return 0
 
 

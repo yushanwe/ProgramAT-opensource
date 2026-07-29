@@ -23,6 +23,21 @@ PROMPT = (
 )
 POLL_INTERVAL = 2.0   # seconds between file-state checks
 POLL_TIMEOUT  = 120.0  # max seconds to wait for file to become ACTIVE
+_video_inference_client = None
+
+PLAYED_CARD_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["event_detected", "before_cards", "after_cards", "played_card", "confidence", "evidence"],
+    "properties": {
+        "event_detected": {"type": "boolean"},
+        "before_cards": {"type": "array", "items": {"type": "string"}},
+        "after_cards": {"type": "array", "items": {"type": "string"}},
+        "played_card": {"type": ["string", "null"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "evidence": {"type": "string"},
+    },
+}
 
 # Mime types recognised as video
 _VIDEO_MIME = {
@@ -50,6 +65,47 @@ def _make_client():
         return None
 
 
+def _make_video_inference_client():
+    """Reuse one Google GenAI client for hosted streaming requests."""
+    global _video_inference_client
+    if _video_inference_client is None:
+        _video_inference_client = _make_client()
+    return _video_inference_client
+
+
+def _image_generation_config(output_schema: str | None = None):
+    from google.genai import types
+    kwargs = dict(
+        temperature=0,
+        tools=[],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+    if output_schema == "played_card_event":
+        kwargs.update(
+            response_mime_type="application/json",
+            response_json_schema=PLAYED_CARD_RESPONSE_SCHEMA,
+        )
+    return types.GenerateContentConfig(**kwargs)
+
+
+async def infer_images_with_gemini(
+    images: list[bytes], prompt: str, model: str, output_schema: str | None = None
+):
+    """Send ordered JPEG bytes directly to Gemini and return text plus usage."""
+    from google.genai import types
+    client = _make_video_inference_client()
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini image inference")
+    parts = [types.Part.from_bytes(data=image, mime_type="image/jpeg") for image in images]
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=model.removeprefix('gemini/'),
+        contents=[prompt, *parts],
+        config=_image_generation_config(output_schema),
+    )
+    return (response.text or '').strip(), getattr(response, 'usage_metadata', None)
+
+
 def _make_vertex_client():
     """Return a google-genai Client configured for Vertex AI, or None if unavailable."""
     try:
@@ -68,6 +124,38 @@ def _is_active(file_obj) -> bool:
     if hasattr(state, 'name'):
         return state.name == 'ACTIVE'
     return str(state) in ('ACTIVE', 'FileState.ACTIVE')
+
+
+async def infer_mp4_with_gemini(path: Path, prompt: str, model: str):
+    """Upload one MP4, run one Gemini request, and return text plus usage metadata."""
+    client = _make_client()
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini video inference")
+    loop = asyncio.get_running_loop()
+    uploaded = None
+    try:
+        uploaded = await asyncio.to_thread(client.files.upload, file=path)
+        deadline = loop.time() + POLL_TIMEOUT
+        while not _is_active(uploaded):
+            state = getattr(getattr(uploaded, 'state', None), 'name', str(getattr(uploaded, 'state', '')))
+            if state == 'FAILED':
+                raise RuntimeError("Gemini rejected the uploaded MP4 during processing")
+            if loop.time() >= deadline:
+                raise TimeoutError("Gemini MP4 processing timed out")
+            await asyncio.sleep(POLL_INTERVAL)
+            uploaded = await asyncio.to_thread(client.files.get, name=uploaded.name)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=model.removeprefix('gemini/'),
+            contents=[prompt, uploaded],
+        )
+        return (response.text or '').strip(), getattr(response, 'usage_metadata', None)
+    finally:
+        if uploaded is not None and getattr(uploaded, 'name', None):
+            try:
+                await asyncio.to_thread(client.files.delete, name=uploaded.name)
+            except Exception as exc:
+                logger.warning("Could not delete Gemini temporary file %s: %s", uploaded.name, exc)
 
 
 async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
