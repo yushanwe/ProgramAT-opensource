@@ -11,16 +11,18 @@ TOOL_NAME = "identify_recent_hand_gesture"
 TOOL_PROMPT = (
     "Identify the person's recent hand gesture for a blind or low-vision user. "
     "When several chronological frames are provided, inspect them earliest to latest "
-    "and use the motion sequence to identify the completed gesture or short meaning. "
+    "and use the motion sequence to identify the completed gesture, short meaning, "
+    "or a word spelled across several hand shapes or sign letters such as L-O-V-E. "
     "When only one image is provided, identify only a clearly recognizable static hand "
-    "pose and say that motion cannot be determined from one image when needed. "
-    "Return one concise spoken sentence. If the evidence is insufficient, say so plainly."
+    "pose or visible single handshape and say that motion or spelled sequences cannot "
+    "be determined from one image when needed. Return one concise spoken sentence. "
+    "If the evidence is insufficient, say so plainly."
 )
 
 MODEL_NAME = "gemini/gemini-3.1-flash-lite-preview"
-RECENT_WINDOW_SECONDS = 4
-MIN_STREAM_FRAMES = 4
-MAX_STREAM_FRAMES = 8
+RECENT_WINDOW_SECONDS = 6
+MIN_STREAM_FRAMES = 5
+MAX_STREAM_FRAMES = 10
 MIN_ANALYSIS_INTERVAL_SECONDS = 1.0
 
 
