@@ -395,7 +395,9 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
           <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
             <View style={styles.settingRow}>
               <View style={styles.settingInfo}>
-                <Text style={[styles.settingLabel, { color: theme.text }]}>Basic Mode</Text>
+                <Text style={[styles.settingLabel, { color: theme.text }]}>
+                  {basicModeEnabled ? 'Basic Mode' : 'Full Mode'}
+                </Text>
                 <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
                   {basicModeEnabled ? 'Core features only' : 'All features enabled'}
                 </Text>
