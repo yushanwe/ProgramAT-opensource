@@ -121,11 +121,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BRAINSTORMING_ENABLED = os.environ.get(
-    'BRAINSTORMING_ENABLED', 'false'
-).strip().lower() in {'1', 'true', 'yes', 'on'}
-
-
 def _normalize_custom_gpt_value(value) -> str:
     """Normalize custom_gpt answers into 'yes', 'no', or ''."""
     if isinstance(value, bool):
@@ -6043,31 +6038,28 @@ async def create_github_issue(text: str):
         incomplete_issue['missing_fields'] = []
         incomplete_issue['timestamp'] = None
 
-        if BRAINSTORMING_ENABLED:
-            # Send one open-ended question, then fold the answer into the issue.
-            if not pending_ideation['active']:
-                logger.info("Sending ideation question before issue creation")
-                _log_to_all_sessions("INFO", "Sending ideation question")
-                question = await generate_ideation_question(parsed_data, '')
-                pending_ideation['active'] = True
-                pending_ideation['parsed_data'] = parsed_data
-                pending_ideation['video_summary'] = ''
-                await _broadcast_ws({'type': 'ideation_question', 'message': question})
-                return
-
-            logger.info("Received ideation answer, proceeding to issue creation")
-            _log_to_all_sessions("INFO", "Received ideation answer")
-            parsed_data = pending_ideation['parsed_data']
-            ideation_answer = text.strip()
-            if ideation_answer:
-                parsed_data['additional'] = (
-                    (parsed_data.get('additional') or '') + '\n\nUser ideation response: ' + ideation_answer
-                ).strip()
-            pending_ideation['active'] = False
-            pending_ideation['parsed_data'] = None
+        # Send one open-ended question, then fold the answer into the issue.
+        if not pending_ideation['active']:
+            logger.info("Sending ideation question before issue creation")
+            _log_to_all_sessions("INFO", "Sending ideation question")
+            question = await generate_ideation_question(parsed_data, '')
+            pending_ideation['active'] = True
+            pending_ideation['parsed_data'] = parsed_data
             pending_ideation['video_summary'] = ''
-        else:
-            logger.info("Brainstorming disabled; proceeding directly to issue creation")
+            await _broadcast_ws({'type': 'ideation_question', 'message': question})
+            return
+
+        logger.info("Received ideation answer, proceeding to issue creation")
+        _log_to_all_sessions("INFO", "Received ideation answer")
+        parsed_data = pending_ideation['parsed_data']
+        ideation_answer = text.strip()
+        if ideation_answer:
+            parsed_data['additional'] = (
+                (parsed_data.get('additional') or '') + '\n\nUser ideation response: ' + ideation_answer
+            ).strip()
+        pending_ideation['active'] = False
+        pending_ideation['parsed_data'] = None
+        pending_ideation['video_summary'] = ''
 
         logger.info("Creating issue after ideation turn")
         _log_to_all_sessions("INFO", "Creating issue after ideation turn")
@@ -6432,7 +6424,6 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
     ideation_answer = ''
     token = ''
     choice = ''  # 'keep_brainstorming' or 'start_building'
-    brainstormingEnabled = True  # default to True for backward compatibility
 
     try:
         reader = await request.multipart()
@@ -6445,7 +6436,6 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                     ideation_answer = meta.get('ideation_answer', '')
                     token = meta.get('token', '')
                     choice = meta.get('choice', '')  # 'keep_brainstorming' or 'start_building'
-                    brainstormingEnabled = meta.get('brainstormingEnabled', True)
                 except Exception:
                     text = raw.decode('utf-8', errors='replace')
             elif part.name == 'video':
@@ -6556,8 +6546,7 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 status=500,
             )
 
-        # Check if brainstorming is enabled
-        if brainstormingEnabled and not choice:
+        if not choice:
             # Generate ideation question and return it for the client to present.
             await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Coming up with a follow-up question…'})
             try:
@@ -6576,11 +6565,6 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
             }
             logger.info("Sending ideation question via HTTP (token=%s)", new_token)
             return web.json_response({'status': 'ideation', 'question': question, 'token': new_token})
-        elif not brainstormingEnabled:
-            # Brainstorming disabled; proceed directly to issue creation
-            logger.info("Brainstorming disabled; proceeding directly to issue creation")
-
-        logger.info("Brainstorming disabled for HTTP creation; creating issue directly")
 
     # --- Fill template and create GitHub issue (reached from Shape B) ---
     try:
@@ -6644,12 +6628,6 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     The answer to the current question was already stored when /submit-creation was called.
     Returns the next question and updated brainstorm history.
     """
-    if not BRAINSTORMING_ENABLED:
-        return web.json_response(
-            {'status': 'disabled', 'error': 'Brainstorming is temporarily disabled'},
-            status=503,
-        )
-
     try:
         data = await request.json()
     except Exception:
