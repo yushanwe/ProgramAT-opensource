@@ -3787,6 +3787,95 @@ async def poll_for_copilot_session_on_pr(pr_number: int, websocket, client_id: s
     }))
 
 
+async def poll_for_copilot_session(issue_number: int, websocket, client_id: str):
+    """
+    Poll GitHub for the Claude PR created for a newly opened VAT issue.
+    The legacy helper name is retained to avoid unrelated compatibility churn.
+    """
+    global pending_copilot_issues
+
+    logger.info(f"Starting to poll for Claude work for issue #{issue_number}")
+    max_poll_duration = 600
+    poll_interval = 15
+    start_time = datetime.now()
+
+    async def _safe_send(message: dict) -> bool:
+        nonlocal websocket
+        info = pending_copilot_issues.get(issue_number)
+        if info and info.get('websocket'):
+            websocket = info['websocket']
+        try:
+            await websocket.send(json.dumps(message))
+            return True
+        except Exception:
+            logger.debug(
+                f"WebSocket send failed for issue #{issue_number} poll (client disconnected)"
+            )
+            return False
+
+    try:
+        await _safe_send({
+            'type': 'copilot_watching',
+            'issue_number': issue_number,
+            'message': f'Watching for Claude to create a PR for issue #{issue_number}...',
+            'timestamp': datetime.now().isoformat()
+        })
+
+        while (datetime.now() - start_time).total_seconds() < max_poll_duration:
+            if issue_number not in pending_copilot_issues:
+                logger.info(f"Stopped polling for issue #{issue_number} - removed from pending")
+                return
+
+            try:
+                g = Github(GITHUB_TOKEN)
+                repo = g.get_repo(GITHUB_REPO)
+                pulls = repo.get_pulls(state='open', sort='created', direction='desc')
+
+                for i, pr in enumerate(pulls):
+                    if i >= 20:
+                        break
+                    pr_text = f"{pr.title} {pr.body or ''}"
+                    if (
+                        f"#{issue_number}" in pr_text
+                        or f"Fixes #{issue_number}" in pr_text
+                        or f"Closes #{issue_number}" in pr_text
+                    ):
+                        logger.info(f"Found Claude PR #{pr.number} for issue #{issue_number}")
+                        if issue_number in pending_copilot_issues:
+                            pending_copilot_issues[issue_number]['pr_number'] = pr.number
+                            pending_copilot_issues.pop(issue_number, None)
+
+                        await _safe_send({
+                            'type': 'copilot_pr_found',
+                            'issue_number': issue_number,
+                            'pr_number': pr.number,
+                            'pr_title': pr.title,
+                            'pr_url': pr.html_url,
+                            'message': f'Claude created PR #{pr.number}: {pr.title}.',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        return
+            except Exception as e:
+                logger.warning(f"Error polling for Claude PR: {e}")
+
+            await asyncio.sleep(poll_interval)
+
+        pending_copilot_issues.pop(issue_number, None)
+        await _safe_send({
+            'type': 'copilot_watch_timeout',
+            'issue_number': issue_number,
+            'message': f'Timed out waiting for Claude to create a PR for issue #{issue_number}',
+            'timestamp': datetime.now().isoformat()
+        })
+    except asyncio.CancelledError:
+        logger.info(f"Claude polling cancelled for issue #{issue_number}")
+        pending_copilot_issues.pop(issue_number, None)
+        raise
+    except Exception as e:
+        logger.error(f"Error in poll_for_copilot_session: {e}")
+        pending_copilot_issues.pop(issue_number, None)
+
+
 
 def fetch_open_prs():
     """

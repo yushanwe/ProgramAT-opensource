@@ -102,6 +102,45 @@ jobs:
             existing PR branch instead of creating another PR.
           claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(find:*),Bash(ls:*),Read,View,Glob,GlobTool,Grep,GrepTool,Write,Edit" --max-turns 16 --model claude-sonnet-4-5'
 
+      - name: Create PR if Claude pushed a branch but did not open one
+        if: github.event.issue.pull_request == null
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          REPO: ${{ github.repository }}
+        run: |
+          existing_pr="$(gh pr list --state open --limit 100 --json number,title,body,headRefName \
+            --jq ".[] | select(((.title // \"\") + \" \" + (.body // \"\")) | contains(\"#$TARGET_NUMBER\")) | .number" \
+            | head -n 1)"
+          if [ -n "$existing_pr" ]; then
+            echo "Existing PR #$existing_pr already references issue #$TARGET_NUMBER."
+            exit 0
+          fi
+
+          branch_prefix="claude/issue-${TARGET_NUMBER}-"
+          branch_name="$(gh api "repos/$REPO/branches?per_page=100" \
+            --jq ".[] | select(.name | startswith(\"$branch_prefix\")) | .name" \
+            | tail -n 1)"
+          if [ -z "$branch_name" ]; then
+            echo "No Claude branch found for issue #$TARGET_NUMBER; leaving verification to the next step."
+            exit 0
+          fi
+
+          pr_title="Fixes #$TARGET_NUMBER: $ISSUE_TITLE"
+          pr_body="$(cat <<EOF
+          Fixes #$TARGET_NUMBER
+
+          Automated Claude Code implementation for issue #$TARGET_NUMBER.
+          EOF
+          )"
+
+          gh pr create \
+            --head "$branch_name" \
+            --base main \
+            --title "$pr_title" \
+            --body "$pr_body"
+
       - name: Verify a tool PR was produced
         env:
           GH_TOKEN: ${{ github.token }}
