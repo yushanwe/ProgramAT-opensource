@@ -7,19 +7,43 @@ import asyncio
 import cv2
 import numpy as np
 
-from litellm_utils import call_model, extract_text
+from litellm_utils import call_model, call_openai_responses_model, extract_text
 
 TOOL_NAME = "exit_locator"
 TOOL_PROMPT = (
     "Assist a blind or low-vision user in finding the nearest indoor exit. "
     "1. Look for visible exit signs, exit doors, building entrances, or doors that clearly lead out. "
     "2. Choose the most likely nearest visible exit based only on what is visible. "
-    "3. Give concise step-by-step spoken directions using body-relative wording or clock direction only from 9 to 12 or 1 to 3, plus brief uncertainty if the evidence is weak. "
+    "3. Give concise spoken directions using body-relative wording or clock direction only from 9 to 12 or 1 to 3, and mention uncertainty when the evidence is limited. "
     "If no likely exit is visible, say that clearly."
 )
 
-MODEL_NAME = "gemini/gemini-3.1-flash-lite-preview"
+FAST_MODEL_NAME = "gemini/gemini-3.1-flash-lite-preview"
+ACCURATE_MODEL_NAME = "gpt-5"
 SCENE_SIMILARITY_THRESHOLD = 0.985
+UNCERTAINTY_MARKERS = (
+    "cannot confirm",
+    "can't confirm",
+    "uncertain",
+    "not sure",
+    "unsure",
+    "unclear",
+    "hard to tell",
+    "difficult to tell",
+    "possibly",
+    "maybe",
+    "might be",
+    "likely",
+    "appears to be",
+    "seems to be",
+    "no likely exit",
+    "no visible exit",
+    "no exit is visible",
+    "no clear exit",
+    "weak evidence",
+    "limited evidence",
+    "insufficient",
+)
 
 
 def compute_scene_embedding(image: np.ndarray) -> np.ndarray:
@@ -52,16 +76,45 @@ def is_same_scene(
     return cosine_similarity(reference, current) >= threshold
 
 
-def analyze_exit(image: np.ndarray) -> str:
-    """Run the vision model on one image and normalize empty responses."""
+def _normalize_result(text: str) -> str:
+    normalized = " ".join((text or "").split())
+    return normalized or "I cannot confirm a visible exit from this view."
+
+
+def _needs_accuracy_escalation(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return True
+    return any(marker in lowered for marker in UNCERTAINTY_MARKERS)
+
+
+def _call_fast_model(image: np.ndarray) -> str:
     response = call_model(
-        MODEL_NAME,
+        FAST_MODEL_NAME,
         [{"role": "user", "content": TOOL_PROMPT}],
         [image],
         {"timeout": 60, "num_retries": 0},
     )
-    text = extract_text(response).strip()
-    return text or "I cannot confirm a visible exit from this view."
+    return _normalize_result(extract_text(response))
+
+
+def _call_accurate_model(image: np.ndarray) -> str:
+    text = call_openai_responses_model(
+        ACCURATE_MODEL_NAME,
+        TOOL_PROMPT,
+        image,
+        reasoning_effort="medium",
+        timeout=60,
+    )
+    return _normalize_result(text)
+
+
+def analyze_exit(image: np.ndarray) -> str:
+    """Run a fast first-pass model and escalate only when the answer looks difficult."""
+    fast_text = _call_fast_model(image)
+    if not _needs_accuracy_escalation(fast_text):
+        return fast_text
+    return _call_accurate_model(image)
 
 
 async def on_take_photo(runtime, image, input_data):
