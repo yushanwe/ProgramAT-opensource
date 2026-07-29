@@ -25,7 +25,7 @@ import { useTheme } from './ThemeContext';
 import WebSocketService from './WebSocketService';
 import TextToSpeechService from './TextToSpeechService';
 import VideoRecorderModal from './VideoRecorderModal';
-import { isBrainstormingEnabled } from './Settings';
+import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 
 interface TextInputProps {
   serverFeedback?: string;
@@ -68,9 +68,16 @@ export default function TextInputComponent({
   // Brainstorming preference from settings
   const [brainstormingEnabled, setBrainstormingEnabled] = useState(true);
 
+  // Basic mode: hides video-attach and brainstorming features for a simplified experience
+  const [basicMode, setBasicMode] = useState(false);
+
   useEffect(() => {
     isBrainstormingEnabled().then(setBrainstormingEnabled).catch(() => setBrainstormingEnabled(true));
+    isBasicModeEnabled().then(setBasicMode).catch(() => setBasicMode(false));
   }, []);
+
+  // Basic mode force-overrides brainstorming without mutating the stored preference.
+  const brainstormingActive = brainstormingEnabled && !basicMode;
 
   const isCreateMode = !selectedIssue;
 
@@ -143,7 +150,7 @@ export default function TextInputComponent({
         // Shape A: first submission — include text and optional video.
         formData.append('metadata', JSON.stringify({
           text: inputText.trim(),
-          brainstormingEnabled: brainstormingEnabled,
+          brainstormingEnabled: brainstormingActive,
         }));
         if (videoUri) {
           formData.append('video', buildVideoPart(videoUri));
@@ -179,7 +186,7 @@ export default function TextInputComponent({
         return;
       }
 
-      if (result.status === 'ideation') {
+      if (result.status === 'ideation' && brainstormingActive) {
         // Server wants one more turn — speak the question, clear input, store token.
         if (result.question) {
           TextToSpeechService.speak(result.question);
@@ -191,7 +198,7 @@ export default function TextInputComponent({
         return;
       }
 
-      if (result.status === 'brainstorm_choice') {
+      if (result.status === 'brainstorm_choice' && brainstormingActive) {
         // Server asking user to choose: keep brainstorming or start building
         TextToSpeechService.speak('Thanks for that context! You can keep brainstorming or start building by selecting one of the buttons below.');
         setBrainstormChoice({
@@ -441,7 +448,7 @@ export default function TextInputComponent({
 
     // If switching to create mode or already in create mode, send mode first
     if (isCreateMode) {
-      WebSocketService.sendIssueSelection('create');
+      WebSocketService.sendIssueSelection('create', undefined, undefined, brainstormingActive);
     }
 
     // Send the text (without the prefix, backend now knows the mode)
@@ -462,8 +469,8 @@ export default function TextInputComponent({
     }
     
     // Send mode switch to backend
-    WebSocketService.sendIssueSelection('create');
-    
+    WebSocketService.sendIssueSelection('create', undefined, undefined, brainstormingActive);
+
     // Call the parent callback to update UI
     if (onNewIssue) {
       onNewIssue();
@@ -587,7 +594,8 @@ export default function TextInputComponent({
             </View>
           )}
 
-          {/* Video attachment row — available in both create and update modes */}
+          {/* Video attachment row — available in both create and update modes, hidden in Basic mode */}
+          {!basicMode && (
           <View style={styles.videoRow}>
               {isPickingFromLibrary ? (
                 <View style={styles.pickingRow}>
@@ -644,9 +652,10 @@ export default function TextInputComponent({
                 </View>
               )}
             </View>
+          )}
 
           {/* Brainstorm choice buttons — shown when user has answered question and needs to choose */}
-          {brainstormChoice && (
+          {brainstormingActive && brainstormChoice && (
             <View style={styles.brainstormChoiceContainer}>
               <Text style={[styles.brainstormChoiceText, { color: theme.text }]} accessible={true} accessibilityRole="header">
                 What would you like to do next?
@@ -686,7 +695,7 @@ export default function TextInputComponent({
           )}
 
           {/* Regular buttons — shown when NOT in brainstorm choice mode */}
-          {!brainstormChoice && (
+          {(!brainstormingActive || !brainstormChoice) && (
             <View style={styles.buttonContainer}>
               <TouchableOpacity
                 style={[styles.button, styles.clearButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
@@ -724,15 +733,17 @@ export default function TextInputComponent({
           )}
         </ScrollView>
 
-        {/* Video recorder overlay — create mode only */}
-        <VideoRecorderModal
-          visible={isVideoRecorderOpen}
-          onVideoRecorded={(path) => {
-            setVideoUri(path);
-            setIsVideoRecorderOpen(false);
-          }}
-          onCancel={() => setIsVideoRecorderOpen(false)}
-        />
+        {/* Video recorder overlay — create mode only, hidden in Basic mode */}
+        {!basicMode && (
+          <VideoRecorderModal
+            visible={isVideoRecorderOpen}
+            onVideoRecorded={(path) => {
+              setVideoUri(path);
+              setIsVideoRecorderOpen(false);
+            }}
+            onCancel={() => setIsVideoRecorderOpen(false)}
+          />
+        )}
     </KeyboardAvoidingView>
   );
 }

@@ -27,6 +27,7 @@ import VideoSummaryTestScreen from './VideoSummaryTestScreen';
 
 const SERVER_URL_KEY = '@server_url';
 const BRAINSTORMING_ENABLED_KEY = '@brainstorming_enabled';
+const BASIC_MODE_ENABLED_KEY = '@basic_mode_enabled';
 
 export function isBrainstormingEnabled(): Promise<boolean> {
   return (async () => {
@@ -35,6 +36,17 @@ export function isBrainstormingEnabled(): Promise<boolean> {
       return saved === null ? true : saved === 'true';
     } catch {
       return true;
+    }
+  })();
+}
+
+export function isBasicModeEnabled(): Promise<boolean> {
+  return (async () => {
+    try {
+      const saved = await AsyncStorage.getItem(BASIC_MODE_ENABLED_KEY);
+      return saved === 'true';
+    } catch {
+      return false;
     }
   })();
 }
@@ -62,6 +74,9 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
   // Brainstorming setting
   const [brainstormingEnabled, setBrainstormingEnabled] = useState(true);
 
+  // Basic mode: hides video-attach and brainstorming features for a simplified experience
+  const [basicModeEnabled, setBasicModeEnabled] = useState(false);
+
   // Meta / Ray-Ban (DAT) native iOS bridge. Only one-time device registration
   // is exposed here; the live camera pipeline is driven from the Tools screen.
   const { MetaWearablesModule } = NativeModules as {
@@ -75,6 +90,7 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     setCurrentServerUrl(WebSocketService.getServerUrl());
     loadSavedServerUrl();
     loadBrainstormingSetting();
+    loadBasicModeSetting();
     const checkConnection = setInterval(() => {
       setIsConnected(WebSocketService.isConnected());
       setCurrentServerUrl(WebSocketService.getServerUrl());
@@ -115,6 +131,22 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
   const handleBrainstormingToggle = async (value: boolean) => {
     setBrainstormingEnabled(value);
     await AsyncStorage.setItem(BRAINSTORMING_ENABLED_KEY, value ? 'true' : 'false');
+  };
+
+  const loadBasicModeSetting = async () => {
+    try {
+      const saved = await AsyncStorage.getItem(BASIC_MODE_ENABLED_KEY);
+      if (saved !== null) {
+        setBasicModeEnabled(saved === 'true');
+      }
+    } catch (error) {
+      console.error('[Settings] Error loading basic mode setting:', error);
+    }
+  };
+
+  const handleBasicModeToggle = async (value: boolean) => {
+    setBasicModeEnabled(value);
+    await AsyncStorage.setItem(BASIC_MODE_ENABLED_KEY, value ? 'true' : 'false');
   };
 
   const handleSaveServerUrl = async () => {
@@ -278,7 +310,7 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     );
   }
 
-  if (showVideoTest) {
+  if (showVideoTest && !basicModeEnabled) {
     return <VideoSummaryTestScreen onBack={() => setShowVideoTest(false)} />;
   }
 
@@ -324,25 +356,72 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
             </View>
           </View>
 
-          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+          <View style={[
+            styles.settingCard,
+            { backgroundColor: theme.card, borderColor: theme.border },
+            basicModeEnabled && styles.disabledSettingCard,
+          ]}>
             <View style={styles.settingRow}>
               <View style={styles.settingInfo}>
                 <Text style={[styles.settingLabel, { color: theme.text }]}>Brainstorming</Text>
                 <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
-                  {brainstormingEnabled ? 'Ask follow-up questions' : 'Direct issue creation'}
+                  {basicModeEnabled
+                    ? 'Unavailable in Basic mode'
+                    : brainstormingEnabled ? 'Ask follow-up questions' : 'Direct issue creation'}
                 </Text>
               </View>
               <Switch
-                value={brainstormingEnabled}
+                value={brainstormingEnabled && !basicModeEnabled}
                 onValueChange={handleBrainstormingToggle}
+                disabled={basicModeEnabled}
                 trackColor={{ false: theme.border, true: theme.primary }}
-                thumbColor={brainstormingEnabled ? '#ffffff' : '#f4f3f4'}
+                thumbColor={brainstormingEnabled && !basicModeEnabled ? '#ffffff' : '#f4f3f4'}
                 accessible={true}
                 accessibilityRole="switch"
                 accessibilityLabel="Brainstorming toggle"
-                accessibilityHint="Double tap to toggle brainstorming questions"
+                accessibilityHint={basicModeEnabled
+                  ? 'Brainstorming is controlled by Basic mode and cannot be changed here'
+                  : 'Double tap to toggle brainstorming questions'}
+                accessibilityState={{ disabled: basicModeEnabled }}
               />
             </View>
+          </View>
+        </View>
+
+        {/* Feature Set Section */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Feature Set</Text>
+
+          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <View style={styles.settingRow}>
+              <View style={styles.settingInfo}>
+                <Text style={[styles.settingLabel, { color: theme.text }]}>Basic Mode</Text>
+                <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
+                  {basicModeEnabled ? 'Core features only' : 'All features enabled'}
+                </Text>
+              </View>
+              <Switch
+                value={basicModeEnabled}
+                onValueChange={handleBasicModeToggle}
+                trackColor={{ false: theme.border, true: theme.primary }}
+                thumbColor={basicModeEnabled ? '#ffffff' : '#f4f3f4'}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Basic mode toggle"
+                accessibilityHint="Double tap to switch between the full feature set and a simplified basic feature set"
+              />
+            </View>
+          </View>
+
+          <View style={[styles.modeDescription, { backgroundColor: theme.backgroundSecondary }]}>
+            <Text style={[styles.modeDescriptionTitle, { color: theme.text }]}>
+              {basicModeEnabled ? 'Basic Mode' : 'Full Mode'}
+            </Text>
+            <Text style={[styles.modeDescriptionText, { color: theme.textSecondary }]}>
+              {basicModeEnabled
+                ? '• Video recording and attachment hidden\n• Brainstorming questions disabled'
+                : '• Video recording and attachment available\n• Brainstorming questions available'}
+            </Text>
           </View>
         </View>
 
@@ -593,23 +672,25 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
         </View>
 
         {/* Developer Tools Section */}
-        <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Developer Tools</Text>
-          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-            <Text style={[styles.settingDescription, styles.debugDescription, { color: theme.textSecondary }]}>
-              Test video recording and Gemini summarization without creating a GitHub issue.
-            </Text>
-            <TouchableOpacity
-              style={[styles.debugButton, styles.debugButtonLast, { backgroundColor: theme.primary }]}
-              onPress={() => setShowVideoTest(true)}
-              accessible={true}
-              accessibilityRole="button"
-              accessibilityLabel="Test video summary"
-              accessibilityHint="Opens a screen to record a video and see the Gemini summary">
-              <Text style={styles.debugButtonText}>Test Video Summary</Text>
-            </TouchableOpacity>
+        {!basicModeEnabled && (
+          <View style={styles.section}>
+            <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Developer Tools</Text>
+            <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+              <Text style={[styles.settingDescription, styles.debugDescription, { color: theme.textSecondary }]}>
+                Test video recording and Gemini summarization without creating a GitHub issue.
+              </Text>
+              <TouchableOpacity
+                style={[styles.debugButton, styles.debugButtonLast, { backgroundColor: theme.primary }]}
+                onPress={() => setShowVideoTest(true)}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel="Test video summary"
+                accessibilityHint="Opens a screen to record a video and see the Gemini summary">
+                <Text style={styles.debugButtonText}>Test Video Summary</Text>
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
+        )}
 
         {/* App Info Section */}
         <View style={styles.section}>

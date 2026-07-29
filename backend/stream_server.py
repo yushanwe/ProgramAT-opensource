@@ -550,7 +550,7 @@ pending_ideation = {'active': False, 'parsed_data': None, 'video_summary': ''}
 pending_ideation_http: dict = {}
 
 # Issue iteration tracking - for updating existing issues
-selected_issue = {'number': None, 'title': None, 'mode': 'create'}  # mode can be 'create' or 'update'
+selected_issue = {'number': None, 'title': None, 'mode': 'create', 'brainstorming_enabled': True}  # mode can be 'create' or 'update'
 issue_cache = {'issues': [], 'last_fetch': None, 'cache_duration': 300}  # Cache for 5 minutes
 
 # Store the last received frame for tool execution
@@ -4985,7 +4985,8 @@ async def create_github_issue(text: str):
         # --- Ideation turn ---
         # If not yet done, send one open-ended question to help the user flesh out
         # their idea, then wait for their answer before creating the issue.
-        if not pending_ideation['active']:
+        # Skipped entirely when the client has disabled brainstorming (Basic mode).
+        if not pending_ideation['active'] and selected_issue.get('brainstorming_enabled', True):
             logger.info("Sending ideation question before issue creation")
             _log_to_all_sessions("INFO", "Sending ideation question")
             question = await generate_ideation_question(parsed_data, '')
@@ -4995,18 +4996,19 @@ async def create_github_issue(text: str):
             await _broadcast_ws({'type': 'ideation_question', 'message': question})
             return  # wait for user's answer
 
-        # Ideation answer has arrived — fold it into the parsed data and proceed.
-        logger.info("Received ideation answer, proceeding to issue creation")
-        _log_to_all_sessions("INFO", "Received ideation answer")
-        parsed_data = pending_ideation['parsed_data']
-        ideation_answer = text.strip()
-        if ideation_answer:
-            parsed_data['additional'] = (
-                (parsed_data.get('additional') or '') + '\n\nUser ideation response: ' + ideation_answer
-            ).strip()
-        pending_ideation['active'] = False
-        pending_ideation['parsed_data'] = None
-        pending_ideation['video_summary'] = ''
+        if pending_ideation['active']:
+            # Ideation answer has arrived — fold it into the parsed data and proceed.
+            logger.info("Received ideation answer, proceeding to issue creation")
+            _log_to_all_sessions("INFO", "Received ideation answer")
+            parsed_data = pending_ideation['parsed_data']
+            ideation_answer = text.strip()
+            if ideation_answer:
+                parsed_data['additional'] = (
+                    (parsed_data.get('additional') or '') + '\n\nUser ideation response: ' + ideation_answer
+                ).strip()
+            pending_ideation['active'] = False
+            pending_ideation['parsed_data'] = None
+            pending_ideation['video_summary'] = ''
 
         logger.info("Creating issue after ideation turn")
         _log_to_all_sessions("INFO", "Creating issue after ideation turn")
@@ -6744,7 +6746,8 @@ async def handle_client(websocket):
                         selected_issue['mode'] = 'create'
                         selected_issue['number'] = None
                         selected_issue['title'] = None
-                        
+                        selected_issue['brainstorming_enabled'] = data.get('brainstormingEnabled', True)
+
                         # Clear any pending text
                         last_text['content'] = None
                         last_text['prev_raw'] = ""

@@ -603,9 +603,9 @@ class WebSocketService {
   /**
    * Send issue selection/mode switch to the server
    */
-  sendIssueSelection(mode: 'create' | 'update', issueNumber?: number, issueTitle?: string): boolean {
-    console.log('[WebSocketService] sendIssueSelection called:', mode, issueNumber, issueTitle);
-    
+  sendIssueSelection(mode: 'create' | 'update', issueNumber?: number, issueTitle?: string, brainstormingEnabled?: boolean): boolean {
+    console.log('[WebSocketService] sendIssueSelection called:', mode, issueNumber, issueTitle, brainstormingEnabled);
+
     if (!this.isConnected()) {
       console.warn('Cannot send issue selection: WebSocket not connected');
       return false;
@@ -621,6 +621,10 @@ class WebSocketService {
       if (mode === 'update' && issueNumber) {
         message.issue_number = issueNumber;
         message.issue_title = issueTitle || '';
+      }
+
+      if (mode === 'create' && brainstormingEnabled !== undefined) {
+        message.brainstormingEnabled = brainstormingEnabled;
       }
 
       console.log('[WebSocketService] Sending issue selection message:', JSON.stringify(message));
