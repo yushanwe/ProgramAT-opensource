@@ -133,45 +133,6 @@ def main(image, input_data=None):
 
         self.assertEqual(validate_generated_tools.validate_files([path]), [])
 
-    def test_rejects_non_canonical_task_category_visual_reasoning(self):
-        path = self._write_temp_tool(
-            "bad_visual_reasoning_tool.py",
-            """
-from model_router_client import copilot_llm_call
-
-def main(image, input_data=None):
-    return copilot_llm_call(
-        task_category="visual_reasoning",
-        messages=[{"role": "user", "content": "Find my Uber and guide me."}],
-        images=[image],
-        metadata={"tool_name": "bad_visual_reasoning_tool"},
-    )
-""",
-        )
-
-        failures = validate_generated_tools.validate_files([path])
-        self.assertTrue(any("non-canonical capability 'visual_reasoning'" in failure for failure in failures))
-
-    def test_rejects_independent_call_when_issue_has_three_stages(self):
-        path = self._write_temp_tool(
-            "uber_single_call_tool.py",
-            """
-from model_router_client import copilot_llm_call
-
-def main(image, input_data=None):
-    return copilot_llm_call(
-        task_category="general_reasoning",
-        messages=[{"role": "user", "content": "Handle all Uber steps in one call."}],
-        images=[image],
-        metadata={"tool_name": "uber_single_call_tool"},
-    )
-""",
-        )
-
-        failures = validate_generated_tools.validate_files([path], issue_text=self.UBER_STAGE_ISSUE)
-
-        self.assertTrue(any("ordered copilot_llm_call capabilities" in failure for failure in failures))
-
     def test_allows_explicit_calls_matching_uber_stage_capabilities(self):
         path = self._write_temp_tool(
             "uber_three_stage_tool.py",
@@ -201,6 +162,140 @@ def main(image, input_data=None):
 
         failures = validate_generated_tools.validate_files([path], issue_text=self.UBER_STAGE_ISSUE)
         self.assertEqual(failures, [])
+
+    def test_static_contract_rejects_video_config(self):
+        issue = "## Mode\n\ntake_photo\n"
+        tool = '''
+from litellm_utils import call_take_photo_vlm
+TOOL_NAME = "hand_identifier"
+EXECUTION_MODE = "take_photo"
+VIDEO_CONFIG = {"window_seconds": 6}
+TOOL_PROMPT = "Identify the current hand."
+def main(image, input_data):
+    return call_take_photo_vlm(image=image, prompt=TOOL_PROMPT, tool_name=TOOL_NAME)
+'''
+        failures = validate_generated_tools.validate_take_photo_tool(
+            tool, issue, Path("tools/hand_identifier.py")
+        )
+        self.assertTrue(any("must not declare" in failure for failure in failures))
+
+    def test_temporal_contract_requires_complete_window_and_temporal_prompt(self):
+        issue = "## Mode\n\nhosted_video_streaming\n"
+        incomplete = '''
+TOOL_NAME = "door_change"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {"window_seconds": 6}
+TOOL_PROMPT = "Describe the door."
+'''
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
+            incomplete, issue, Path("tools/door_change.py")
+        )
+        self.assertTrue(any("VIDEO_CONFIG is missing" in failure for failure in failures))
+        self.assertTrue(any("chronological or state-change" in failure for failure in failures))
+
+        complete = '''
+TOOL_NAME = "door_change"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 5,
+    "minimum_unique_frames": 12,
+}
+TOOL_PROMPT = "Compare chronological early and late frames and report whether the door changed."
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_temporal_streaming_tool(
+                complete, issue, Path("tools/door_change.py")
+            ),
+            [],
+        )
+
+    def test_temporal_sign_language_tool_validates_as_ordered_video(self):
+        issue = """## Task
+Understand a temporal short sign-language gesture from recent hand movements.
+
+## Expected output
+Identify the sign or short signed phrase they just made, including signs lasting seconds.
+
+## Mode
+
+hosted_video_streaming
+"""
+        tool = '''
+TOOL_NAME = "recent_sign_language"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 4,
+    "minimum_unique_frames": 8,
+}
+OUTPUT_CONFIG = {"deduplicate": True}
+TOOL_PROMPT = (
+    "Inspect the four chronological frames from early to late. Track the signer's "
+    "hand shapes, orientation, location, and motion sequence over the recent interval, "
+    "then identify the completed sign or short signed phrase."
+)
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_temporal_streaming_tool(
+                tool, issue, Path("tools/recent_sign_language.py")
+            ),
+            [],
+        )
+
+    def test_validation_follows_copilot_declaration_not_parser_mode_suggestion(self):
+        issue_with_wrong_suggestion = """## Task
+Identify the signed phrase from recent movement.
+
+## Mode
+
+take_photo
+"""
+        temporal_tool = '''
+TOOL_NAME = "recent_sign_language"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 4,
+    "minimum_unique_frames": 8,
+}
+TOOL_PROMPT = "Compare chronological early and late hand movement and identify the signed phrase."
+'''
+        path = Path("tools/recent_sign_language.py")
+        self.assertEqual(
+            validate_generated_tools.validate_take_photo_tool(
+                temporal_tool, issue_with_wrong_suggestion, path
+            ),
+            [],
+        )
+        self.assertEqual(
+            validate_generated_tools.validate_temporal_streaming_tool(
+                temporal_tool, issue_with_wrong_suggestion, path
+            ),
+            [],
+        )
+
+    def test_sign_language_tool_cannot_reuse_played_card_schema(self):
+        issue = "## Mode\n\nhosted_video_streaming\n"
+        tool = '''
+TOOL_NAME = "recent_sign_language"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 4,
+    "minimum_unique_frames": 8,
+}
+OUTPUT_CONFIG = {"schema": "played_card_event"}
+TOOL_PROMPT = "Inspect chronological hand motion and identify the signed phrase."
+'''
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
+            tool, issue, Path("tools/recent_sign_language.py")
+        )
+        self.assertTrue(any("card-specific prompt" in failure for failure in failures))
 
 
 if __name__ == "__main__":

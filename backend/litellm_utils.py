@@ -133,7 +133,7 @@ def _completion_kwargs(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     if not isinstance(metadata, dict):
         return kwargs
-    for key in ("temperature", "max_tokens", "top_p", "stop", "timeout", "response_format", "stream", "api_base", "base_url"):
+    for key in ("temperature", "max_tokens", "top_p", "stop", "timeout", "num_retries", "response_format", "stream", "api_base", "base_url"):
         if key in metadata and metadata[key] is not None:
             kwargs["api_base" if key == "base_url" else key] = metadata[key]
     return kwargs
@@ -158,4 +158,60 @@ def call_model(
         messages=_merge_images(messages or [], images),
         api_key=resolve_api_key(model_name, explicit_key if isinstance(explicit_key, str) else ""),
         **_completion_kwargs(metadata),
+    )
+
+
+def _extract_responses_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str):
+        return output_text.strip()
+    parts: List[str] = []
+    for item in getattr(response, "output", None) or []:
+        for content in getattr(item, "content", None) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts).strip()
+
+
+def call_openai_responses_model(
+    model_name: str,
+    prompt: str,
+    image: Any,
+    *,
+    reasoning_effort: str = "medium",
+) -> str:
+    """Call one OpenAI Responses API model with one fresh multimodal request."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=resolve_api_key(model_name), max_retries=0)
+    response = client.responses.create(
+        model=model_name,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": str(prompt).strip()},
+                {"type": "input_image", "image_url": _image_to_data_uri(image)},
+            ],
+        }],
+        reasoning={"effort": reasoning_effort},
+    )
+    return _extract_responses_text(response)
+
+
+def call_take_photo_vlm(
+    image: Any,
+    prompt: str,
+    tool_name: Optional[str] = None,
+    *,
+    mode: str = "take-photo",
+    request_id: Optional[str] = None,
+) -> str:
+    """Delegate the fused prompt to the mode's YAML-configured cascade."""
+    # Imported lazily because model_router uses the individual provider wrappers
+    # in this module when constructing its implementation executor registry.
+    from model_router import run_mode_cascade
+
+    return run_mode_cascade(
+        mode=mode, prompt=prompt, image=image, request_id=request_id
     )

@@ -55,6 +55,13 @@ import re
 import base64
 from collections import deque
 
+TOOL_NAME = "live_ocr"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = (
+    "Read the visible text accurately and return only the text in a concise, natural reading order. "
+    "If no text is readable, say 'No readable text.'"
+)
+
 # Default configuration
 DEFAULT_CHUNK_SIZE = 6  # words per chunk (balanced for audio delivery and context switching)
 DEFAULT_SIMILARITY_THRESHOLD = 0.8  # 80% similarity to consider text as duplicate
