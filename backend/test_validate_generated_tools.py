@@ -61,11 +61,11 @@ def detect_vehicles(image):
         self.assertTrue(any("COCO class list" in failure for failure in failures))
         self.assertTrue(any("model file reference" in failure for failure in failures))
 
-    def test_allows_model_router_client_import(self):
+    def test_allows_tool_policy_client_import(self):
         path = self._write_temp_tool(
             "good_generated_tool.py",
             """
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 TASK_CATEGORY = "general_reasoning"
 
@@ -85,7 +85,7 @@ def main(image, input_data=None):
         path = self._write_temp_tool(
             "good_ocr_tool.py",
             '''
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     result = copilot_llm_call(capability="ocr", images=[image])
@@ -100,7 +100,7 @@ def main(image, input_data=None):
             path = self._write_temp_tool(
                 "stringified_result_tool.py",
                 f'''
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     guidance = copilot_llm_call(
@@ -119,7 +119,7 @@ def main(image, input_data=None):
         path = self._write_temp_tool(
             "response_field_tool.py",
             '''
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     guidance = copilot_llm_call(
@@ -137,7 +137,7 @@ def main(image, input_data=None):
         path = self._write_temp_tool(
             "uber_three_stage_tool.py",
             """
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     vehicle = copilot_llm_call(
@@ -164,20 +164,78 @@ def main(image, input_data=None):
         self.assertEqual(failures, [])
 
     def test_static_contract_rejects_video_config(self):
+        """Legacy declarative take-photo tools retain their compatibility rules."""
         issue = "## Mode\n\ntake_photo\n"
         tool = '''
-from litellm_utils import call_take_photo_vlm
+from model_execution import execute_tool_policy
 TOOL_NAME = "hand_identifier"
 EXECUTION_MODE = "take_photo"
 VIDEO_CONFIG = {"window_seconds": 6}
 TOOL_PROMPT = "Identify the current hand."
+TOOL_POLICY = {"strategy": "single", "models": ["gemini-3.1-flash-lite"]}
 def main(image, input_data):
-    return call_take_photo_vlm(image=image, prompt=TOOL_PROMPT, tool_name=TOOL_NAME)
+    return execute_tool_policy(image=image, prompt=TOOL_PROMPT, policy=TOOL_POLICY, tool_name=TOOL_NAME)
 '''
         failures = validate_generated_tools.validate_take_photo_tool(
             tool, issue, Path("tools/hand_identifier.py")
         )
         self.assertTrue(any("must not declare" in failure for failure in failures))
+
+    def test_lifecycle_tool_supports_both_entry_points_without_mode_or_policy(self):
+        tool = '''
+import asyncio
+from litellm_utils import call_model, extract_text
+
+TOOL_NAME = "exit_finder"
+TOOL_PROMPT = "Find the nearest visible exit and give concise accessible guidance."
+
+async def analyze(image):
+    response = await asyncio.to_thread(
+        call_model,
+        "gemini/gemini-3.1-flash-lite-preview",
+        [{"role": "user", "content": TOOL_PROMPT}],
+        [image],
+    )
+    return extract_text(response)
+
+async def on_take_photo(runtime, image, input_data):
+    return await analyze(image)
+
+async def on_stream_start(runtime, input_data):
+    runtime.set_state("last_frame_id", 0)
+
+async def on_frame(runtime, frame):
+    if frame.frame_id == runtime.get_state("last_frame_id"):
+        return
+    runtime.set_state("last_frame_id", frame.frame_id)
+    await runtime.emit(await analyze(frame.image), final=True, replace=True)
+
+async def on_stream_stop(runtime):
+    runtime.clear_state()
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_take_photo_tool(
+                tool, "", Path("tools/exit_finder.py")
+            ),
+            [],
+        )
+
+    def test_lifecycle_tool_requires_one_shared_prompt(self):
+        tool = '''
+TOOL_NAME = "gesture_identifier"
+TOOL_PROMPT = "Identify the visible gesture without inventing motion."
+TEMPORAL_PROMPT = "Track motion."
+
+async def on_take_photo(runtime, image, input_data):
+    return "uncertain"
+
+async def on_frame(runtime, frame):
+    return None
+'''
+        failures = validate_generated_tools.validate_take_photo_tool(
+            tool, "", Path("tools/gesture_identifier.py")
+        )
+        self.assertTrue(any("one shared TOOL_PROMPT" in failure for failure in failures))
 
     def test_temporal_contract_requires_complete_window_and_temporal_prompt(self):
         issue = "## Mode\n\nhosted_video_streaming\n"

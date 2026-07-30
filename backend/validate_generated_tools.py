@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from policy_executor import ToolPolicyError, validate_tool_policy
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = REPO_ROOT / "tools"
 
@@ -25,15 +27,25 @@ FORBIDDEN_PATTERNS = [
     ("DEFAULT_MODEL constant", re.compile(r"\bDEFAULT_MODEL\b")),
     ("local ModelRouter class", re.compile(r"\bclass\s+ModelRouter\b")),
     ("COCO class list", re.compile(r"\bCOCO_CLASSES\b")),
-    ("model registry", re.compile(r"\b(?:MODEL_REGISTRY|model_registry|available_models|provider_registry)\b")),
     ("provider fallback logic", re.compile(r"\b(?:fallback_models|fallback_model|provider_fallback|fallback_provider)\b")),
+    ("backend policy orchestration", re.compile(r"\bexecute_resolved_tool_policy\b")),
+    ("unsafe process import", re.compile(r"^\s*(?:import|from)\s+(?:subprocess|multiprocessing)\b", re.MULTILINE)),
+    ("unsafe environment access", re.compile(r"^\s*(?:import|from)\s+(?:os|dotenv)\b|\bos\s*\.\s*(?:environ|getenv)\b", re.MULTILINE)),
+    ("unsafe dynamic import", re.compile(r"\b(?:__import__|import_module)\s*\(")),
+    ("unsafe backend import", re.compile(r"^\s*(?:import|from)\s+(?:stream_server|generated_tool_runtime|tool_policy_runtime)\b", re.MULTILINE)),
+    ("unsafe socket import", re.compile(r"^\s*(?:import|from)\s+socket\b", re.MULTILINE)),
+    ("custom output transport import", re.compile(r"^\s*(?:import|from)\s+(?:websockets?|aiohttp|requests|httpx|urllib|http\.client)\b", re.MULTILINE)),
+    ("custom output transport", re.compile(r"\b(?:websocket|event_emitter|result_callback|response_callback|on_progress)\b", re.IGNORECASE)),
+    ("raw credential access", re.compile(r"\b(?:api_key|explicit_api_key|GEMINI_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY)\b")),
+    ("filesystem access", re.compile(r"\b(?:open|Path)\s*\(|\.(?:write_text|write_bytes|unlink|mkdir|rename|replace)\s*\(")),
     ("model file reference", re.compile(r"\.pt\b|['\"][^'\"]+\.pt['\"]")),
     ("model file discovery", re.compile(r"\b(?:glob|rglob)\s*\([^)]*\.pt[^)]*\)|os\.walk\s*\(")),
 ]
 
 ALLOWED_SHARED_TOOL_FILES = {
     "litellm_utils.py",
-    "model_router_client.py",
+    "tool_policy_client.py",
+    "model_execution.py",
 }
 
 def _extract_string_constants(tree: ast.AST) -> dict[str, str]:
@@ -152,29 +164,114 @@ def validate_no_stringified_copilot_results(tool_text: str, rel_path: Path) -> L
 
 
 def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
-    """Enforce the unified single-call take-photo generation contract."""
+    """Validate the executable lifecycle contract and legacy take-photo fallback."""
     try:
         tree = ast.parse(tool_text)
     except SyntaxError:
         return []
     constants = _extract_literal_constants(tree)
+    lifecycle = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"on_take_photo", "on_stream_start", "on_frame", "on_stream_stop"}
+    }
+    if lifecycle:
+        failures = []
+        if "on_take_photo" not in lifecycle and "on_frame" not in lifecycle:
+            failures.append(
+                f"{rel_path}: executable tools require on_take_photo() or on_frame()."
+            )
+        if not isinstance(constants.get("TOOL_NAME"), str):
+            failures.append(f"{rel_path}: executable tools require one string TOOL_NAME.")
+        if not isinstance(constants.get("TOOL_PROMPT"), str) or not str(
+            constants.get("TOOL_PROMPT") or ""
+        ).strip():
+            failures.append(
+                f"{rel_path}: executable tools require one non-empty string TOOL_PROMPT."
+            )
+        mode_prompt_names = {
+            "TAKE_PHOTO_PROMPT", "STREAMING_PROMPT", "TEMPORAL_PROMPT"
+        }
+        found_mode_prompts = sorted(mode_prompt_names & set(constants))
+        if found_mode_prompts:
+            failures.append(
+                f"{rel_path}: use one shared TOOL_PROMPT instead of mode-specific prompts: "
+                + ", ".join(found_mode_prompts)
+            )
+        imported_names = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        if any(name in {"litellm", "openai", "anthropic"} for name in imported_names):
+            failures.append(
+                f"{rel_path}: tools must use litellm_utils instead of provider SDKs."
+            )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            call_name = (
+                node.func.id if isinstance(node.func, ast.Name)
+                else node.func.attr if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if call_name not in {"call_model", "call_openai_responses_model"}:
+                continue
+            if not node.args and not any(keyword.arg == "model_name" for keyword in node.keywords):
+                failures.append(
+                    f"{rel_path}:{node.lineno}: model calls require an explicit model name."
+                )
+        return failures
+
     if constants.get('EXECUTION_MODE') != 'take_photo':
         return []
 
-    vlm_calls = [
+    policy_calls = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and (
             isinstance(node.func, ast.Name)
-            and node.func.id == "call_take_photo_vlm"
+            and node.func.id == "execute_tool_policy"
         )
     ]
     failures = []
-    if len(vlm_calls) != 1:
+    if any(isinstance(node, (ast.AsyncFunctionDef, ast.Yield, ast.YieldFrom)) for node in ast.walk(tree)):
         failures.append(
-            f"{rel_path}: take-photo tools require exactly one call_take_photo_vlm() call; "
-            f"found {len(vlm_calls)}."
+            f"{rel_path}: generated take-photo tools must use synchronous single-return functions; "
+            "progressive execution is runtime-owned."
         )
+    if "call_take_photo_vlm" in {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}:
+        failures.append(f"{rel_path}: generated tools must not use call_take_photo_vlm().")
+    if len(policy_calls) != 1:
+        failures.append(
+            f"{rel_path}: take-photo tools require exactly one execute_tool_policy() call; "
+            f"found {len(policy_calls)}."
+        )
+    generated_policy_keywords = {"image", "prompt", "policy", "tool_name"}
+    for call in policy_calls:
+        unsupported_keywords = sorted(
+            keyword.arg for keyword in call.keywords
+            if keyword.arg is not None and keyword.arg not in generated_policy_keywords
+        )
+        if unsupported_keywords:
+            failures.append(
+                f"{rel_path}:{call.lineno}: generated tools cannot pass runtime-owned "
+                f"execution controls: {unsupported_keywords}."
+            )
+    parent_by_child = {
+        child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+    }
+    for call in policy_calls:
+        parent = parent_by_child.get(call)
+        while parent is not None:
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)):
+                failures.append(
+                    f"{rel_path}:{call.lineno}: execute_tool_policy() must not run inside a custom routing loop."
+                )
+                break
+            parent = parent_by_child.get(parent)
     tool_prompt = constants.get("TOOL_PROMPT")
     if tool_prompt is None:
         failures.append(f"{rel_path}: take-photo tools require one string TOOL_PROMPT constant.")
@@ -185,7 +282,7 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
     if 'VIDEO_CONFIG' in constants:
         failures.append(f"{rel_path}: static tools must not declare temporal VIDEO_CONFIG.")
     prompt_uses = []
-    for call in vlm_calls:
+    for call in policy_calls:
         prompt_keyword = next((kw for kw in call.keywords if kw.arg == "prompt"), None)
         prompt_uses.append(
             prompt_keyword is not None
@@ -195,7 +292,7 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
     if prompt_uses != [True]:
         failures.append(f"{rel_path}: take-photo tools must pass TOOL_PROMPT directly as the helper prompt.")
     tool_name_uses = []
-    for call in vlm_calls:
+    for call in policy_calls:
         keyword = next((kw for kw in call.keywords if kw.arg == "tool_name"), None)
         tool_name_uses.append(
             keyword is not None
@@ -206,6 +303,33 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
         failures.append(f"{rel_path}: take-photo tools must pass TOOL_NAME directly as tool_name.")
     if extract_copilot_llm_task_categories(tool_text):
         failures.append(f"{rel_path}: take-photo tools must not call copilot_llm_call().")
+    if "TOOL_POLICY" in constants:
+        try:
+            validate_tool_policy(constants["TOOL_POLICY"])
+        except (ToolPolicyError, TypeError) as exc:
+            failures.append(f"{rel_path}: invalid TOOL_POLICY: {exc}.")
+        policy_uses = []
+        for call in policy_calls:
+            keyword = next((kw for kw in call.keywords if kw.arg == "policy"), None)
+            policy_uses.append(
+                keyword is not None and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "TOOL_POLICY"
+            )
+        if policy_uses != [True]:
+            failures.append(
+                f"{rel_path}: tools declaring TOOL_POLICY must pass policy=TOOL_POLICY "
+                "to execute_tool_policy()."
+            )
+    elif any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(isinstance(target, ast.Name) and target.id == "TOOL_POLICY" for target in (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        ))
+        for node in tree.body
+    ):
+        failures.append(f"{rel_path}: TOOL_POLICY must be static literal data.")
+    else:
+        failures.append(f"{rel_path}: new take-photo tools require a literal TOOL_POLICY constant.")
     return failures
 
 
@@ -218,6 +342,12 @@ def validate_temporal_streaming_tool(
     except SyntaxError:
         return []
     constants = _extract_literal_constants(tree)
+    if any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"on_take_photo", "on_stream_start", "on_frame", "on_stream_stop"}
+        for node in tree.body
+    ):
+        return []
     if constants.get('EXECUTION_MODE') != 'hosted_video_streaming':
         return []
     failures = []
@@ -287,13 +417,13 @@ def validate_temporal_streaming_tool(
         for node in tree.body if isinstance(node, ast.Assign)
         for target in node.targets if isinstance(target, ast.Name)
         and target.id not in {
-            'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
+            'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'TOOL_POLICY', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
         }
     ]
     if module_state:
         failures.append(f"{rel_path}: temporal tools must not keep module state: {module_state}")
     allowed_names = {
-        'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
+        'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'TOOL_POLICY', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
     }
     non_declarative = []
     for node in tree.body:
@@ -359,6 +489,24 @@ def validate_files(paths: Iterable[Path], issue_text: Optional[str] = None) -> L
             failures.extend(validate_take_photo_tool(text, issue_text, rel_path))
             failures.extend(validate_temporal_streaming_tool(text, issue_text, rel_path))
 
+    return failures
+
+
+def validate_generated_tool_source(
+    tool_text: str, rel_path: Path = Path("tools/generated_tool.py")
+) -> List[str]:
+    """Validate executable source immediately before the backend loads it."""
+    failures: List[str] = []
+    for label, pattern in FORBIDDEN_PATTERNS:
+        match = pattern.search(tool_text)
+        if match:
+            line_number = tool_text.count("\n", 0, match.start()) + 1
+            failures.append(
+                f"{rel_path}:{line_number}: forbidden generated-tool pattern: {label}"
+            )
+    failures.extend(validate_no_stringified_copilot_results(tool_text, rel_path))
+    failures.extend(validate_take_photo_tool(tool_text, "runtime", rel_path))
+    failures.extend(validate_rtvi_streaming_tool(tool_text, "runtime", rel_path))
     return failures
 
 

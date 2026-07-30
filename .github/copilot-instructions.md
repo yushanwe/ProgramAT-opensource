@@ -1,170 +1,158 @@
-# ProgramAT Copilot instructions
+# ProgramAT code-agent instructions
 
-ProgramAT tools are Python files in `tools/`. The backend executes them with a
-camera image and speaks the returned value.
+ProgramAT tools are executable Python modules in `tools/`. New tools own their model selection, prompts, frame selection, temporal logic, call timing, concurrency, state, and output behavior. The backend supplies decoded frames, isolated runtime state, cancellation, approved model-call helpers, and result transport.
 
-Each take-photo tool must expose `main(image, input_data)` with exactly two parameters.
-`image` is an OpenCV BGR array and `input_data` is a dictionary. Return a concise,
-audio-friendly string (or the established `audio`/`text` dictionary shape). Do
-not print results, connect to the backend, or use WebSockets.
+## Generated-tool contract
 
-## Take-photo tools
-
-ProgramAT has two visual-context contracts:
-
-- **Static** tools answer from the current frame alone. Use
-  `EXECUTION_MODE = "take_photo"`. Static tools may run once in Take Photo or
-  repeatedly in Streaming; every streaming invocation receives one selected
-  current frame and must be independent. Never add `VIDEO_CONFIG`, a rolling
-  window, or cross-frame state to a static tool.
-- **Temporal** tools require evidence across multiple moments: recent history,
-  sequence, duration, an early/late or before/after comparison, a state change,
-  or “what just happened.” Use
-  `EXECUTION_MODE = "hosted_video_streaming"` to select their Streaming behavior.
-  They must declare literal `VIDEO_CONFIG` settings for `window_seconds`,
-  `interval_seconds`, `minimum_span_seconds`, and `minimum_unique_frames`.
-
-Take Photo is available for every tool and always supplies exactly one current
-image with the tool's normal `TOOL_PROMPT`. For a temporal tool, author that
-prompt to work safely with either input shape:
-
-- With multiple chronological frames, use motion, sequence, duration, and state
-  changes as relevant to the task.
-- With one image, use only recognizable static evidence. Never invent unseen
-  movement, earlier state, or later state.
-- When one frame is insufficient, return the task-specific concise uncertainty
-  response requested by the prompt.
-
-Do not classify a tool as temporal unless the user's requested answer clearly
-depends on multiple moments. Recognition, identification, OCR, description,
-classification, and other questions answerable from one frame are static even
-when the user may choose to run them continuously.
-
-The issue `Mode` value is a parser suggestion, not an instruction to ignore the
-request semantics. Read the preserved `ORIGINAL_PROMPTS` and Task/Expected output
-before deciding the contract. Correct the suggested mode when they conflict.
-If a request permits both static and dynamic examples, choose temporal whenever
-correct interpretation may require recent movement or several ordered frames.
-For sign language specifically, a current held posture is static; recent hand
-movements, a sign lasting seconds, or the sign/phrase just made are temporal.
-
-Define exactly one `TOOL_PROMPT` and use this shape:
+Normally implement both entry points of the same tool:
 
 ```python
-from litellm_utils import call_take_photo_vlm
+TOOL_NAME = "concise_snake_case_name"
+TOOL_PROMPT = "One concise task instruction shared by Take Photo and Streaming."
 
-TOOL_NAME = "tool_name"
-EXECUTION_MODE = "take_photo"
-TOOL_PROMPT = "One task-specific instruction."
+async def on_take_photo(runtime, image, input_data):
+    ...
 
+async def on_stream_start(runtime, input_data):
+    ...
 
-def main(image, input_data):
-    if image is None:
-        return "No camera image is available."
-    return call_take_photo_vlm(
-        image=image, prompt=TOOL_PROMPT, tool_name=TOOL_NAME
-    )
+async def on_frame(runtime, frame):
+    ...
+
+async def on_stream_stop(runtime):
+    ...
 ```
 
-Before writing `TOOL_PROMPT`, analyze whether the requested task is achievable
-as one operation or contains genuinely dependent visual or reasoning
-subproblems. Default to the simpler prompt. A task that can be completed in one
-operation does not need steps, even if the issue description is long or contains
-several output-format requirements. Do not create steps merely to restate Task,
-Expected output, and Constraints / examples.
+Infer supported behavior from the hooks. Do not declare `EXECUTION_MODE`, `TOOL_POLICY`, or call `execute_tool_policy()` in new tools. Those declarative contracts remain only for compatibility with older tools.
 
-Author the shortest high-quality fused prompt that preserves those issue fields.
-Include an unavailable-information fallback and request only an accessible,
-concise, audio-friendly final answer.
+Every visual tool should support Take Photo unless a single image is genuinely meaningless. Implement meaningful Streaming behavior when possible. A static task can process one changed latest frame; a temporal task can select recent chronological frames. Do not force multiple frames when one is enough.
 
-- If the task can be achieved in one operation, write one direct instruction
-  with no sequence or numbered steps. This includes simple recognition, OCR,
-  classification, and identification.
-- For a complex task, when a later conclusion depends on earlier visual
-  findings, put one concise ordered sequence of sub-tasks inside the single
-  fused prompt. The sequence may use numbered instructions when that improves
-  reliability. Ask the VLM to return only the final user-facing answer, not its
-  intermediate reasoning.
+## One shared prompt
 
-These are prompt-level instructions for one VLM helper call. Never turn them
-into runtime stages, multiple model calls, router stages, specialist calls, or
-verification calls. You may consult repository capability descriptions as
-reasoning examples, but do not emit capability names, routing metadata,
-cascades, or evaluators.
+Build one `TOOL_PROMPT` from the task, expected output, constraints, and examples, and use it in both Take Photo and Streaming.
 
-### Prompt examples
+Before writing it, briefly decide whether one direct instruction is enough or whether the task has dependent parts that benefit from a few ordered steps:
 
-Simple task—use one direct instruction with no steps:
+- If one instruction is enough, keep it direct and do not add steps.
+- If later conclusions depend on earlier findings, put a short numbered sequence such as 1, 2, 3 inside the same `TOOL_PROMPT`.
+- Do not create separate prompts, planner stages, or model calls for individual steps.
+- Do not add steps merely to restate the issue fields.
 
-```text
-Identify the visible hand gesture. Return only the gesture name; if no gesture
-is clear, say "No clear gesture."
+```python
+TOOL_PROMPT = (
+    "Assist a blind user in finding an indoor exit. "
+    "1. Find visible doors, doorways, or exit signs. "
+    "2. Decide which one is the most likely exit. "
+    "3. Report its clock-face direction and give concise guidance toward it."
+)
 ```
 
-Complex task—use one fused prompt with dependent ordered sub-tasks:
+A simple task should stay simple:
 
-```text
-Follow this sequence using the same image:
-1. Identify chairs, benches, or other seating.
-2. Determine which visible seats are unoccupied.
-3. Select the nearest suitable option.
-4. Give concise spoken guidance toward it.
-If none is visible, say so. Return only the final guidance.
+```python
+TOOL_PROMPT = "Read the medication label and report the text concisely."
 ```
 
-Make exactly one VLM helper call. Do not add planner, router, specialist,
-fallback model, verification, or provider calls. The shared helper owns the
-experiment's model execution.
+The prompt should preserve the requested output, be concise and speech-ready for blind and low-vision users, normalize a stable format when useful, and state when evidence is insufficient. It must work with one image or several chronological frames: never invent motion from one image, and use chronological order when several frames are supplied.
 
-## Streaming tools
+Take Photo and Streaming may use different models, frames, timing, orchestration, state, and output behavior while sharing this prompt.
 
-All streaming tools use hosted NVIDIA video through the shared runtime. Keep generated
-tools declarative and put event/scene behavior entirely in `TOOL_PROMPT`.
+## Runtime API
 
-### Hosted-video streaming tools
+`frame` provides `frame_id`, `timestamp`, `image`, `width`, `height`, and `image_base64`.
 
-Use `EXECUTION_MODE = "hosted_video_streaming"` only when the requested result
-requires recent history or comparison across time. Generate only `TOOL_NAME`,
-that execution mode, required literal `VIDEO_CONFIG`, optional literal
-`OUTPUT_CONFIG`, and a task-specific `TOOL_PROMPT`. The prompt must explain the
-chronological, early/late, before/after, duration, sequence, or state-change
-evidence the VLM should inspect. The shared
-runtime supplies the rolling buffer, MP4 encoding, hosted request, event filtering,
-deduplication, and output. Never implement RTSP/FFmpeg, frame buffering, async
-loops, provider calls, card parsing, before/after state, or take-photo imports.
+```python
+runtime.current_request_id
+runtime.current_frame
+runtime.get_latest_frame()
+runtime.get_recent_frames(count=None, seconds=None)
+runtime.get_state(key, default=None)
+runtime.set_state(key, value)
+runtime.clear_state()
+runtime.is_cancelled()
+await runtime.emit(text, partial=False, final=False, replace=False, metadata=None)
+```
 
-Temporal describes the **input context**: several ordered recent frames. It does
-not imply that every temporal tool has before/after fields or persistent state.
-Choose the output contract independently from the task:
+State is isolated by client, tool source version, and streaming session. Keep scene anchors, prior results, generations, and temporary tasks in runtime state rather than module globals. Check cancellation and a tool-owned generation or scene identifier before emitting work that may be stale.
 
-- Prefer concise plain text for recognition tasks such as a recent sign-language
-  gesture. Ask for only the final sentence or phrase and omit `OUTPUT_CONFIG`
-  unless filtering settings are needed.
-- Use a task-specific structured schema only when the runtime supports and the
-  task genuinely needs structured fields. The prompt must name those fields and
-  still yield a concise user-facing result through the runtime adapter.
-- Use explicit state-change fields only when the requested output depends on
-  comparing states.
+The tool may define a small literal frame configuration when the backend needs settings before delivering frames. Do not use configuration as a substitute for executable frame selection. Prefer runtime selection for latest-frame, changed-scene, sparse-history, or dense chronological behavior.
 
-Never copy an unrelated tool's output schema. In particular,
-`OUTPUT_CONFIG = {"schema": "played_card_event"}` is exclusively for played-card
-detection. Only that explicit declaration may request card JSON or fields such
-as `before_cards`, `after_cards`, and `played_card`. Sign-language and other
-generic temporal tools must not mention or declare card fields.
+## Model calls
 
-Although hosted-video declarations contain no `main` function, the shared Take
-Photo runtime reads the same `TOOL_PROMPT` and performs one single-image call.
+Select models explicitly in tool code. Default ordinary visual tasks to Gemini 3.1 Flash Lite, but choose a faster, stronger, or specialized configured model when justified. The registry in `backend/model_registry.py` is advisory; the backend does not replace the selected model.
 
-Supported explicit modes are `take_photo` and `hosted_video_streaming`.
-Never infer execution mode from the filename. Do not generate a `main` function for a hosted-video
-streaming tool. Never add FFmpeg, frame buffers, HTTP/provider calls, async loops,
-or inference logic to generated tools.
+```python
+import asyncio
+from litellm_utils import call_model, extract_text
 
-## General conventions
+response = await asyncio.to_thread(
+    call_model,
+    "gemini/gemini-3.1-flash-lite-preview",
+    [{"role": "user", "content": TOOL_PROMPT}],
+    [image],
+)
+text = extract_text(response)
+```
 
-- Tools never import other tool modules. Shared utilities such as
-  `litellm_utils` are allowed.
-- Guard a missing image and catch errors with an audio-friendly error response.
-- Avoid GPU-only dependencies unless the issue explicitly requires one.
-- Reuse existing non-model utility patterns where appropriate.
-- Keep changes scoped to the requested tool and add a focused backend test.
+Use `call_openai_responses_model()` only for a configured model that requires the Responses API. Do not split prompt steps into separate model calls. Take Photo and Streaming may each choose the model appropriate to their entry point.
+
+Choose model strategy from the requested output behavior:
+
+- Use one model when the user does not request escalation or multiple results. Use one faster model if the user wants it to be faster, and use one more accurate model if the user wants it to be more accurate.
+- Use a conditional cascade when the user wants normal cases to be fast but difficult, uncertain, empty, or insufficient cases to receive additional accuracy. Call the fast model first, inspect its result, and call the stronger model only when escalation is needed; deliver one final answer.
+- Use parallel progressive only when the user explicitly wants multiple model results delivered as they complete. Do not infer progressive output merely from requests for speed, accuracy, multiple models, or better handling of difficult cases.
+
+Model strategy remains tool-controlled. The backend must not turn a multi-model tool into parallel progressive execution.
+
+## Entry-point behavior
+
+Take Photo receives one current image. It should use `TOOL_PROMPT`, explicitly call its chosen model or models, and return or emit concise results. If motion or history is essential, report that it cannot be determined from one image.
+
+Streaming decides when and what to analyze. It may inspect the latest frame, skip similar frames, process confirmed scene changes, select recent frames, maintain state, or emit progressive results. Static tasks should generally avoid unnecessary temporal windows. Temporal tasks may pass selected frames in chronological order to the same `TOOL_PROMPT`.
+
+Each hook independently decides whether to return once or emit results that append, replace, remain partial, or finalize. The backend only transports accepted results and rejects stale or cancelled work.
+
+## Tool quality and accessibility conventions
+
+Write each generated tool as Python in `tools/`, alongside `backend/` and `ProgramATApp/`. Tools run on the backend, receive camera data through the lifecycle runtime, and return or emit results for the app; they must not connect to the backend or use WebSockets. Assume one user-facing task per tool and make it runnable from the app's camera feed.
+
+All user-facing results must be concise, descriptive, action-oriented, and natural when spoken by text-to-speech. Return or emit plain language, not JSON, code, cryptic abbreviations, debugging text, raw model metadata, stack traces, or internal structures. Do not return `None` or an empty string as the final result.
+
+```python
+return "No objects detected"
+return "Found 5 people in the frame"
+await runtime.emit("Text says: Welcome to the building", final=True)
+await runtime.emit("Warning: Low light conditions", final=True)
+```
+
+An empty, failed, or low-confidence model result does not prove the requested target is absent. State uncertainty when evidence is insufficient.
+
+For navigation, use body-relative or clock-face directions, approximate distance, or stable structural cues. Restrict camera-based clock directions to 9–12 and 1–3; directions behind the camera are not observable. Never use color or another purely visual landmark as the only cue.
+
+Avoid GPU-heavy packages unless strictly necessary. Reuse approved shared backend helpers and useful patterns, but do not import one tool module from another or duplicate infrastructure. Prefer changing only the requested tool file unless the public runtime genuinely lacks a required capability. After the code works and is tested, avoid unnecessary documentation and finish promptly.
+
+## Safety and accessibility
+
+Allowed:
+
+- approved model-call helpers;
+- current and recent runtime frames;
+- runtime state, cancellation, and emission;
+- local helper functions and normal asyncio control flow;
+- OpenCV, NumPy, PIL, and CLIP when appropriate.
+
+Forbidden:
+
+- API keys or environment-variable access;
+- direct provider SDKs or arbitrary networking;
+- raw WebSockets or backend transport internals;
+- subprocesses or unrestricted filesystem writes;
+- other clients, sessions, or backend-private globals.
+
+Use body-relative directions or stable nonvisual and structural cues for navigation. Never use color or another visual-only landmark as the sole cue.
+
+## Examples the contract must support
+
+- Exit Finder: Take Photo analyzes one image; Streaming analyzes a changed latest frame. Both use the same prompt and no unnecessary temporal window.
+- Hand Gesture Identifier: Take Photo reports a visible static posture and uncertainty about motion; Streaming may pass several chronological frames to the same prompt.
+- Uber Finder: Take Photo may use an accuracy-oriented model; Streaming may use a faster model and update only on scene changes, still using the same task prompt.

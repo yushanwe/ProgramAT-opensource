@@ -30,18 +30,27 @@ uv run python stream_server.py   # serves ws://0.0.0.0:8081
 - `gemini_summarizer.py` — summarizes Copilot session logs for screen readers.
 - `copilot_db.py` — SQLite store for Copilot session data.
 - `module_manager.py` — installs missing pip packages for tools at runtime.
-- `model_router.py` — semantic Copilot routing plus simple system/Copilot LLM calls.
-- `execution_policy.yaml` — the single policy cascade cascade configuration.
+- `model_adapters.py` — provider-specific model invocation adapters.
+- `generated_tool_runtime.py` — lifecycle hooks, frame history, isolated state,
+  cancellation, and emission for executable generated tools.
+- `tool_policy_runtime.py` / `policy_executor.py` — compatibility execution for
+  older declarative tools.
+- `model_registry.py` — advisory list of configured models.
 - `litellm_utils.py` — shared LiteLLM invocation and response helpers.
 
 `ARCHITECTURE.md` (repo root) explains how these fit together.
 
 ## How tools run
 
-The server `exec()`s a tool's source and calls `main(image, input_data)` on it.
-The relevant code is `handle_client` (connection loop), `run_tool` (one-shot) (found inside the handle_client handler), and
-`run_streaming_tools` (per-frame loop) in `stream_server.py`. The tool-authoring
-contract lives in `tools/CLAUDE.md`.
+The server validates and loads executable tools in isolated runtime namespaces.
+Take Photo invokes `on_take_photo`; Streaming invokes `on_stream_start`,
+`on_frame`, and `on_stream_stop`. Hook presence determines supported behavior,
+so one tool can support both entry points. Legacy `main(image, input_data)` and
+declarative execution modes remain supported for compatibility.
+
+The connection and dispatch paths live in `handle_client` and the streaming
+scheduler in `stream_server.py`. The detailed generated-tool contract lives in
+`.github/copilot-instructions.md`, with a short pointer in `tools/CLAUDE.md`.
 
 ## Gotchas
 

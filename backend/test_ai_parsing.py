@@ -23,12 +23,14 @@ def load_stream_server_function(name: str):
     )
     namespace = {
         "Any": Any,
+        "ast": ast,
         "Dict": Dict,
         "List": List,
         "Optional": Optional,
         "json": json,
         "re": re,
         "ToolPlanningContext": Any,
+        "has_executable_lifecycle": lambda text: "async def on_frame(" in text,
     }
     dependency_names = {
         "_normalize_issue_creation_requirements": {
@@ -36,8 +38,13 @@ def load_stream_server_function(name: str):
             "_explicit_custom_gpt_value",
         },
         "_append_task_stages_to_issue_body": {"_build_task_stages_markdown"},
-        "_select_visual_execution_mode": {
+        "_select_streaming_context": {
             "_request_explicitly_requires_temporal_context",
+        },
+        "_tool_execution_mode": {"_literal_tool_metadata"},
+        "fill_template": {
+            "_original_request_fallback",
+            "_replace_issue_section",
         },
     }.get(name, set())
     dependencies = [
@@ -54,50 +61,76 @@ def load_stream_server_function(name: str):
 class TestIssueTemplateGuidance(unittest.TestCase):
     """Test Copilot-facing issue template guidance."""
 
-    def test_visual_at_template_uses_take_photo_vlm(self):
+    def test_visual_at_template_uses_executable_tool_lifecycle(self):
         template_path = Path(__file__).resolve().parent.parent / ".github" / "ISSUE_TEMPLATE" / "visual_at.md"
         template = template_path.read_text(encoding="utf-8")
 
-        for heading in ("Tool name", "Task", "Expected output", "Constraints / examples", "Mode"):
+        for heading in (
+            "Tool name", "Task", "Expected output",
+            "Constraints / examples", "Streaming context",
+        ):
             self.assertIn(f"## {heading}", template)
             self.assertIn(f"## {heading}\n\n<!--", template)
-        self.assertIn("call_take_photo_vlm", template)
+        self.assertNotIn("call_take_photo_vlm", template)
+        self.assertNotIn("execute_tool_policy", template)
+        self.assertNotIn("TOOL_POLICY", template)
         self.assertIn("TOOL_PROMPT", template)
-        self.assertIn("author one concise, task-specific `TOOL_PROMPT`", template)
+        self.assertIn("one concise, task-specific `TOOL_PROMPT`", template)
         self.assertNotIn("Task Stages", template)
         self.assertNotIn("copilot_llm_call", template)
+        self.assertIn("Choose models", template)
+        self.assertIn("on_take_photo", template)
+        self.assertIn("on_frame", template)
+        self.assertIn("runtime.emit", template)
 
         instructions_path = template_path.parent.parent / "copilot-instructions.md"
         instructions = instructions_path.read_text(encoding="utf-8")
-        self.assertTrue(instructions.startswith("# ProgramAT Copilot instructions\n"))
-        self.assertIn("### Prompt examples", instructions)
-        self.assertIn("Simple task—use one direct instruction with no steps", instructions)
-        self.assertIn("Complex task—use one fused prompt", instructions)
-        self.assertEqual(instructions.count("```text"), 2)
-        self.assertIn("requested task is achievable", instructions)
-        self.assertIn("as one operation", instructions)
-        self.assertIn("Default to the simpler prompt", instructions)
-        self.assertIn("does not need steps", instructions)
-        self.assertIn("Do not create steps merely to restate", instructions)
-        self.assertIn("one direct instruction", instructions)
-        self.assertIn("ordered sequence of sub-tasks inside the single", instructions)
-        self.assertIn("may use numbered instructions", instructions)
-        self.assertIn("Never turn them", instructions)
-        self.assertIn("into runtime stages, multiple model calls", instructions)
+        self.assertTrue(instructions.startswith("# ProgramAT code-agent instructions\n"))
+        self.assertIn("call_model", instructions)
+        self.assertIn("call_openai_responses_model", instructions)
+        self.assertIn("get_recent_frames", instructions)
+        self.assertIn("get_state", instructions)
+        self.assertIn("Do not split prompt steps into separate model calls", instructions)
+        self.assertIn("Each hook independently decides", instructions)
+        self.assertIn("Take Photo and Streaming may use different", instructions)
+        self.assertIn("blind and low-vision users", instructions)
+        self.assertIn("never use color", instructions.casefold())
+        self.assertIn("compatibility with older tools", instructions)
+        self.assertIn("## Tool quality and accessibility conventions", instructions)
+        self.assertIn("Python in `tools/`", instructions)
+        self.assertIn("must not connect to the backend or use WebSockets", instructions)
+        self.assertIn("plain language, not JSON", instructions)
+        self.assertIn("does not prove the requested target is absent", instructions)
+        self.assertIn("9–12 and 1–3", instructions)
+        self.assertIn("Avoid GPU-heavy packages", instructions)
+        self.assertIn("do not import one tool module from another", instructions)
+        self.assertIn("approved shared backend helpers", instructions)
+        self.assertIn("avoid unnecessary documentation", instructions)
+        self.assertIn("If one instruction is enough", instructions)
+        self.assertIn("short numbered sequence", instructions)
+        self.assertIn("Do not create separate prompts, planner stages", instructions)
+        self.assertIn("Do not add steps merely to restate the issue fields", instructions)
+        self.assertIn("Assist a blind user in finding an indoor exit", instructions)
+        self.assertIn("Read the medication label and report the text concisely", instructions)
+        self.assertIn("Use one model when", instructions)
+        self.assertIn("Use a conditional cascade when", instructions)
+        self.assertIn("call the stronger model only when escalation is needed", instructions)
+        self.assertIn("deliver one final answer", instructions)
+        self.assertIn("Use parallel progressive only when", instructions)
+        self.assertIn("multiple model results delivered as they complete", instructions)
+        self.assertIn("Do not infer progressive output", instructions)
+        self.assertIn("Model strategy remains tool-controlled", instructions)
 
-        self.assertIn("### Take-photo implementation guidance", template)
-        self.assertIn("Default to no steps", template)
-        self.assertIn("one operation is sufficient", template)
-        self.assertIn("Do not create steps merely to restate", template)
-        self.assertIn("numbered instructions", template)
-        self.assertIn("are optional when they improve reliability", template)
-        self.assertIn("Never turn", template)
-        self.assertIn("multiple model calls", template)
-        self.assertIn("hosted_video_streaming", template)
+        self.assertIn("Default to one direct instruction", template)
+        self.assertIn("genuinely depends on earlier visual findings", template)
         self.assertIn("TOOL_PROMPT", template)
-        self.assertIn("runtime owns FFmpeg clip encoding", template)
-        self.assertIn("Hosted-video streaming tools", instructions)
-        self.assertIn("Never infer execution mode from the filename", instructions)
+        self.assertIn("runtime frame APIs", template)
+        self.assertNotIn("EXECUTION_MODE", template)
+        self.assertNotIn("hosted_video_streaming", template)
+        self.assertIn("Tools belong in `tools/` and use Python", template)
+        self.assertIn("audio-friendly for blind and low-vision users", template)
+        self.assertIn("state uncertainty when evidence is insufficient", template)
+        self.assertIn("9–12 and 1–3", template)
 
     def test_temporal_sign_language_request_cannot_be_downgraded_to_take_photo(self):
         request = """Problem:
@@ -108,17 +141,17 @@ Observe the signer’s recent hand movements and identify the sign or short sign
 
 Custom GPT:
 No"""
-        select_mode = load_stream_server_function("_select_visual_execution_mode")
+        select_context = load_stream_server_function("_select_streaming_context")
 
         # Regression: even a mistaken Llama suggestion must not erase the
         # request's explicit recent-motion and just-made semantics.
         self.assertEqual(
-            select_mode("take_photo", request),
-            "hosted_video_streaming",
+            select_context("latest_frame", request),
+            "recent_history",
         )
         self.assertEqual(
-            select_mode("", request),
-            "hosted_video_streaming",
+            select_context("", request),
+            "recent_history",
         )
 
         fill_issue = load_stream_server_function("fill_template")
@@ -131,16 +164,77 @@ No"""
             "description": "Understand a temporal short sign language gesture.",
             "example_usage": "Observe recent hand movements and identify the phrase just made.",
             "additional": "The sign may last for a few seconds.",
-            "execution_mode": select_mode("take_photo", request),
+            "streaming_context": select_context("latest_frame", request),
             "original_prompts": [request],
         })
-        self.assertIn("## Mode\n\nhosted_video_streaming", issue)
+        self.assertIn("## Streaming context\n\nrecent_history", issue)
         self.assertIn("signer’s recent hand movements", issue)
 
+    def test_current_template_maps_task_and_expected_output_by_heading(self):
+        fill_issue = load_stream_server_function("fill_template")
+        template = (
+            Path(__file__).resolve().parent.parent
+            / ".github" / "ISSUE_TEMPLATE" / "visual_at.md"
+        ).read_text(encoding="utf-8")
+        original = (
+            "Problem: I need help understanding a recent hand gesture. "
+            "Example Usage: Identify the gesture or short meaning."
+        )
+        issue = fill_issue(template, {
+            "title": "Hand Gesture Detector",
+            "description": "Identify a recent hand gesture from visible motion.",
+            "example_usage": "Report the gesture or short meaning just expressed.",
+            "additional": "Use the full motion sequence.",
+            "streaming_context": "recent_history",
+            "original_prompts": [f"[2026-07-27 15:49] {original}"],
+        })
+
+        self.assertIn(
+            "## Task\n\nIdentify a recent hand gesture from visible motion.",
+            issue,
+        )
+        self.assertIn(
+            "## Expected output\n\nReport the gesture or short meaning just expressed.",
+            issue,
+        )
+        self.assertNotIn(
+            "<!-- What should the tool determine from the camera image or recent frames? -->",
+            issue,
+        )
+
+    def test_required_issue_fields_fall_back_to_original_request(self):
+        fill_issue = load_stream_server_function("fill_template")
+        template = (
+            Path(__file__).resolve().parent.parent
+            / ".github" / "ISSUE_TEMPLATE" / "visual_at.md"
+        ).read_text(encoding="utf-8")
+        original = "Find the nearest exit and tell me how to reach it."
+        issue = fill_issue(template, {
+            "title": "Exit Finder",
+            "description": "",
+            "example_usage": "",
+            "streaming_context": "latest_frame",
+            "original_prompts": [f"[2026-07-27 16:00] {original}"],
+        })
+
+        self.assertIn(f"## Task\n\n{original}", issue)
+        self.assertIn(f"## Expected output\n\n{original}", issue)
+
     def test_current_held_sign_posture_remains_static(self):
-        select_mode = load_stream_server_function("_select_visual_execution_mode")
+        select_context = load_stream_server_function("_select_streaming_context")
         request = "Identify the sign shown by the signer’s current held hand posture."
-        self.assertEqual(select_mode("take_photo", request), "take_photo")
+        self.assertEqual(select_context("latest_frame", request), "latest_frame")
+
+    def test_lifecycle_hooks_override_legacy_execution_mode(self):
+        execution_mode = load_stream_server_function("_tool_execution_mode")
+        lifecycle_tool = '''
+EXECUTION_MODE = "hosted_video_streaming"
+async def on_frame(runtime, frame):
+    return None
+'''
+        declarative_tool = 'EXECUTION_MODE = "hosted_video_streaming"\n'
+        self.assertEqual(execution_mode(lifecycle_tool), "")
+        self.assertEqual(execution_mode(declarative_tool), "hosted_video_streaming")
 
 
 class TestSentenceDetectionLogic(unittest.TestCase):

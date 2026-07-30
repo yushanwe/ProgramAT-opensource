@@ -18,6 +18,7 @@ import json
 import base64
 import io
 import logging
+import queue
 import sys
 import threading
 import time
@@ -31,7 +32,6 @@ from aiohttp import web, WSMsgType
 from google.cloud import secretmanager
 from github import Github
 import os
-import yaml
 from dotenv import load_dotenv
 
 # Load .env before importing modules that read routing/provider settings at import time.
@@ -64,16 +64,15 @@ STREAMING_MIN_STABLE_CONFIRMATIONS = max(
     1, int(os.getenv('STREAMING_MIN_STABLE_CONFIRMATIONS', '2'))
 )
 
-from model_router import (
+from tool_policy_runtime import (
     STREAMING_EXECUTION_CONTEXT,
     StreamingExecutionCancelled,
     TOOL_EXECUTION_IMAGES,
+    execute_resolved_tool_policy,
     system_llm_call,
 )
-from litellm_utils import (
-    call_take_photo_vlm,
-    extract_text,
-)
+from litellm_utils import extract_text
+from model_execution import execute_tool_policy
 from module_manager import get_module_manager
 import copilot_db
 from gemini_summarizer import summarize_entries_sync
@@ -101,15 +100,26 @@ import tempfile
 import shutil
 import secrets
 import traceback
+import hashlib
 from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor
+from generated_tool_runtime import (
+    FrameStore,
+    ToolFrame,
+    ToolRuntime,
+    cancel_tasks as cancel_generated_tool_tasks,
+    has_executable_lifecycle,
+    invoke_tool_hook,
+    load_generated_tool,
+)
+from validate_generated_tools import validate_generated_tool_source
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / 'tools'
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from door_detection import main as door_recognition_main
-from model_router_client import copilot_llm_call as tool_copilot_llm_call
+from tool_policy_client import copilot_llm_call as tool_copilot_llm_call
 
 # Configure logging
 logging.basicConfig(
@@ -489,6 +499,7 @@ SERVER_CAPABILITIES = _validate_config()
 GITHUB_TOKEN = _fetch_github_token()
 GITHUB_REPO = os.environ.get('GITHUB_REPO', '')  # Format: owner/repo
 PAUSE_DURATION = float(os.environ.get('PAUSE_DURATION', '5.0'))  # seconds to wait before creating issue
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # LiteLLM / Gemini Configuration
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
@@ -560,6 +571,212 @@ active_streaming_tools = {}
 # Cancelled on stop or when a new tool starts to prevent stale results arriving
 # after the tool has been swapped out.
 active_streaming_tasks: dict = {}
+
+
+def _tool_source_version(tool_code: str) -> str:
+    return hashlib.sha256((tool_code or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _generated_input_data(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"value": value}
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
+    return {}
+
+
+def _tool_frame(
+    frame_id: int, image, image_base64: str = "", timestamp: Optional[float] = None
+) -> ToolFrame:
+    height, width = image.shape[:2] if image is not None else (0, 0)
+    return ToolFrame(
+        frame_id=frame_id,
+        timestamp=float(timestamp if timestamp is not None else time.time()),
+        image=image,
+        width=int(width),
+        height=int(height),
+        image_base64=image_base64 or "",
+    )
+
+
+def _generated_emit_callback(websocket, client_id: str, owner: Dict[str, Any], mode: str):
+    async def emit(event: Dict[str, Any]) -> bool:
+        if owner.get("cancelled"):
+            return False
+        if mode == "streaming" and active_streaming_tools.get(client_id) is not owner:
+            return False
+        payload = {
+            "type": "tool_progress_result",
+            "invocation_id": event["invocation_id"],
+            "request_id": event["request_id"],
+            "tool_name": event["tool_name"],
+            "result_index": event["result_index"],
+            "text": event["text"],
+            "result": event["text"],
+            "partial": event["partial"],
+            "final": event["final"],
+            "replace": event["replace"],
+            "metadata": event["metadata"],
+            "model": event["metadata"].get("model"),
+            "error": event["metadata"].get("error"),
+            "mode": mode,
+            "timestamp": datetime.now().isoformat(),
+        }
+        if event["result_index"] == 1:
+            await websocket.send(json.dumps({
+                "type": "tool_progress_started",
+                "invocation_id": event["invocation_id"],
+                "tool_name": event["tool_name"],
+                "mode": mode,
+                "timestamp": datetime.now().isoformat(),
+            }))
+        await websocket.send(json.dumps(payload))
+        return True
+
+    return emit
+
+
+def _build_generated_runtime(
+    websocket,
+    client_id: str,
+    owner: Dict[str, Any],
+    *,
+    tool_name: str,
+    tool_code: str,
+    mode: str,
+    request_id: Optional[str] = None,
+) -> ToolRuntime:
+    return ToolRuntime(
+        client_id=client_id,
+        tool_name=tool_name,
+        tool_version=_tool_source_version(tool_code),
+        session_id=owner.setdefault("generated_session_id", secrets.token_hex(16)),
+        request_id=request_id,
+        frame_store=owner.setdefault("frame_store", FrameStore()),
+        emit_callback=_generated_emit_callback(websocket, client_id, owner, mode),
+        cancelled=lambda: bool(owner.get("cancelled")) or (
+            mode == "streaming" and active_streaming_tools.get(client_id) is not owner
+        ),
+    )
+
+
+def _validated_generated_namespace(tool_name: str, tool_code: str) -> Dict[str, Any]:
+    rel_path = Path("tools") / f"{tool_name}.py"
+    failures = validate_generated_tool_source(tool_code, rel_path)
+    if failures:
+        raise ValueError("Unsafe generated tool source: " + "; ".join(failures))
+    return load_generated_tool(
+        tool_code,
+        filename=str(Path(__file__).parent.parent / rel_path),
+    )
+
+
+async def _initialize_executable_streaming_tool(
+    websocket, client_id: str, tool_config: Dict[str, Any]
+) -> None:
+    tool = tool_config["tool"]
+    tool_code = tool["code"]
+    runtime = _build_generated_runtime(
+        websocket,
+        client_id,
+        tool_config,
+        tool_name=tool["name"],
+        tool_code=tool_code,
+        mode="streaming",
+    )
+    namespace = _validated_generated_namespace(tool["name"], tool_code)
+    tool_config.update({
+        "executable_lifecycle": True,
+        "generated_runtime": runtime,
+        "generated_namespace": namespace,
+        "generated_tasks": set(),
+        "generated_frame_sequence": 0,
+    })
+    await invoke_tool_hook(
+        namespace, "on_stream_start", runtime, _generated_input_data(tool.get("input"))
+    )
+
+
+async def _dispatch_executable_tool_frame(
+    client_id: str,
+    tool_config: Dict[str, Any],
+    image,
+    image_base64: str,
+    timestamp: float,
+) -> None:
+    if active_streaming_tools.get(client_id) is not tool_config:
+        return
+    if len(tool_config.get("generated_tasks") or ()) >= 8:
+        logger.info(
+            "[GeneratedTool] frame dropped client=%s tool=%s reason=pending_hook_limit",
+            client_id,
+            tool_config["tool"]["name"],
+        )
+        return
+    sequence = int(tool_config.get("generated_frame_sequence", 0)) + 1
+    tool_config["generated_frame_sequence"] = sequence
+    frame = _tool_frame(sequence, image, image_base64, timestamp)
+    runtime = tool_config["generated_runtime"]
+    runtime._frames.add(frame)
+    task = asyncio.create_task(
+        invoke_tool_hook(tool_config["generated_namespace"], "on_frame", runtime, frame)
+    )
+    tasks = tool_config["generated_tasks"]
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    task.add_done_callback(_log_streaming_task_error)
+
+
+async def _stop_executable_streaming_tool(tool_config: Dict[str, Any]) -> None:
+    if not tool_config.get("executable_lifecycle"):
+        return
+    tool_config["cancelled"] = True
+    runtime = tool_config.get("generated_runtime")
+    namespace = tool_config.get("generated_namespace") or {}
+    await cancel_generated_tool_tasks(tool_config.get("generated_tasks") or ())
+    if runtime is not None:
+        try:
+            await invoke_tool_hook(namespace, "on_stream_stop", runtime)
+        except Exception:
+            logger.exception("[GeneratedTool] on_stream_stop failed tool=%s", runtime.tool_name)
+    if runtime is not None:
+        runtime.clear_state()
+        runtime._frames.clear()
+
+
+async def _run_executable_take_photo(
+    websocket,
+    client_id: str,
+    tool_name: str,
+    tool_code: str,
+    image,
+    image_base64: str,
+    input_data: Any,
+) -> tuple[Any, int]:
+    owner: Dict[str, Any] = {"cancelled": False}
+    runtime = _build_generated_runtime(
+        websocket,
+        client_id,
+        owner,
+        tool_name=tool_name,
+        tool_code=tool_code,
+        mode="take-photo",
+    )
+    runtime._frames.add(_tool_frame(1, image, image_base64))
+    namespace = _validated_generated_namespace(tool_name, tool_code)
+    try:
+        result = await invoke_tool_hook(
+            namespace, "on_take_photo", runtime, image, input_data
+        )
+        return result, runtime._emit_index
+    finally:
+        owner["cancelled"] = True
+        runtime.clear_state()
+        runtime._frames.clear()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -655,6 +872,12 @@ def _literal_tool_metadata(tool_code: str, name: str) -> Any:
 
 
 def _tool_execution_mode(tool_code: str) -> str:
+    # Executable lifecycle hooks are the current contract and can support both
+    # Take Photo and Streaming. Ignore a stale legacy mode declaration when
+    # hooks are present so it cannot route the whole tool into a restrictive
+    # declarative executor.
+    if has_executable_lifecycle(tool_code):
+        return ''
     value = _literal_tool_metadata(tool_code, 'EXECUTION_MODE')
     return str(value or '').strip().lower().replace('-', '_')
 
@@ -800,6 +1023,7 @@ async def _cleanup_policy_streaming_registration(client_id: str) -> None:
     config = active_streaming_tools.pop(client_id, None)
     if config is None:
         return
+    await _stop_executable_streaming_tool(config)
     for key in ('cascade_task', 'debounce_task'):
         pending = config.get(key)
         if pending is not None and not pending.done():
@@ -1445,6 +1669,7 @@ async def _start_hosted_nvidia_session(
     tool_code = resolve_tool_code_for_execution(
         tool_name=data.get('tool_name', ''), tool_path=data.get('tool_path', ''),
         client_tool_code=data.get('tool_code', ''),
+        client_tool_source=data.get('tool_source', ''),
     )
     tool_name, tool_prompt = _validated_temporal_streaming_tool(tool_code)
     video_config = _literal_tool_metadata(tool_code, 'VIDEO_CONFIG') or {}
@@ -1584,7 +1809,7 @@ async def _dispatch_active_streaming_frame(
     image_base64: str,
     frame_timestamp: float | None = None,
 ) -> asyncio.Task | None:
-    """Dispatch an incoming frame only to the policy-cascade scheduler."""
+    """Dispatch an incoming frame to the unchanged tool-policy scheduler."""
     if image is None or client_id not in active_streaming_tools:
         return None
     task = asyncio.create_task(
@@ -1594,31 +1819,24 @@ async def _dispatch_active_streaming_frame(
     task.add_done_callback(_log_streaming_task_error)
     return task
 
-EXECUTION_POLICY_PATH = Path(__file__).resolve().parent / 'execution_policy.yaml'
 _clip_encoders = {}
 _clip_encoder_load_lock = threading.Lock()
 _clip_ready_models = set()
 
 
-def load_streaming_frame_selector_config(path=EXECUTION_POLICY_PATH) -> Dict[str, Any]:
-    """Load and validate streaming-only frame selector configuration."""
-    with Path(path).open('r', encoding='utf-8') as handle:
-        root = yaml.safe_load(handle) or {}
-    selector = (root.get('streaming') or {}).get('frame_selector') or {}
-    if selector.get('implementation') != 'clip':
-        raise ValueError("streaming.frame_selector.implementation must be 'clip'")
-    model = str(selector.get('model') or '').strip()
-    threshold = float(selector.get('similarity_threshold'))
+def load_streaming_frame_selector_config(path=None) -> Dict[str, Any]:
+    """Return the unchanged streaming frame-selection settings."""
+    del path
+    model = 'openai/clip-vit-base-patch32'
+    threshold = 0.985
     last_sent_threshold = float(os.getenv(
         'STREAMING_MAX_SIMILARITY_TO_LAST_SENT',
         os.getenv(
             'MAX_SIMILARITY_TO_LAST_SENT',
-            selector.get(
-                'max_similarity_to_last_sent', STREAMING_MAX_SIMILARITY_TO_LAST_SENT
-            ),
+            STREAMING_MAX_SIMILARITY_TO_LAST_SENT,
         ),
     ))
-    max_skip_frames = int(selector.get('max_skip_frames'))
+    max_skip_frames = 20
     if not model:
         raise ValueError('streaming.frame_selector.model is required')
     if not -1.0 <= threshold <= 1.0:
@@ -1763,6 +1981,10 @@ yolo_model_cache = {}
 # Format: {client_id: {'process': subprocess, 'session_id': str, 'task': asyncio.Task}}
 active_copilot_streams = {}
 
+# Opt-in progressive policy invocations, keyed by (client_id, tool_name).
+# Provider work may outlive cancellation, so every send also checks record identity.
+active_progressive_invocations = {}
+
 # Issues awaiting Copilot PR creation - tracks issues we're monitoring for PR creation
 # Format: {issue_number: {'created_at': datetime, 'websocket': websocket, 'client_id': str}}
 pending_copilot_issues = {}
@@ -1889,20 +2111,331 @@ def _run_take_photo_vlm(
     mode: str = 'take-photo',
     request_id: Optional[str] = None,
 ) -> str:
-    """Execute the fused prompt through the mode's policy-configured cascade."""
+    """Execute the fused prompt through the shared structured policy executor."""
     prompt = _take_photo_tool_prompt(tool_name, tool_code)
+    policy = _take_photo_tool_policy(tool_code)
     logger.info(
-        "[Policy Cascade] mode=%s prompt_author=copilot policy_source=execution_policy.yaml "
+        "[Tool Policy] mode=%s prompt_author=copilot policy_source=%s "
         "request_id=%s",
         mode,
+        'TOOL_POLICY' if policy else 'default',
         request_id or 'generated',
     )
-    return call_take_photo_vlm(
+    return execute_tool_policy(
         image=image,
         prompt=prompt,
         mode=mode,
         request_id=request_id,
+        policy=policy,
+        tool_name=tool_name,
     )
+
+
+def _take_photo_tool_policy(tool_code: str) -> Any:
+    """Read an optional literal TOOL_POLICY without executing generated code."""
+    try:
+        tree = ast.parse(tool_code or '')
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == 'TOOL_POLICY' for target in targets):
+                value = ast.literal_eval(node.value)
+                return value
+    except (SyntaxError, ValueError, TypeError) as exc:
+        logger.warning("[Tool Policy] unreadable TOOL_POLICY; using default error=%s", exc)
+        return None
+    return None
+
+
+def _is_progressive_tool_policy(tool_code: str) -> bool:
+    policy = _take_photo_tool_policy(tool_code)
+    return isinstance(policy, dict) and policy.get('strategy') == 'parallel_progressive'
+
+
+def _progressive_invocation_key(client_id: str, tool_name: str) -> tuple[str, str]:
+    return client_id, tool_name
+
+
+def _obsolete_progressive_invocation(client_id: str, tool_name: str) -> None:
+    key = _progressive_invocation_key(client_id, tool_name)
+    record = active_progressive_invocations.pop(key, None)
+    if record is None:
+        return
+    record['cancelled'].set()
+    task = record.get('task')
+    if (
+        task is not None
+        and task is not asyncio.current_task()
+        and not task.done()
+    ):
+        task.cancel()
+    logger.info(
+        "[ToolProgress] invocation=%s tool=%s obsolete=true",
+        record['invocation_id'],
+        tool_name,
+    )
+
+
+def _obsolete_client_progressive_invocations(client_id: str) -> None:
+    keys = [
+        key for key in active_progressive_invocations
+        if key[0] == client_id
+    ]
+    for _, tool_name in keys:
+        _obsolete_progressive_invocation(client_id, tool_name)
+
+
+def _progressive_invocation_is_fresh(
+    key: tuple[str, str], record: Dict[str, Any]
+) -> bool:
+    return (
+        active_progressive_invocations.get(key) is record
+        and not record['cancelled'].is_set()
+    )
+
+
+def _log_progressive_task_error(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "Progressive tool task error",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+async def _execute_progressive_invocation(
+    websocket,
+    client_id: str,
+    tool_name: str,
+    tool_code: str,
+    image,
+    mode: str,
+    record: Dict[str, Any],
+) -> bool:
+    key = _progressive_invocation_key(client_id, tool_name)
+    event_queue: queue.Queue = queue.Queue()
+    prompt = _take_photo_tool_prompt(tool_name, tool_code)
+    policy = _take_photo_tool_policy(tool_code)
+    result_index = 0
+
+    def queue_event(model_name: str, text: str, error: Optional[str] = None) -> None:
+        nonlocal result_index
+        stale = not _progressive_invocation_is_fresh(key, record)
+        if stale:
+            logger.info(
+                "[Progressive] event_queued invocation_id=%s model=%s result_index=0 "
+                "final=false stale=true cancelled=%s",
+                record['invocation_id'], model_name, record['cancelled'].is_set(),
+            )
+            return
+        result_index += 1
+        event = {
+            'type': 'tool_progress_result',
+            'invocation_id': record['invocation_id'],
+            'tool_name': tool_name,
+            'model': model_name,
+            'result_index': result_index,
+            'text': text,
+            'final': False,
+            'mode': mode,
+            'timestamp': datetime.now().isoformat(),
+        }
+        if error:
+            event['error'] = error
+
+        try:
+            logger.info(
+                "[Progressive] event_queued invocation_id=%s model=%s result_index=%d "
+                "final=false stale=false cancelled=false",
+                record['invocation_id'], model_name, event['result_index'],
+            )
+            event_queue.put_nowait(event)
+        except Exception:
+            logger.exception(
+                "[Progressive] event_queue_failed invocation_id=%s model=%s "
+                "result_index=%d final=false stale=%s cancelled=%s",
+                record['invocation_id'], model_name, result_index, stale,
+                record['cancelled'].is_set(),
+            )
+
+    def on_progress(model_name: str, text: str) -> None:
+        queue_event(model_name, text)
+
+    def on_progress_error(model_name: str, error: Exception) -> None:
+        queue_event(model_name, '', str(error))
+
+    try:
+        worker_state: Dict[str, Any] = {}
+
+        def run_worker() -> str:
+            try:
+                worker_state['result'] = execute_resolved_tool_policy(
+                    prompt,
+                    image,
+                    policy=policy,
+                    request_id=record['invocation_id'],
+                    metadata={'mode': mode, 'tool_name': tool_name},
+                    on_progress=on_progress,
+                    on_progress_error=on_progress_error,
+                    is_cancelled=record['cancelled'].is_set,
+                )
+                return worker_state['result']
+            except BaseException as exc:
+                worker_state['error'] = exc
+                return ''
+            finally:
+                event_queue.put_nowait(None)
+
+        worker = threading.Thread(
+            target=run_worker,
+            name=f"tool-progress-{record['invocation_id'][:8]}",
+            daemon=True,
+        )
+        record['worker_thread'] = worker
+        worker.start()
+        while True:
+            try:
+                event = event_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+            if event is None:
+                break
+            stale = not _progressive_invocation_is_fresh(key, record)
+            logger.info(
+                "[Progressive] event_sending invocation_id=%s model=%s result_index=%d "
+                "final=false stale=%s cancelled=%s",
+                record['invocation_id'], event['model'], event['result_index'],
+                stale, record['cancelled'].is_set(),
+            )
+            if stale:
+                continue
+            try:
+                await websocket.send(json.dumps(event))
+                logger.info(
+                    "[Progressive] event_sent invocation_id=%s model=%s result_index=%d "
+                    "final=false stale=false cancelled=false",
+                    record['invocation_id'], event['model'], event['result_index'],
+                )
+            except Exception:
+                logger.exception(
+                    "[Progressive] event_send_failed invocation_id=%s model=%s "
+                    "result_index=%d final=false stale=false cancelled=false",
+                    record['invocation_id'], event['model'], event['result_index'],
+                )
+                raise
+        if worker_state.get('error') is not None:
+            raise worker_state['error']
+        if not _progressive_invocation_is_fresh(key, record):
+            return False
+        final_event = {
+            'type': 'tool_progress_result',
+            'invocation_id': record['invocation_id'],
+            'tool_name': tool_name,
+            'model': None,
+            'result_index': result_index + 1,
+            'text': '',
+            'final': True,
+            'mode': mode,
+            'timestamp': datetime.now().isoformat(),
+        }
+        logger.info(
+            "[Progressive] event_sending invocation_id=%s model=none result_index=%d "
+            "final=true stale=false cancelled=false",
+            record['invocation_id'], final_event['result_index'],
+        )
+        await websocket.send(json.dumps(final_event))
+        logger.info(
+            "[Progressive] event_sent invocation_id=%s model=none result_index=%d "
+            "final=true stale=false cancelled=false",
+            record['invocation_id'], final_event['result_index'],
+        )
+        logger.info(
+            "[Progressive] invocation_complete invocation_id=%s model=none "
+            "result_index=%d final=true stale=false cancelled=false",
+            record['invocation_id'], final_event['result_index'],
+        )
+        return True
+    except asyncio.CancelledError:
+        record['cancelled'].set()
+        raise
+    except Exception as exc:
+        logger.error(
+            "[ToolProgress] invocation failed tool=%s invocation=%s error=%s",
+            tool_name,
+            record['invocation_id'],
+            exc,
+        )
+        if _progressive_invocation_is_fresh(key, record):
+            try:
+                final_event = {
+                    'type': 'tool_progress_result',
+                    'invocation_id': record['invocation_id'],
+                    'tool_name': tool_name,
+                    'model': None,
+                    'result_index': result_index + 1,
+                    'text': '',
+                    'final': True,
+                    'error': str(exc),
+                    'mode': mode,
+                    'timestamp': datetime.now().isoformat(),
+                }
+                await websocket.send(json.dumps(final_event))
+                logger.info(
+                    "[Progressive] invocation_complete invocation_id=%s model=none "
+                    "result_index=%d final=true stale=false cancelled=false error=%s",
+                    record['invocation_id'], final_event['result_index'], exc,
+                )
+            except Exception:
+                logger.exception(
+                    "[ToolProgress] final error marker send failed invocation=%s",
+                    record['invocation_id'],
+                )
+        return False
+    finally:
+        if active_progressive_invocations.get(key) is record:
+            active_progressive_invocations.pop(key, None)
+
+
+async def _start_progressive_invocation(
+    websocket,
+    client_id: str,
+    tool_name: str,
+    tool_code: str,
+    image,
+    mode: str,
+) -> str:
+    _obsolete_progressive_invocation(client_id, tool_name)
+    invocation_id = secrets.token_hex(16)
+    record = {
+        'invocation_id': invocation_id,
+        'cancelled': threading.Event(),
+        'task': None,
+    }
+    active_progressive_invocations[
+        _progressive_invocation_key(client_id, tool_name)
+    ] = record
+    await websocket.send(json.dumps({
+        'type': 'tool_progress_started',
+        'invocation_id': invocation_id,
+        'tool_name': tool_name,
+        'mode': mode,
+        'timestamp': datetime.now().isoformat(),
+    }))
+    logger.info(
+        "[Progressive] event_sent invocation_id=%s model=none result_index=0 "
+        "final=false stale=false cancelled=false type=tool_progress_started",
+        invocation_id,
+    )
+    task = asyncio.create_task(_execute_progressive_invocation(
+        websocket, client_id, tool_name, tool_code, image, mode, record
+    ))
+    record['task'] = task
+    task.add_done_callback(_log_progressive_task_error)
+    return invocation_id
 
 
 def _resolve_tool_prompt(tool_code: str) -> Optional[str]:
@@ -2726,7 +3259,7 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
     # bodies are not executed per frame; TOOL_PROMPT is the complete fused task.
     if tool_language != 'python' or not tool_code:
         logger.error(
-            "[Streaming] policy cascade requires a Python tool with TOOL_PROMPT "
+            "[Streaming] tool policy requires a Python tool with TOOL_PROMPT "
             "client=%s tool=%s language=%s",
             client_id,
             tool_name,
@@ -2735,6 +3268,16 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
         return False
     if tool_language == 'python' and tool_code:
         execution_id = tool_config.get('current_execution_id')
+        if _is_progressive_tool_policy(tool_code):
+            await _start_progressive_invocation(
+                websocket,
+                client_id,
+                tool_name,
+                tool_code,
+                image,
+                'streaming',
+            )
+            return True
         try:
             cascade_result = await asyncio.to_thread(
                 _run_take_photo_vlm,
@@ -2746,13 +3289,13 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
             )
         except Exception as exc:
             logger.error(
-                "[Streaming] policy cascade failed client=%s execution=%s error=%s",
+                "[Streaming] tool policy failed client=%s execution=%s error=%s",
                 client_id, execution_id, exc,
             )
             return False
         if streaming_cancelled():
             logger.info(
-                "[Streaming] policy cascade result discarded as stale client=%s execution=%s",
+                "[Streaming] tool policy result discarded as stale client=%s execution=%s",
                 client_id, execution_id,
             )
             return False
@@ -2901,1007 +3444,137 @@ async def _process_entry_batch(websocket, session_id: str, pr_or_session: str, e
 
 
 async def fetch_copilot_sessions() -> list:
-    """
-    Fetch active Copilot coding agent tasks for the repository.
-    Uses `gh agent-task list` CLI command.
-    
-    Note: gh agent-task list doesn't support --json, so we parse text output
-    or just return empty and rely on PR-based lookup instead.
-    
-    Returns:
-        List of session dictionaries (may be empty if parsing fails)
-    """
-    try:
-        # gh agent-task list doesn't have --json flag, so we'll return empty
-        # and rely on the PR number based lookup in poll_for_copilot_session
-        logger.info("fetch_copilot_sessions called - using PR-based lookup instead")
-        return []
-        
-    except Exception as e:
-        logger.error(f"Error fetching Copilot sessions: {e}")
-        return []
+    """Return no remote code-agent sessions; Claude execution lives in GitHub Actions."""
+    return []
 
 
 async def stream_copilot_session_logs(websocket, client_id: str, pr_number_or_session: str, pr_number: int = None, skip_wait: bool = False, _last_summary_time=None, _skip_lines: int = 0, _start_entry_count: int = 0):
-    """
-    Stream Copilot agent task logs to a client using `gh agent-task view --follow`.
-    
-    Args:
-        websocket: WebSocket connection to send logs to
-        client_id: Client identifier for tracking
-        pr_number_or_session: PR number or session ID to stream logs for
-        pr_number: Explicit PR number (optional, used when pr_number_or_session is a session ID)
-        skip_wait: If True, skip the 45-second initialization wait (caller already confirmed session exists)
-        _last_summary_time: Internal: carry forward last summary time on reconnect to prevent rapid-fire summaries
-        _skip_lines: Internal: number of log lines to skip on reconnect (already processed)
-        _start_entry_count: Internal: starting entry count on reconnect (continue numbering)
-    """
-    global active_copilot_streams
-    
-    logger.info(f"Starting Copilot agent task log stream for {client_id}, pr/session: {pr_number_or_session}, pr_number: {pr_number}")
-    
-    try:
-        # Create clean environment for gh CLI - remove token env vars so it uses OAuth from gh auth login
-        # PAT tokens (GITHUB_TOKEN) don't work with agent-task, it requires OAuth credentials
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        session_id = str(pr_number_or_session)
-        
-        # If given a PR number, first fetch the session ID
-        if session_id.isdigit():
-            import pty
-            import fcntl
-            import re
-            
-            pr_number = int(session_id)  # Store the PR number
-            logger.info(f"PR number provided, fetching session ID for PR #{session_id}")
-            
-            # Wait for the session to initialize on GitHub's side before querying
-            # Skip this wait if the caller already confirmed the session exists
-            if not skip_wait:
-                logger.info("Waiting 45 seconds for GitHub to initialize the Copilot session...")
-                await asyncio.sleep(45)
-            else:
-                logger.info("Skipping 45-second wait (session already confirmed)")
-            
-            # Use Python's pty module to create a real PTY and send enter after delay
-            logger.info(f"Creating PTY for: gh agent-task view {session_id} -R {GITHUB_REPO}")
-            
-            # Create a PTY
-            master, slave = pty.openpty()
-            
-            # Spawn the gh command in the PTY
-            proc = await asyncio.create_subprocess_exec(
-                'gh', 'agent-task', 'view', str(session_id),
-                '-R', GITHUB_REPO,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                env=env
-            )
-            
-            # Close slave in parent process
-            os.close(slave)
-            
-            # Send multiple enters with delays to ensure we catch the prompt
-            # First wait for gh to query and display sessions
-            logger.info("Waiting 0.8 seconds then sending first enter...")
-            await asyncio.sleep(0.8)
-            os.write(master, b'\r\n')
-            logger.info("Sent first enter, waiting 0.3 seconds...")
-            await asyncio.sleep(0.3)
-            os.write(master, b'\r\n')
-            logger.info("Sent second enter to PTY")
-            
-            # Read output
-            output = b''
-            try:
-                # Set non-blocking
-                flags = fcntl.fcntl(master, fcntl.F_GETFL)
-                fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                
-                # Read with timeout
-                for _ in range(50):  # 5 seconds total
-                    await asyncio.sleep(0.1)
-                    try:
-                        chunk = os.read(master, 4096)
-                        if chunk:
-                            output += chunk
-                    except OSError:
-                        pass
-                    
-                    # Check if process has exited
-                    if proc.returncode is not None:
-                        break
-            finally:
-                os.close(master)
-                
-            # Wait for process to complete
-            await proc.wait()
-            
-            logger.info(f"Command completed with return code: {proc.returncode}")
-            output_str = output.decode('utf-8', errors='replace')
-            logger.info(f"Output length: {len(output_str)}")
-            
-            # Parse session ID from output - look for UUID pattern
-            uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-            matches = re.findall(uuid_pattern, output_str)
-            logger.info(f"Found {len(matches)} UUID matches in output")
-            
-            if matches:
-                session_id = matches[0]
-                logger.info(f"Selected most recent session: {session_id}")
-            else:
-                logger.error(f"Could not find session ID in output: {output_str[:200]}")
-                await websocket.send(json.dumps({
-                    'type': 'copilot_session_error',
-                    'pr_or_session': str(pr_number),
-                    'error': 'Could not find session ID for this PR'
-                }))
-                return
-        
-        # Spawn the gh CLI process with --follow and --log for continuous streaming
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            session_id,
-            '-R', GITHUB_REPO,
-            '--follow',
-            '--log',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        
-        # Create or get session in database with PR number
-        if pr_number is not None:
-            logger.info(f"Creating session {session_id} for PR #{pr_number} in database")
-            copilot_db.create_session(session_id, pr_number)
-        else:
-            logger.warning(f"Session {session_id} created without PR number - will not be queryable by PR")
-        
-        # Store process reference for cleanup
-        active_copilot_streams[client_id] = {
-            'process': proc,
-            'pr_or_session': pr_number_or_session,
-            'started_at': datetime.now(),
-            'session_id': session_id
-        }
-        
-        # Notify client that streaming has started
-        print(f"\n{'='*60}\n🤖 Copilot Session Started: {session_id}\n{'='*60}", flush=True)
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_stream_started',
-            'pr_or_session': str(pr_number_or_session),
-            'session_id': session_id,
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        # Entry tracking state
-        current_entry_lines = []
-        entry_buffer = []  # Buffer of complete entries
-        entry_count = _start_entry_count  # Continue from where we left off on reconnect
-        log_index = _skip_lines  # Continue log index from reconnect
-        prev_line = ""
-        in_code_section = False
-        lines_seen = 0  # Count lines seen this invocation (for skip logic)
-        last_summary_time = _last_summary_time or datetime.now()  # Don't fire immediately on first run
-        summary_interval = 30  # Generate summary every 30 seconds
-        check_interval = 5  # Check for new entries every 5 seconds
-        max_entry_lines = 50  # Force a boundary if an entry exceeds this many lines
-        
-        # Background task to periodically generate summaries
-        async def periodic_summarizer():
-            """Check every 5 seconds, summarize if 30 seconds have passed since last summary."""
-            nonlocal entry_buffer, last_summary_time
-            while True:
-                try:
-                    await asyncio.sleep(check_interval)
-                    now = datetime.now()
-                    
-                    # Only summarize if we have entries
-                    if not entry_buffer:
-                        continue
-                    
-                    # If first batch or 30 seconds have passed since last summary
-                    if last_summary_time is None:
-                        time_since_last = float('inf')
-                    else:
-                        time_since_last = (now - last_summary_time).total_seconds()
-                    
-                    if time_since_last >= summary_interval:
-                        # Copy and clear buffer
-                        entries_to_process = entry_buffer.copy()
-                        entry_buffer.clear()
-                        last_summary_time = now
-                        
-                        if not entries_to_process:
-                            continue
-                        
-                        logger.info(f"Periodic summarizer: Processing {len(entries_to_process)} entries ({time_since_last:.1f}s since last summary)")
-                        
-                        # Cap total text size to avoid overwhelming the summarizer
-                        # Any entries that don't fit go back in the buffer for next cycle
-                        total_chars = sum(len(e.get('text', '')) for e in entries_to_process)
-                        if total_chars > 15000:
-                            kept = []
-                            deferred = []
-                            char_count = 0
-                            for entry in entries_to_process:
-                                entry_text = entry.get('text', '')
-                                if char_count + len(entry_text) > 15000 and kept:
-                                    # This entry and all remaining go back in the buffer
-                                    deferred.append(entry)
-                                else:
-                                    kept.append(entry)
-                                    char_count += len(entry_text)
-                            # Put un-processed entries back in the buffer for next cycle
-                            if deferred:
-                                entry_buffer = deferred + entry_buffer
-                                logger.info(f"Capped at {len(kept)} entries ({char_count} chars), deferred {len(deferred)} entries to next cycle")
-                            entries_to_process = kept
-                        
-                        if entries_to_process:
-                            await _process_entry_batch(websocket, session_id, pr_number_or_session, entries_to_process)
-                        
-                        logger.info(f"Summary complete, next in {summary_interval}s")
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Error in periodic summarizer: {e}")
-        
-        # Start the periodic summarizer task
-        summarizer_task = asyncio.create_task(periodic_summarizer())
-        
-        try:
-            # Read and forward log lines as they arrive
-            while True:
-                line = await proc.stdout.readline()
-                
-                if not line:
-                    # Process ended or EOF - stop the periodic summarizer first
-                    summarizer_task.cancel()
-                    try:
-                        await summarizer_task
-                    except asyncio.CancelledError:
-                        pass
-                    
-                    # Flush any remaining entry
-                    if current_entry_lines:
-                        entry_text = '\n'.join(current_entry_lines)
-                        entry_buffer.append({
-                            'entry_num': entry_count,
-                            'lines': current_entry_lines[:],
-                            'text': entry_text,
-                            'is_code': in_code_section
-                        })
-                        entry_count += 1
-                        
-                        # Store in DB using batch insert (non-blocking)
-                        batch = [(session_id, log_index + i, line_text, in_code_section, entry_count - 1) 
-                                for i, line_text in enumerate(current_entry_lines)]
-                        asyncio.create_task(async_insert_logs_batch(batch))
-                        log_index += len(current_entry_lines)
-                    
-                    # Summarize any remaining entries
-                    if entry_buffer:
-                        await _process_entry_batch(websocket, session_id, pr_number_or_session, entry_buffer)
-                        entry_buffer.clear()  # Clear after final summary
-                    
-                    break
-                
-                log_line = line.decode('utf-8', errors='replace').rstrip()
-                
-                if log_line:
-                    lines_seen += 1
-                    
-                    # Skip lines already processed in previous invocation (reconnect)
-                    if lines_seen <= _skip_lines:
-                        prev_line = log_line
-                        continue
-                    
-                    # Print to terminal for server-side visibility
-                    print(f"  {log_line}", flush=True)
-                    
-                    # Send raw log to client
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_log',
-                        'pr_or_session': str(pr_number_or_session),
-                        'line': log_line,
-                        'timestamp': datetime.now().isoformat()
-                    }))
-                    
-                    # Track code fence state (```)
-                    if log_line.strip().startswith('```'):
-                        in_code_section = not in_code_section  # Toggle
-                    
-                    # Check if this line looks like code
-                    line_is_code = looks_like_code(log_line) or in_code_section
-                    
-                    # Detect entry boundary OR force boundary if entry is too large
-                    force_boundary = len(current_entry_lines) >= max_entry_lines
-                    natural_boundary = is_entry_boundary(log_line, prev_line)
-                    
-                    if (natural_boundary or force_boundary) and current_entry_lines:
-                        if force_boundary and not natural_boundary:
-                            logger.debug(f"Forcing entry boundary at {len(current_entry_lines)} lines")
-                        
-                        # Complete the current entry
-                        entry_text = '\n'.join(current_entry_lines)
-                        entry_buffer.append({
-                            'entry_num': entry_count,
-                            'lines': current_entry_lines[:],
-                            'text': entry_text,
-                            'is_code': in_code_section
-                        })
-                        
-                        # Store in DB using batch insert (non-blocking)
-                        batch = [(session_id, log_index + i, line_text, in_code_section, entry_count) 
-                                for i, line_text in enumerate(current_entry_lines)]
-                        asyncio.create_task(async_insert_logs_batch(batch))
-                        log_index += len(current_entry_lines)
-                        
-                        entry_count += 1
-                        current_entry_lines = []
-                        # Note: Don't reset in_code_section here - it persists across entries
-                    
-                    # Add line to current entry
-                    if log_line.strip():  # Don't add blank lines
-                        current_entry_lines.append(log_line)
-                    
-                    prev_line = log_line
-        finally:
-            # Cancel the summarizer task when done
-            summarizer_task.cancel()
-            try:
-                await summarizer_task
-            except asyncio.CancelledError:
-                pass
-
-        
-        # Check for any stderr output
-        stderr_output = await proc.stderr.read()
-        if stderr_output:
-            stderr_text = stderr_output.decode('utf-8', errors='replace').strip()
-            if stderr_text:
-                # Print to terminal
-                print(f"⚠️  STDERR: {stderr_text}", flush=True)
-                logger.warning(f"Copilot agent task stderr: {stderr_text}")
-                # Only send as error if it looks like an actual error (not just warnings/info)
-                if any(err_word in stderr_text.lower() for err_word in ['error', 'failed', 'fatal']):
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_error',
-                        'pr_or_session': str(pr_number_or_session),
-                        'error': stderr_text,
-                        'timestamp': datetime.now().isoformat()
-                    }))
-        
-        # Get exit code
-        exit_code = await proc.wait()
-        
-        logger.info(f"gh agent-task view exited with code {exit_code} for session {session_id}")
-        
-        # Check if the session is actually complete or if it's still running
-        # (This can happen when a sub-agent finishes but the parent is still active)
-        try:
-            # Query the session status
-            status_proc = await asyncio.create_subprocess_exec(
-                'gh', 'agent-task', 'view',
-                session_id,
-                '-R', GITHUB_REPO,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
-            stdout, stderr = await status_proc.communicate()
-            output = stdout.decode('utf-8', errors='replace')
-            
-            # Check if session shows as "in progress" or "active"
-            is_still_active = any(status in output.lower() for status in ['in progress', 'active', 'running'])
-            
-            if is_still_active:
-                if exit_code == 0:
-                    # Session is still active - the --follow just ended (likely due to sub-agent completion)
-                    logger.info(f"Session {session_id} is still active, restarting follow stream...")
-                    print(f"  🔄 Sub-agent completed, continuing to follow parent session...", flush=True)
-                else:
-                    # Non-zero exit but session still active - connection issue, try to reconnect
-                    logger.warning(f"Session {session_id} is still active but stream exited with code {exit_code}, reconnecting...")
-                    print(f"  🔄 Connection lost, attempting to reconnect to active session...", flush=True)
-                
-                # Restart the follow by calling stream_copilot_session_logs recursively
-                # Use the same websocket and parameters, carry forward summary timing
-                await stream_copilot_session_logs(websocket, client_id, session_id, pr_number, skip_wait=True, _last_summary_time=last_summary_time, _skip_lines=lines_seen, _start_entry_count=entry_count)
-                return  # Exit this instance, the recursive call handles the rest
-                
-        except Exception as e:
-            logger.warning(f"Could not check session status: {e}, assuming complete")
-        
-        # Determine session status based on exit code and whether we got any logs
-        # Get log count to see if we captured anything
-        logs_count = copilot_db.get_log_count(session_id)
-        
-        if exit_code == 0:
-            status = 'completed'
-        elif logs_count > 0:
-            # We got some logs but stream ended abnormally - mark as partial, not failed
-            status = 'partial'
-            logger.info(f"Session {session_id} recording ended early (exit {exit_code}) but captured {logs_count} log entries - marking as partial")
-        else:
-            # No logs captured and non-zero exit
-            status = 'failed'
-            
-        copilot_db.update_session_status(session_id, status, exit_code)
-        
-        # Notify client that streaming has ended
-        print(f"{'='*60}\n✅ Copilot Session Ended (exit code: {exit_code})\n{'='*60}\n", flush=True)
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_stream_ended',
-            'pr_or_session': str(pr_number_or_session),
-            'session_id': session_id,
-            'exit_code': exit_code,
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        logger.info(f"Copilot agent task log stream ended for {client_id}, exit code: {exit_code}")
-        
-    except asyncio.CancelledError:
-        logger.info(f"Copilot agent task stream cancelled for {client_id}")
-        raise
-    except Exception as e:
-        logger.error(f"Error streaming Copilot agent task logs: {e}")
-        try:
-            await websocket.send(json.dumps({
-                'type': 'copilot_session_error',
-                'pr_or_session': str(pr_number_or_session),
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }))
-        except:
-            pass  # Connection may already be closed
-    finally:
-        # Cleanup
-        if client_id in active_copilot_streams:
-            stream_info = active_copilot_streams[client_id]
-            if stream_info.get('process'):
-                try:
-                    stream_info['process'].terminate()
-                    await asyncio.wait_for(stream_info['process'].wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    stream_info['process'].kill()
-                except:
-                    pass
-            del active_copilot_streams[client_id]
+    await websocket.send(json.dumps({
+        'type': 'copilot_session_error',
+        'pr_or_session': str(pr_number_or_session),
+        'error': 'Remote code-agent session streaming is no longer supported on this branch.',
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def stop_copilot_session_stream(client_id: str):
-    """
-    Stop an active Copilot session stream for a client.
-    
-    Args:
-        client_id: Client identifier
-    """
-    global active_copilot_streams
-    
-    if client_id not in active_copilot_streams:
-        logger.warning(f"No active Copilot stream for {client_id}")
-        return
-    
-    stream_info = active_copilot_streams[client_id]
-    
-    # Cancel the streaming task if it exists
-    if 'task' in stream_info and stream_info['task']:
-        stream_info['task'].cancel()
-    
-    # Terminate the subprocess
-    if stream_info.get('process'):
-        try:
-            stream_info['process'].terminate()
-            await asyncio.wait_for(stream_info['process'].wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            stream_info['process'].kill()
-        except Exception as e:
-            logger.error(f"Error stopping Copilot stream process: {e}")
-    
-    if client_id in active_copilot_streams:
-        del active_copilot_streams[client_id]
-    
-    logger.info(f"Stopped Copilot session stream for {client_id}")
+    active_copilot_streams.pop(client_id, None)
 
 
 async def fetch_and_store_pr_sessions(websocket, client_id: str, pr_number: int):
-    """
-    Fetch sessions for a PR and return them to the client.
-    
-    Note: GitHub CLI doesn't provide a way to list historical sessions.
-    We can only access:
-    1. Sessions already stored in our database from previous live streaming
-    2. The currently active session (if any) by streaming it live
-    
-    Args:
-        websocket: WebSocket connection to send updates to
-        client_id: Client identifier
-        pr_number: PR number to fetch sessions for
-    """
-    logger.info(f"Fetching sessions for PR #{pr_number}")
-    
-    try:
-        # Check database for existing sessions
-        sessions = copilot_db.get_sessions_for_pr(pr_number)
-        
-        if sessions:
-            logger.info(f"Found {len(sessions)} session(s) in database for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': sessions,
-                'timestamp': datetime.now().isoformat()
-            }))
-            return
-        
-        # No sessions in DB - check if there's an active session we can fetch
-        logger.info(f"No sessions in DB for PR #{pr_number}, checking for active session")
-        
-        # Try to get active session by running gh agent-task view
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            str(pr_number),
-            '-R', GITHUB_REPO,
-            '--log',  # Just get log info, not streaming
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            # No active session for this PR
-            logger.info(f"No active session found for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': [],
-                'timestamp': datetime.now().isoformat()
-            }))
-            return
-        
-        # Parse output to extract session ID
-        output = stdout.decode('utf-8', errors='replace')
-        import re
-        uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-        session_ids = re.findall(uuid_pattern, output)
-        
-        if session_ids:
-            session_id = session_ids[0]  # Use first found session ID
-            logger.info(f"Found active session {session_id} for PR #{pr_number}, creating in DB")
-            
-            # Create session in database
-            copilot_db.create_session(session_id, pr_number)
-            
-            # Fetch logs for this session without streaming
-            await fetch_and_store_session_logs(session_id, pr_number)
-            
-            # Get sessions from database and send to client
-            sessions = copilot_db.get_sessions_for_pr(pr_number)
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': sessions,
-                'timestamp': datetime.now().isoformat()
-            }))
-        else:
-            logger.info(f"Could not extract session ID for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': [],
-                'timestamp': datetime.now().isoformat()
-            }))
-        
-    except Exception as e:
-        logger.error(f"Error fetching sessions for PR #{pr_number}: {e}")
-        await websocket.send(json.dumps({
-            'type': 'error',
-            'message': f'Failed to fetch sessions: {str(e)}',
-            'timestamp': datetime.now().isoformat()
-        }))
+    await websocket.send(json.dumps({
+        'type': 'pr_sessions_list',
+        'pr_number': pr_number,
+        'sessions': [],
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def fetch_and_store_session_logs(session_id: str, pr_number: int):
-    """
-    Fetch logs for a specific session from GitHub and store in database.
-    Uses gh agent-task view --log (without --follow) to get historical logs.
-    
-    Args:
-        session_id: Copilot session ID
-        pr_number: Associated PR number
-    """
-    logger.info(f"Fetching historical logs for session {session_id}")
-    
-    try:
-        # Create clean environment for gh CLI
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        # Run gh agent-task view with --log but WITHOUT --follow for historical data
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            session_id,
-            '-R', GITHUB_REPO,
-            '--log',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        
-        # Process logs line by line
-        current_entry_lines = []
-        entry_buffer = []
-        entry_count = 0
-        log_index = 0
-        prev_line = ""
-        in_code_section = False
-        max_entry_lines = 50  # Force boundary if entry exceeds this
-        
-        while True:
-            line = await proc.stdout.readline()
-            
-            if not line:
-                # EOF - flush any remaining entry
-                if current_entry_lines:
-                    entry_text = '\n'.join(current_entry_lines)
-                    entry_buffer.append({
-                        'entry_num': entry_count,
-                        'lines': current_entry_lines[:],
-                        'text': entry_text,
-                        'is_code': in_code_section
-                    })
-                    entry_count += 1
-                    
-                    # Store in DB using batch insert (non-blocking)
-                    batch = [(session_id, log_index + i, line_text, in_code_section, entry_count - 1) 
-                            for i, line_text in enumerate(current_entry_lines)]
-                    asyncio.create_task(async_insert_logs_batch(batch))
-                    log_index += len(current_entry_lines)
-                
-                # Summarize any remaining entries
-                if entry_buffer:
-                    await _process_historical_batch(session_id, entry_buffer)
-                
-                break
-            
-            log_line = line.decode('utf-8', errors='replace').rstrip()
-            
-            if log_line:
-                # Track code fence state (```)
-                if log_line.strip().startswith('```'):
-                    in_code_section = not in_code_section  # Toggle
-                
-                # Check if this line looks like code
-                line_is_code = looks_like_code(log_line) or in_code_section
-                
-                # Detect entry boundary or force if too large
-                force_boundary = len(current_entry_lines) >= max_entry_lines
-                natural_boundary = is_entry_boundary(log_line, prev_line)
-                
-                if (natural_boundary or force_boundary) and current_entry_lines:
-                    # Complete the current entry
-                    entry_text = '\n'.join(current_entry_lines)
-                    entry_buffer.append({
-                        'entry_num': entry_count,
-                        'lines': current_entry_lines[:],
-                        'text': entry_text,
-                        'is_code': in_code_section
-                    })
-                    
-                    # Store in DB using batch insert (non-blocking)
-                    batch = [(session_id, log_index + i, line_text, in_code_section, entry_count) 
-                            for i, line_text in enumerate(current_entry_lines)]
-                    asyncio.create_task(async_insert_logs_batch(batch))
-                    log_index += len(current_entry_lines)
-                    
-                    entry_count += 1
-                    current_entry_lines = []
-                    # Don't reset in_code_section - it persists across entries
-                    
-                    # For historical logs, batch every 10 entries to avoid too many summaries
-                    if len(entry_buffer) >= 10:
-                        await _process_historical_batch(session_id, entry_buffer[:10])
-                        entry_buffer = entry_buffer[10:]
-                
-                # Add line to current entry
-                if log_line.strip():
-                    current_entry_lines.append(log_line)
-                
-                prev_line = log_line
-        
-        # Get exit code
-        exit_code = await proc.wait()
-        
-        # Determine session status based on exit code and whether we got any logs
-        if exit_code == 0:
-            status = 'completed'
-        elif log_index > 0:
-            # We got some logs but stream ended abnormally - mark as partial, not failed
-            status = 'partial'
-            logger.info(f"Session {session_id} fetch ended early (exit {exit_code}) but captured {log_index} log entries - marking as partial")
-        else:
-            # No logs captured and non-zero exit
-            status = 'failed'
-            
-        copilot_db.update_session_status(session_id, status, exit_code)
-        
-        logger.info(f"Stored {log_index} log lines and {entry_count} entries for session {session_id}")
-        
-    except Exception as e:
-        logger.error(f"Error fetching logs for session {session_id}: {e}")
+    return
 
 
 async def _process_historical_batch(session_id: str, entries: list):
-    """
-    Process a batch of historical entries: generate summary and store in DB.
-    Similar to _process_entry_batch but without WebSocket sending.
-    
-    Args:
-        session_id: Copilot session ID
-        entries: List of entry dicts
-    """
-    if not entries:
-        return
-    
-    # Generate summary (including code now)
-    loop = asyncio.get_event_loop()
-    try:
-        summary = await loop.run_in_executor(None, summarize_entries_sync, entries)
-        
-        # Get entry range
-        start_entry = entries[0]['entry_num']
-        end_entry = entries[-1]['entry_num']
-        
-        # Store summary in database
-        copilot_db.insert_summary(session_id, summary, start_entry, end_entry)
-        
-        logger.info(f"Generated summary for historical entries {start_entry}-{end_entry}: {summary[:50]}...")
-        
-    except Exception as e:
-        logger.error(f"Error processing historical batch: {e}")
+    return
 
 
 async def poll_for_copilot_session_on_pr(pr_number: int, websocket, client_id: str):
-    """
-    Poll for a Copilot agent task on a specific PR (used when commenting on existing PRs).
-    Much simpler than poll_for_copilot_session since we already know the PR number.
-    
-    Args:
-        pr_number: The PR number where @copilot was mentioned
-        websocket: WebSocket connection to stream logs to
-        client_id: Client identifier
-    """
-    logger.info(f"Polling for Copilot session on PR #{pr_number}")
-    
-    max_wait = 120  # Wait up to 2 minutes for session to start
-    poll_interval = 5  # Check every 5 seconds
-    start_time = datetime.now()
-    
-    try:
-        # Notify client we're watching
-        await websocket.send(json.dumps({
-            'type': 'copilot_watching',
-            'pr_number': pr_number,
-            'message': f'Waiting for Copilot session to start on PR #{pr_number}...',
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        # Create clean environment for gh CLI
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        while (datetime.now() - start_time).total_seconds() < max_wait:
-            try:
-                # Check if session exists for this PR using gh agent-task list
-                proc = await asyncio.create_subprocess_exec(
-                    'gh', 'agent-task', 'list',
-                    '--limit', '50',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env
-                )
-                stdout, stderr = await proc.communicate()
-                stdout_text = stdout.decode('utf-8', errors='replace').strip()
-                
-                # Look for our PR in the output
-                if f'#{pr_number}' in stdout_text and 'program-at/ProgramAT' in stdout_text:
-                    logger.info(f"Found session on PR #{pr_number}, starting stream")
-                    
-                    # Notify client
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_starting',
-                        'pr_number': pr_number,
-                        'message': f'Copilot session found, streaming logs...',
-                        'timestamp': datetime.now().isoformat()
-                    }))
-                    
-                    # Start streaming logs - stream function will extract the session ID
-                    # skip_wait=True because we already confirmed the session exists via agent-task list
-                    await stream_copilot_session_logs(
-                        websocket,
-                        client_id,
-                        str(pr_number),  # Pass PR number, function will get session ID
-                        pr_number=pr_number,
-                        skip_wait=True
-                    )
-                    return
-                else:
-                    logger.debug(f"No session yet on PR #{pr_number}, waiting...")
-                    
-            except Exception as e:
-                logger.warning(f"Error checking for session on PR #{pr_number}: {e}")
-            
-            await asyncio.sleep(poll_interval)
-        
-        # Timeout
-        logger.info(f"Timed out waiting for Copilot session on PR #{pr_number}")
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_timeout',
-            'pr_number': pr_number,
-            'message': f'No Copilot session started within {max_wait} seconds',
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-    except Exception as e:
-        logger.error(f"Error polling for session on PR #{pr_number}: {e}")
+    await websocket.send(json.dumps({
+        'type': 'copilot_session_timeout',
+        'pr_number': pr_number,
+        'message': 'Remote code-agent session polling is no longer supported on this branch.',
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def poll_for_copilot_session(issue_number: int, websocket, client_id: str):
     """
-    Poll for a Copilot agent task associated with a newly created issue.
-    Watches for PR creation and then streams the agent task logs using gh agent-task view.
-    
-    Args:
-        issue_number: The GitHub issue number to monitor
-        websocket: WebSocket connection to stream logs to
-        client_id: Client identifier
+    Poll GitHub for the Claude PR created for a newly opened VAT issue.
+    The legacy helper name is retained to avoid unrelated compatibility churn.
     """
     global pending_copilot_issues
-    
-    logger.info(f"Starting to poll for Copilot agent task for issue #{issue_number}")
-    
-    max_poll_duration = 600  # Poll for up to 10 minutes
-    poll_interval = 15  # Check every 15 seconds
-    session_poll_interval = 5  # Check for session more frequently once PR is found
+
+    logger.info(f"Starting to poll for Claude work for issue #{issue_number}")
+    max_poll_duration = 600
+    poll_interval = 15
     start_time = datetime.now()
-    found_pr = None
-    
-    # Helper to send to websocket, tolerating disconnects
-    async def _safe_send(msg_dict):
-        """Send JSON to the websocket. Returns False if send failed (client gone)."""
+
+    async def _safe_send(message: dict) -> bool:
         nonlocal websocket
-        # Refresh websocket from pending_copilot_issues in case client reconnected
         info = pending_copilot_issues.get(issue_number)
         if info and info.get('websocket'):
             websocket = info['websocket']
         try:
-            await websocket.send(json.dumps(msg_dict))
+            await websocket.send(json.dumps(message))
             return True
         except Exception:
-            logger.debug(f"WebSocket send failed for issue #{issue_number} poll (client disconnected)")
+            logger.debug(
+                f"WebSocket send failed for issue #{issue_number} poll (client disconnected)"
+            )
             return False
-    
+
     try:
-        # Notify client we're watching for Copilot
         await _safe_send({
             'type': 'copilot_watching',
             'issue_number': issue_number,
-            'message': f'Watching for Copilot to create a PR for issue #{issue_number}...',
+            'message': f'Watching for Claude to create a PR for issue #{issue_number}...',
             'timestamp': datetime.now().isoformat()
         })
-        
+
         while (datetime.now() - start_time).total_seconds() < max_poll_duration:
-            # Check if client disconnected
             if issue_number not in pending_copilot_issues:
                 logger.info(f"Stopped polling for issue #{issue_number} - removed from pending")
                 return
-            
+
             try:
-                # If we haven't found a PR yet, look for one
-                if not found_pr:
-                    g = Github(GITHUB_TOKEN)
-                    repo = g.get_repo(GITHUB_REPO)
-                    pulls = repo.get_pulls(state='open', sort='created', direction='desc')
-                    
-                    for pr in list(pulls)[:10]:  # Check recent PRs
-                        pr_text = f"{pr.title} {pr.body or ''}"
-                        if f"#{issue_number}" in pr_text or f"Fixes #{issue_number}" in pr_text or f"Closes #{issue_number}" in pr_text:
-                            logger.info(f"Found PR #{pr.number} for issue #{issue_number}")
-                            found_pr = pr
-                            
-                            # Store PR number in pending info for reconnecting clients
-                            if issue_number in pending_copilot_issues:
-                                pending_copilot_issues[issue_number]['pr_number'] = pr.number
-                            
-                            # Notify client about PR (tolerate disconnects)
-                            await _safe_send({
-                                'type': 'copilot_pr_found',
-                                'issue_number': issue_number,
-                                'pr_number': pr.number,
-                                'pr_title': pr.title,
-                                'pr_url': pr.html_url,
-                                'message': f'Copilot created PR #{pr.number}: {pr.title}. Waiting for agent session to start...',
-                                'timestamp': datetime.now().isoformat()
-                            })
-                            break
-                
-                # If we found a PR, try to stream its session
-                # The stream function will use gh agent-task list to find the session ID
-                if found_pr:
-                    logger.info(f"Found PR #{found_pr.number}, attempting to stream session")
-                    
-                    # Refresh websocket from pending info (client may have reconnected)
-                    info = pending_copilot_issues.get(issue_number)
-                    if info and info.get('websocket'):
-                        websocket = info['websocket']
-                        client_id = info.get('client_id', client_id)
-                    
-                    # Remove from pending (done polling, about to stream)
-                    if issue_number in pending_copilot_issues:
-                        del pending_copilot_issues[issue_number]
-                    
-                    # Notify client session is starting (tolerate disconnects)
-                    await _safe_send({
-                        'type': 'copilot_session_starting',
-                        'pr_number': found_pr.number,
-                        'message': f'Agent session found, streaming logs...',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    # Start streaming - pass PR number, stream function will extract session ID
-                    # skip_wait=True because poll already confirmed the session exists
-                    await stream_copilot_session_logs(
-                        websocket, 
-                        client_id, 
-                        str(found_pr.number),  # Pass PR number as string
-                        pr_number=found_pr.number,  # Explicitly pass PR number for database
-                        skip_wait=True
-                    )
-                    return
-                    
-                    # Session not ready, wait shorter interval
-                    await asyncio.sleep(session_poll_interval)
-                    continue
-                
+                g = Github(GITHUB_TOKEN)
+                repo = g.get_repo(GITHUB_REPO)
+                pulls = repo.get_pulls(state='open', sort='created', direction='desc')
+
+                for i, pr in enumerate(pulls):
+                    if i >= 20:
+                        break
+                    pr_text = f"{pr.title} {pr.body or ''}"
+                    if (
+                        f"#{issue_number}" in pr_text
+                        or f"Fixes #{issue_number}" in pr_text
+                        or f"Closes #{issue_number}" in pr_text
+                    ):
+                        logger.info(f"Found Claude PR #{pr.number} for issue #{issue_number}")
+                        if issue_number in pending_copilot_issues:
+                            pending_copilot_issues[issue_number]['pr_number'] = pr.number
+                            pending_copilot_issues.pop(issue_number, None)
+
+                        await _safe_send({
+                            'type': 'copilot_pr_found',
+                            'issue_number': issue_number,
+                            'pr_number': pr.number,
+                            'pr_title': pr.title,
+                            'pr_url': pr.html_url,
+                            'message': f'Claude created PR #{pr.number}: {pr.title}.',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        return
             except Exception as e:
-                logger.warning(f"Error polling for Copilot agent task: {e}")
-            
+                logger.warning(f"Error polling for Claude PR: {e}")
+
             await asyncio.sleep(poll_interval)
-        
-        # Timeout reached
-        logger.info(f"Stopped polling for issue #{issue_number} - timeout reached")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
-        
+
+        pending_copilot_issues.pop(issue_number, None)
         await _safe_send({
             'type': 'copilot_watch_timeout',
             'issue_number': issue_number,
-            'message': f'Timed out waiting for Copilot to create a PR for issue #{issue_number}',
+            'message': f'Timed out waiting for Claude to create a PR for issue #{issue_number}',
             'timestamp': datetime.now().isoformat()
         })
-        
     except asyncio.CancelledError:
-        logger.info(f"Copilot polling cancelled for issue #{issue_number}")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
+        logger.info(f"Claude polling cancelled for issue #{issue_number}")
+        pending_copilot_issues.pop(issue_number, None)
         raise
     except Exception as e:
         logger.error(f"Error in poll_for_copilot_session: {e}")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
+        pending_copilot_issues.pop(issue_number, None)
+
 
 
 def fetch_open_prs():
@@ -3980,9 +3653,11 @@ def fetch_open_issues():
         
         # Fetch open issues (limit to 50 most recent)
         issues = repo.get_issues(state='open', sort='updated', direction='desc')
-        
+
         issue_list = []
-        for issue in issues[:50]:  # Limit to 50 issues
+        for i, issue in enumerate(issues):
+            if i >= 50:
+                break
             issue_list.append({
                 'number': issue.number,
                 'title': issue.title,
@@ -4026,6 +3701,31 @@ def fetch_pr_title(pr_number: int) -> str:
     except Exception as e:
         logger.error(f"Failed to fetch title for PR #{pr_number}: {e}")
         return f"PR #{pr_number}"
+
+
+def _fallback_issue_title(parsed_data: dict, raw_text: str) -> str:
+    """Build a non-empty GitHub issue title when the parser leaves it blank."""
+    candidates = [
+        parsed_data.get('title'),
+        parsed_data.get('description'),
+        parsed_data.get('example_usage'),
+        _original_request_fallback(parsed_data),
+        raw_text,
+    ]
+
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            candidate = ' '.join(str(item) for item in candidate)
+        elif candidate is None:
+            candidate = ''
+        elif not isinstance(candidate, str):
+            candidate = str(candidate)
+
+        normalized = ' '.join(candidate.split()).strip(' .:-')
+        if normalized:
+            return normalized[:256]
+
+    return "Visual assistive tool request"
 
 
 def fetch_pr_tools(pr_number: int) -> list:
@@ -4128,8 +3828,29 @@ def get_local_tools_for_pr_merge() -> list:
     return local_tools
 
 
-def resolve_tool_code_for_execution(tool_name: str, tool_path: str = '', client_tool_code: str = '') -> str:
-    """Prefer the server's current local tool code over stale client-sent code."""
+def resolve_tool_code_for_execution(
+    tool_name: str,
+    tool_path: str = '',
+    client_tool_code: str = '',
+    client_tool_source: str = '',
+) -> str:
+    """Prefer fetched remote code, using the current local tool only as fallback."""
+    remote_code = client_tool_code or ''
+    if remote_code and not (client_tool_source or '').strip().lower().startswith('local'):
+        normalized_path = (tool_path or '').strip().lower()
+        remote_is_python = not normalized_path or normalized_path.endswith('.py')
+        try:
+            if remote_is_python:
+                ast.parse(remote_code)
+            logger.info("[ToolResolution] tool=%s source=remote", tool_name)
+            return remote_code
+        except SyntaxError as exc:
+            logger.warning(
+                "[ToolResolution] tool=%s remote_invalid=%s; trying local fallback",
+                tool_name,
+                exc,
+            )
+
     candidates = []
 
     raw_path = (tool_path or '').strip()
@@ -4158,16 +3879,13 @@ def resolve_tool_code_for_execution(tool_name: str, tool_path: str = '', client_
         if candidate.exists() and candidate.is_file():
             try:
                 server_tool_code = candidate.read_text(encoding='utf-8')
-                if client_tool_code and client_tool_code != server_tool_code:
-                    logger.info(
-                        f"[RUN_TOOL] Using server-local tool code for {tool_name} from {candidate}; "
-                        "client-sent code was stale or different"
-                    )
+                logger.info("[ToolResolution] tool=%s source=local_fallback", tool_name)
                 return server_tool_code
             except Exception as e:
                 logger.warning(f"Failed to read local tool {candidate}: {e}")
 
-    return client_tool_code or ''
+    logger.warning("[ToolResolution] tool=%s source=unavailable", tool_name)
+    return ''
 
 
 def fetch_pr_tools_from_github(pr, repo) -> list:
@@ -4507,7 +4225,8 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
                     'code': code,
                     'language': language,
                     'branch_name': branch_name,
-                    'is_production': True
+                    'is_production': True,
+                    'source': 'github_branch',
                 })
                 logger.info(f"Added production tool: {tool_name} from {file_info['path']} (branch {branch_name})")
             except Exception as e:
@@ -5008,8 +4727,8 @@ Return ONLY a valid JSON object:
 
 def should_mention_copilot(text: str) -> bool:
     """
-    Determine if the text is asking for code changes (should mention @copilot)
-    vs just status updates or issue selection (should not mention @copilot).
+    Determine if the text is asking for code changes that should trigger Claude
+    vs just status updates or issue selection.
     
     Args:
         text: The comment text to analyze
@@ -5046,34 +4765,34 @@ def should_mention_copilot(text: str) -> bool:
         if keyword in text_lower:
             return True
     
-    # Default: always mention @copilot so it stays aware of issue updates.
+    # Default: keep the active code agent aware of issue updates.
     return True
 
 
-def build_copilot_comment(comment_text: str, trigger_required: bool) -> tuple[str, bool]:
-    """Build a comment, adding one leading Copilot mention when required."""
-    if not trigger_required or re.search(r'(?i)(?<![\w-])@copilot\b', comment_text):
+def build_copilot_comment(
+    comment_text: str,
+    trigger_required: bool,
+    provider: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Build an agent-triggering comment while preserving the legacy helper name."""
+    mention = '@claude'
+    if not trigger_required or re.search(
+        rf'(?i)(?<![\w-]){re.escape(mention)}\b', comment_text
+    ):
         return comment_text, False
-    return f"@copilot\n\n{comment_text}", True
-
-
-def is_copilot_target(issue) -> bool:
-    """Return whether an existing GitHub issue/PR belongs to a Copilot workflow."""
-    identities = [getattr(getattr(issue, 'user', None), 'login', '')]
-    identities.extend(getattr(assignee, 'login', '') for assignee in (getattr(issue, 'assignees', None) or []))
-    labels = [getattr(label, 'name', '') for label in (getattr(issue, 'labels', None) or [])]
-    return any('copilot' in str(value).lower() for value in (*identities, *labels))
+    return f"{mention}\n\n{comment_text}", True
 
 
 async def update_github_issue(issue_number: int, comment_text: str, mention_copilot: bool = True):
     """
     Add a comment to an existing GitHub issue or PR.
-    Optionally mentions @copilot in the comment to get Copilot's attention.
+    Optionally mention the active code agent to trigger implementation work.
     
     Args:
         issue_number: The issue or PR number to update
         comment_text: The comment to add
-        mention_copilot: Whether to add @copilot mention (True for code changes, False for status updates)
+        mention_copilot: Whether to trigger the agent (True for code changes,
+            False for status updates). The name is retained for compatibility.
     """
     _log_to_all_sessions("INFO", f"update_github_issue called: issue/PR #{issue_number}, comment: {comment_text}, mention_copilot: {mention_copilot}")
     
@@ -5089,12 +4808,33 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
 
         is_pr = issue.pull_request is not None
         target_kind = "PR" if is_pr else "issue"
-        trigger_required = mention_copilot and is_copilot_target(issue)
-        final_comment, mention_added = build_copilot_comment(comment_text, trigger_required)
+        # Claude should continue an existing PR, not start a second issue run.
+        pr_number = issue_number if is_pr else None
+        pr_url = issue.html_url if is_pr else None
+        associated_pr = None
+        if not is_pr:
+            try:
+                pulls = repo.get_pulls(state='open')
+                for pr in pulls:
+                    if f"#{issue_number}" in f"{pr.title} {pr.body or ''}":
+                        associated_pr = pr
+                        pr_number = pr.number
+                        pr_url = pr.html_url
+                        break
+            except Exception as e:
+                _log_to_all_sessions("WARNING", f"Could not find PR for issue #{issue_number}: {e}")
+                logger.warning(f"Could not find PR for issue #{issue_number}: {e}")
+
+        trigger_required = mention_copilot
+        issue_trigger_required = trigger_required and associated_pr is None
+        final_comment, mention_added = build_copilot_comment(
+            comment_text,
+            issue_trigger_required if not is_pr else trigger_required,
+        )
         preview = ' '.join(final_comment.split())[:240]
         decision_log = (
             f"GitHub comment decision: target={target_kind} #{issue_number}, "
-            f"copilot_trigger_required={trigger_required}, "
+            f"agent=claude, trigger_required={trigger_required}, "
             f"mention_added_automatically={mention_added}, preview={preview!r}"
         )
         _log_to_all_sessions("INFO", decision_log)
@@ -5102,31 +4842,22 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         
         # Add comment to the issue/PR
         issue.create_comment(final_comment)
-        _log_to_all_sessions("INFO", f"GitHub API: Added comment to #{issue_number}" + (" with @copilot mention" if trigger_required else ""))
-        logger.info(f"Added comment to #{issue_number}" + (" with @copilot mention" if trigger_required else ""))
+        trigger_note = " with code-agent mention" if mention_added else ""
+        _log_to_all_sessions("INFO", f"GitHub API: Added comment to #{issue_number}{trigger_note}")
+        logger.info(f"Added comment to #{issue_number}{trigger_note}")
         
-        # Check if this is a PR (pull_request attribute exists) or an issue
-        pr_number = issue_number if is_pr else None
-        pr_url = issue.html_url if is_pr else None
-        
-        # If it's an issue (not a PR), try to find an associated PR
-        if not is_pr:
+        # Also preserve the update on the associated PR. For Claude, this is the
+        # sole triggering mention so the same request cannot start two runs.
+        if associated_pr is not None:
             try:
-                # Search for PR that references this issue
-                pulls = repo.get_pulls(state='open')
-                for pr in pulls:
-                    # Check if PR body or title references this issue
-                    if pr.body and f"#{issue_number}" in pr.body:
-                        pr_number = pr.number
-                        pr.create_issue_comment(final_comment)
-                        pr_url = pr.html_url
-                        _log_to_all_sessions("INFO", f"GitHub API: Added comment to associated PR #{pr_number}" + (" with @copilot mention" if trigger_required else ""))
-                        logger.info(f"Added comment to associated PR #{pr_number}" + (" with @copilot mention" if trigger_required else ""))
-                        break
+                pr_comment, _ = build_copilot_comment(comment_text, trigger_required)
+                associated_pr.create_issue_comment(pr_comment)
+                _log_to_all_sessions("INFO", f"GitHub API: Added comment to associated PR #{pr_number}")
+                logger.info(f"Added comment to associated PR #{pr_number}")
             except Exception as e:
                 _log_to_all_sessions("WARNING", f"Could not add comment to PR for issue #{issue_number}: {e}")
                 logger.warning(f"Could not add comment to PR for issue #{issue_number}: {e}")
-        
+
         # Send success notification to client
         if connected_clients:
             success_data = {
@@ -5138,8 +4869,7 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 'pr_url': pr_url
             }
             await _broadcast_ws(success_data)
-            # @copilot was mentioned in the comment — no automatic log streaming.
-            # Copilot session logs are only streamed when the user explicitly requests them.
+            # Detailed Claude logs remain authoritative in GitHub Actions.
         
     except Exception as e:
         import traceback
@@ -5183,23 +4913,17 @@ Extract only these user-facing fields:
 - description: the task the tool performs
 - example_usage: expected output
 - additional: constraints and examples
-- execution_mode: exactly "take_photo", "hosted_video_streaming", or empty when unstated
+- streaming_context: "latest_frame", "recent_history", or empty when unstated
 - missing_fields: only missing important fields
 
 Only block creation when the core task is genuinely unclear.
 - Tool name, task, and expected output are the core fields.
-- Constraints/examples and execution_mode may be empty when unstated.
-- Classify a task as "hosted_video_streaming" only when its answer explicitly
-  requires evidence across multiple moments: recent history, sequence, duration,
-  before/after comparison, state change, or what just happened.
-- A task answerable from the current frame is "take_photo", even when the user
-  may run it continuously. Static identification, recognition, OCR, description,
-  and classification do not become temporal merely because Streaming is available.
-- If correct interpretation may require several recent frames, classify the
-  whole tool as temporal even when some examples can be recognized statically.
-  In particular, a sign-language request involving recent hand movement, a sign
-  lasting several seconds, or the sign/phrase just made is temporal. A request
-  to identify only the current held hand posture is static.
+- Constraints/examples and streaming_context may be empty when unstated.
+- Use "recent_history" only when Streaming needs evidence across multiple
+  moments: sequence, duration, before/after comparison, state change, or what
+  just happened. Otherwise use "latest_frame".
+- This field describes Streaming frame needs, not the modes supported by the
+  whole tool. New tools normally support both Take Photo and Streaming.
 - Do not generate or improve a VLM prompt.
 - Do not return stages, subtasks, reasoning steps, capabilities, routes, or models.
 
@@ -5210,7 +4934,7 @@ Return ONLY this JSON object:
   "description": "...",
   "example_usage": "...",
   "additional": "...",
-  "execution_mode": "...",
+  "streaming_context": "...",
   "missing_fields": []
 }}
 {context_info}
@@ -5232,14 +4956,18 @@ def _request_explicitly_requires_temporal_context(text: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in temporal_patterns)
 
 
-def _select_visual_execution_mode(suggested_mode: Any, original_request: str) -> str:
-    """Normalize the parser suggestion while preventing explicit temporal downgrades."""
+def _select_streaming_context(suggested_context: Any, original_request: str) -> str:
+    """Normalize the frame context needed by Streaming."""
     if _request_explicitly_requires_temporal_context(original_request):
-        return 'hosted_video_streaming'
-    normalized = str(suggested_mode or '').strip().lower()
-    aliases = {'take-photo': 'take_photo', 'streaming': 'hosted_video_streaming'}
+        return 'recent_history'
+    normalized = str(suggested_context or '').strip().lower().replace('-', '_')
+    aliases = {
+        'take_photo': 'latest_frame',
+        'hosted_video_streaming': 'recent_history',
+        'streaming': 'recent_history',
+    }
     normalized = aliases.get(normalized, normalized)
-    return normalized if normalized in {'take_photo', 'hosted_video_streaming'} else 'take_photo'
+    return normalized if normalized in {'latest_frame', 'recent_history'} else 'latest_frame'
 
 
 def _normalize_issue_creation_requirements(
@@ -5248,9 +4976,12 @@ def _normalize_issue_creation_requirements(
 ) -> Dict[str, Any]:
     normalized = dict(parsed_data)
     explicit_custom_gpt = _explicit_custom_gpt_value(transcript)
-    execution_mode = str(normalized.get('execution_mode') or '').strip().lower()
-    mode_custom_gpt = 'no' if execution_mode in {
-        'take_photo', 'hosted_video_streaming', 'take-photo', 'streaming'
+    streaming_context = str(
+        normalized.get('streaming_context') or normalized.get('execution_mode') or ''
+    ).strip().lower()
+    mode_custom_gpt = 'no' if streaming_context in {
+        'latest_frame', 'recent_history', 'take_photo',
+        'hosted_video_streaming', 'take-photo', 'streaming'
     } else ''
     parsed_custom_gpt = mode_custom_gpt or _normalize_custom_gpt_value(
         normalized.get('custom_gpt') or normalized.get('live_mode')
@@ -5288,23 +5019,27 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
     """
     try:
         issue_prompt = _build_issue_extraction_prompt(transcript, existing_data)
+        logger.info("Issue extraction transcript=%s", transcript)
         issue_response = system_llm_call(
             messages=[{'role': 'user', 'content': issue_prompt}],
             metadata={'response_format': {'type': 'json_object'}},
         )
         issue_raw = extract_text(issue_response)
+        logger.info("Issue extraction raw output=%s", issue_raw)
         issue_data = _parse_llm_json_object(issue_raw)
         logger.info(
-            "Issue extraction output=%s",
+            "Issue extraction parsed output=%s",
             json.dumps(issue_data, ensure_ascii=False),
         )
 
         parsed_data = _normalize_issue_creation_requirements(issue_data, transcript)
         prior_requests = (existing_data or {}).get('original_prompts', [])
         mode_semantics = '\n'.join([*(str(item) for item in prior_requests), transcript])
-        parsed_data['execution_mode'] = _select_visual_execution_mode(
-            issue_data.get('execution_mode'), mode_semantics
+        parsed_data['streaming_context'] = _select_streaming_context(
+            issue_data.get('streaming_context') or issue_data.get('execution_mode'),
+            mode_semantics,
         )
+        parsed_data.pop('execution_mode', None)
         parsed_data['stages'] = []
         
         # Preserve the original transcript for bookkeeping
@@ -5320,15 +5055,13 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
     except Exception as e:
         logger.exception("Failed to complete issue extraction")
         _log_to_all_sessions("ERROR", f"Issue parser workflow failed: {e}")
-        # Fallback to simple parsing
+        # Preserve the complete request when structured extraction fails. This
+        # is intentionally redundant across Task and Expected output: losing
+        # user intent is worse than asking the code agent to interpret the
+        # original wording in both required sections.
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         fallback_custom_gpt = _normalize_custom_gpt_value(transcript)
-        fallback_missing_fields = []
-        if not fallback_custom_gpt:
-            fallback_missing_fields = ['custom_gpt']
-        elif fallback_custom_gpt == 'yes' and not (existing_data or {}).get('gpt_query'):
-            fallback_missing_fields = ['gpt_query']
         return {
             'type': 'visual AT',
             'title': transcript[:100],
@@ -5336,17 +5069,47 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
             'problem': '',
             'solution': '',
             'implementation_details': '',
-            'example_usage': '',
+            'example_usage': transcript,
             'custom_gpt': fallback_custom_gpt,
             'gpt_query': '',
             'alternatives': '',
             'additional': '',
-            'execution_mode': _select_visual_execution_mode('', transcript),
-            'parser_failed': True,
+            'streaming_context': _select_streaming_context('', transcript),
+            'parser_fallback': True,
             'parser_error': str(e),
-            'missing_fields': fallback_missing_fields,
+            'missing_fields': [],
             'original_prompts': existing_prompts + [f"[{timestamp}] {transcript}"]
         }
+
+
+def _original_request_fallback(parsed_data: dict) -> str:
+    """Return preserved user wording suitable for a required issue field."""
+    prompts = parsed_data.get('original_prompts') or []
+    cleaned = []
+    for prompt in prompts:
+        text = re.sub(r'^\[[^\]]+\]\s*', '', str(prompt or '')).strip()
+        if text:
+            cleaned.append(text)
+    return '\n'.join(cleaned).strip()
+
+
+def _replace_issue_section(body: str, heading: str, value: str) -> str:
+    """Fill one issue field by heading instead of a fragile comment key."""
+    pattern = rf'(^## {re.escape(heading)}\s*\n\n).*?(?=^## |\Z)'
+    replacement = lambda match: f"{match.group(1)}{value.strip()}\n\n"
+    return re.sub(pattern, replacement, body, count=1, flags=re.MULTILINE | re.DOTALL)
+
+
+def _issue_section_content(body: str, heading: str) -> str:
+    """Read visible content from one generated issue section."""
+    match = re.search(
+        rf'^## {re.escape(heading)}\s*\n\n(.*?)(?=^## |\Z)',
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return ''
+    return re.sub(r'<!--.*?-->', '', match.group(1), flags=re.DOTALL).strip()
 
 
 def fill_template(template_content: str, parsed_data: dict) -> str:
@@ -5370,16 +5133,23 @@ def fill_template(template_content: str, parsed_data: dict) -> str:
             return ''
         return str(value)
 
-    filled = filled.replace('<!-- A short Python-friendly name for the tool. -->',
-                            ensure_string(parsed_data.get('title', '')))
-    filled = filled.replace('<!-- What should the tool determine from the camera image? -->',
-                            ensure_string(parsed_data.get('description', '')))
-    filled = filled.replace('<!-- What should the spoken answer contain? -->',
-                            ensure_string(parsed_data.get('example_usage', '')))
-    filled = filled.replace('<!-- Important constraints, edge cases, and example inputs or answers. -->',
-                            ensure_string(parsed_data.get('additional', '')))
-    filled = filled.replace('<!-- Enter exactly: take_photo or hosted_video_streaming. -->',
-                            ensure_string(parsed_data.get('execution_mode', '')))
+    fallback = _original_request_fallback(parsed_data)
+    task = ensure_string(parsed_data.get('description', '')).strip() or fallback
+    expected_output = (
+        ensure_string(parsed_data.get('example_usage', '')).strip() or fallback
+    )
+    fields = {
+        'Tool name': ensure_string(parsed_data.get('title', '')).strip(),
+        'Task': task,
+        'Expected output': expected_output,
+        'Constraints / examples': ensure_string(parsed_data.get('additional', '')).strip(),
+        'Streaming context': ensure_string(
+            parsed_data.get('streaming_context')
+            or parsed_data.get('execution_mode', '')
+        ).strip(),
+    }
+    for heading, value in fields.items():
+        filled = _replace_issue_section(filled, heading, value)
     
     # Inject original prompts into the ORIGINAL_PROMPTS comment block
     original_prompts = parsed_data.get('original_prompts', [])
@@ -5581,6 +5351,8 @@ async def _broadcast_ws(data: dict) -> None:
                 logger.warning(f"Failed to broadcast to client: {result}")
 
 
+
+
 async def create_github_issue(text: str):
     """
     Create a GitHub issue OR update an existing one based on selected mode.
@@ -5613,9 +5385,9 @@ async def create_github_issue(text: str):
         
         if selected_issue['mode'] == 'update' and selected_issue['number']:
             logger.info(f"Already in update mode for issue #{selected_issue['number']}, adding comment")
-            # Determine if we should mention @copilot based on the comment content
+            # Determine if this is an agent-triggering code update.
             mention_copilot = should_mention_copilot(text.strip())
-            logger.info(f"Comment mentions copilot: {mention_copilot}")
+            logger.info(f"Comment triggers code agent: {mention_copilot}")
             await update_github_issue(selected_issue['number'], text.strip(), mention_copilot)
             return
         
@@ -5791,20 +5563,25 @@ async def create_github_issue(text: str):
             # Fallback if template doesn't exist
             body = f"**Transcript:**\n{text}\n\n**Parsed Data:**\n{json.dumps(parsed_data, indent=2)}"
 
+        empty_required_sections = [
+            heading for heading in ('Task', 'Expected output')
+            if not _issue_section_content(body, heading)
+        ]
+        if empty_required_sections:
+            raise ValueError(
+                "Refusing to create issue with empty required sections: "
+                + ", ".join(empty_required_sections)
+            )
+
         # Create GitHub client
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO)
         
-        # Create issue with parsed title and filled template
-        title = parsed_data.get('title', text[:100])
-        
-        # Ensure title is a string (AI might return unexpected formats)
-        if isinstance(title, list):
-            title = ' '.join(str(item) for item in title)
-        elif not isinstance(title, str):
-            title = str(title)
-        
-        # Truncate title if too long (GitHub has a limit)
+        # Create issue with parsed title and filled template.
+        # The parser occasionally leaves title blank, so always normalize
+        # through a fallback chain before calling GitHub.
+        title = _fallback_issue_title(parsed_data, text)
+
         if len(title) > 256:
             title = title[:253] + '...'
         
@@ -5828,6 +5605,8 @@ async def create_github_issue(text: str):
         issue_cache['last_fetch'] = datetime.now()
         _log_to_all_sessions("INFO", f"GitHub API: Created issue #{issue.number}: {title} (url: {issue.html_url})")
         logger.info(f"Created GitHub issue #{issue.number}: {title[:50]}... (type: {issue_type})")
+
+        issue.add_to_labels('ready-for-claude')
         
         # Send success notification to client
         if connected_clients:
@@ -5839,7 +5618,6 @@ async def create_github_issue(text: str):
             }
             await _broadcast_ws(success_data)
             
-            # Start polling for Copilot session for each connected client
             for ws in connected_clients:
                 try:
                     ws_client_id = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
@@ -5856,9 +5634,9 @@ async def create_github_issue(text: str):
                     asyncio.create_task(
                         poll_for_copilot_session(issue.number, ws, ws_client_id)
                     )
-                    logger.info(f"Started Copilot session polling for issue #{issue.number}")
+                    logger.info(f"Started Claude PR polling for issue #{issue.number}")
                 except Exception as e:
-                    logger.error(f"Error starting Copilot poll for client: {e}")
+                    logger.error(f"Error starting Claude poll for client: {e}")
         
     except Exception as e:
         import traceback
@@ -6445,17 +6223,17 @@ async def handle_update_submit(request: web.Request) -> web.Response:
 
     # --- Post to GitHub ---
     try:
-        # Always @copilot on updates so it stays aware of new context/video summaries.
-        final_comment = f"{comment}\n\n@copilot"
+        # Reuse the normal update path so Claude is triggered on an associated
+        # open PR (when present) instead of starting duplicate issue work.
+        await update_github_issue(int(issue_number), comment, mention_copilot=True)
 
-        def _post_comment():
+        def _get_issue_url():
             g = Github(GITHUB_TOKEN)
             repo = g.get_repo(GITHUB_REPO)
             issue = repo.get_issue(int(issue_number))
-            issue.create_comment(final_comment)
             return issue.html_url
 
-        issue_url = await asyncio.to_thread(_post_comment)
+        issue_url = await asyncio.to_thread(_get_issue_url)
         logger.info("Posted comment to issue #%s via /submit-update", issue_number)
 
         await _broadcast_ws({
@@ -6791,6 +6569,7 @@ async def handle_client(websocket):
                         tool_name=data.get('tool_name', ''),
                         tool_path=data.get('tool_path', ''),
                         client_tool_code=data.get('tool_code', ''),
+                        client_tool_source=data.get('tool_source', ''),
                     )
                     execution_mode = _tool_execution_mode(tool_code)
                     data = dict(data, tool_code=tool_code)
@@ -6841,13 +6620,10 @@ async def handle_client(websocket):
                     custom_gpt = False
                     tool_name = data.get('tool_name', 'unknown')
                     tool_path = data.get('tool_path', '')
-                    tool_code = resolve_tool_code_for_execution(
-                        tool_name=tool_name,
-                        tool_path=tool_path,
-                        client_tool_code=data.get('tool_code', ''),
-                    )
                     
                     previous_config = active_streaming_tools.get(client_id)
+                    if previous_config is not None:
+                        await _stop_executable_streaming_tool(previous_config)
                     previous_task = previous_config.get('cascade_task') if previous_config else None
                     if previous_task is not None and not previous_task.done():
                         previous_task.cancel()
@@ -6892,6 +6668,32 @@ async def handle_client(websocket):
                         active_streaming_tools[client_id]['forced_key_frame_interval_seconds'],
                         active_streaming_tools[client_id]['min_stable_confirmations'],
                     )
+                    if has_executable_lifecycle(tool_code):
+                        try:
+                            await _initialize_executable_streaming_tool(
+                                websocket, client_id, active_streaming_tools[client_id]
+                            )
+                            logger.info(
+                                "[GeneratedTool] executable streaming lifecycle active "
+                                "client=%s tool=%s",
+                                client_id,
+                                tool_name,
+                            )
+                        except Exception as exc:
+                            active_streaming_tools[client_id]["cancelled"] = True
+                            del active_streaming_tools[client_id]
+                            logger.exception(
+                                "[GeneratedTool] stream initialization failed tool=%s",
+                                tool_name,
+                            )
+                            await websocket.send(json.dumps({
+                                "type": "tool_stream_result",
+                                "tool_name": tool_name,
+                                "status": "error",
+                                "result": f"Unable to start generated tool: {exc}",
+                                "timestamp": datetime.now().isoformat(),
+                            }))
+                            continue
                     
                     # Custom GPT mode: use Gemini Live instead of code execution
                     if custom_gpt and gpt_query and gemini_live_manager:
@@ -6999,7 +6801,9 @@ async def handle_client(websocket):
                         if not old_task.done():
                             old_task.cancel()
                     if client_id in active_streaming_tools:
-                        stopping_config = active_streaming_tools[client_id]
+                        # Remove the registration first so frame dispatch and emit
+                        # callbacks reject this session while cleanup is in flight.
+                        stopping_config = active_streaming_tools.pop(client_id)
                         tool_name = stopping_config['tool']['name']
                         cascade_task = stopping_config.get('cascade_task')
                         if cascade_task is not None and not cascade_task.done():
@@ -7007,11 +6811,12 @@ async def handle_client(websocket):
                         debounce_task = stopping_config.get('debounce_task')
                         if debounce_task is not None and not debounce_task.done():
                             debounce_task.cancel()
+                        _obsolete_progressive_invocation(client_id, tool_name)
+                        await _stop_executable_streaming_tool(stopping_config)
                         # Clean up Gemini Live session if active
-                        if active_streaming_tools[client_id].get('gemini_live') and gemini_live_manager:
+                        if stopping_config.get('gemini_live') and gemini_live_manager:
                             await gemini_live_manager.stop_session(client_id)
                             logger.info(f"Stopped Gemini Live session for {client_id}")
-                        del active_streaming_tools[client_id]
                         
                         await websocket.send(json.dumps({
                             'type': 'streaming_stopped',
@@ -7501,14 +7306,24 @@ async def handle_client(websocket):
                         last_frame['image'] is not None
                         and client_id in active_streaming_tools
                     ):
-                        logger.debug("[Streaming] frame received; scheduling client=%s", client_id)
-                        await _dispatch_active_streaming_frame(
-                            websocket,
-                            client_id,
-                            last_frame['image'],
-                            data_field['base64Image'],
-                            frame_timestamp,
-                        )
+                        tool_config = active_streaming_tools[client_id]
+                        if tool_config.get("executable_lifecycle"):
+                            await _dispatch_executable_tool_frame(
+                                client_id,
+                                tool_config,
+                                last_frame["image"],
+                                data_field["base64Image"],
+                                frame_timestamp,
+                            )
+                        else:
+                            logger.debug("[Streaming] frame received; scheduling client=%s", client_id)
+                            await _dispatch_active_streaming_frame(
+                                websocket,
+                                client_id,
+                                last_frame['image'],
+                                data_field['base64Image'],
+                                frame_timestamp,
+                            )
                     elif last_frame['image'] is None:
                         logger.debug(f"No image available for {client_id}")
                     elif client_id not in active_streaming_tools:
@@ -7614,11 +7429,13 @@ async def handle_client(websocket):
                 if data.get('type') == 'run_tool':
                     logger.info(f"Client {client_id} requested tool execution: {data.get('tool_name')}")
                     tool_name = data.get('tool_name', 'unknown')
+                    _obsolete_progressive_invocation(client_id, tool_name)
                     tool_path = data.get('tool_path', '')
                     tool_code = resolve_tool_code_for_execution(
                         tool_name=tool_name,
                         tool_path=tool_path,
                         client_tool_code=data.get('tool_code', ''),
+                        client_tool_source=data.get('tool_source', ''),
                     )
                     tool_language = data.get('tool_language', 'python')
                     tool_input = data.get('input', '')
@@ -7660,11 +7477,7 @@ async def handle_client(websocket):
                     if tool_language == 'python' and tool_code:
                         image_context_token = None
                         try:
-                            resolved_tool_code = resolve_tool_code_for_execution(
-                                tool_name=tool_name,
-                                tool_path=tool_path,
-                                client_tool_code=tool_code,
-                            )
+                            resolved_tool_code = tool_code
                             # Use frame from message if provided, otherwise use last streaming frame
                             frame_image = None
                             frame_base64 = None
@@ -7736,6 +7549,38 @@ async def handle_client(websocket):
                                 
                                 frame_image = last_frame['image']
                                 frame_base64 = last_frame['base64']
+
+                            if has_executable_lifecycle(resolved_tool_code):
+                                lifecycle_result, emitted_count = await _run_executable_take_photo(
+                                    websocket,
+                                    client_id,
+                                    tool_name,
+                                    resolved_tool_code,
+                                    frame_image,
+                                    frame_base64 or "",
+                                    parsed_input,
+                                )
+                                if lifecycle_result is not None and emitted_count == 0:
+                                    response_data = _build_mobile_tool_response(
+                                        'tool_result',
+                                        tool_name,
+                                        lifecycle_result,
+                                        datetime.now(),
+                                    )
+                                    _log_final_tool_response(tool_name, response_data)
+                                    await websocket.send(json.dumps(response_data))
+                                continue
+
+                            if _is_progressive_tool_policy(resolved_tool_code):
+                                await _start_progressive_invocation(
+                                    websocket,
+                                    client_id,
+                                    tool_name,
+                                    resolved_tool_code,
+                                    frame_image,
+                                    'take-photo',
+                                )
+                                continue
 
                             vlm_result = await asyncio.to_thread(
                                 _run_take_photo_vlm,
@@ -7949,10 +7794,12 @@ async def handle_client(websocket):
         # Clean up streaming tools for this client
         if client_id in active_streaming_tools:
             logger.info(f"Stopping streaming tool for disconnected client {client_id}")
+            await _stop_executable_streaming_tool(active_streaming_tools[client_id])
             # Clean up Gemini Live session if active
             if active_streaming_tools[client_id].get('gemini_live') and gemini_live_manager:
                 await gemini_live_manager.stop_session(client_id)
             del active_streaming_tools[client_id]
+        _obsolete_client_progressive_invocations(client_id)
         # Clean up any active Copilot streams for this client
         if client_id in active_copilot_streams:
             logger.info(f"Stopping Copilot stream for disconnected client {client_id}")
@@ -8034,161 +7881,6 @@ monitored_sessions = set()  # Track session IDs we're already monitoring
 monitored_prs = set()  # Track PR numbers we've checked
 
 
-async def monitor_copilot_sessions():
-    """
-    Background task to continuously monitor for new Copilot sessions and capture their logs.
-    Checks:
-    1. All open PRs for Copilot agent tasks
-    2. Recent @copilot comments that spawn sessions
-    3. Any active sessions we haven't captured yet
-    
-    This ensures we have historical logs for all sessions, even if no one explicitly requests them.
-    """
-    global monitored_sessions, monitored_prs
-    
-    if not GITHUB_TOKEN:
-        logger.warning("GitHub token not available, skipping Copilot session monitoring")
-        return
-    
-    logger.info("Starting background Copilot session monitoring")
-    check_interval = 60  # Check every minute
-    
-    # Create clean environment for gh CLI
-    env = os.environ.copy()
-    env.pop('GH_TOKEN', None)
-    env.pop('GITHUB_TOKEN', None)
-    
-    while True:
-        try:
-            await asyncio.sleep(check_interval)
-            
-            g = Github(GITHUB_TOKEN)
-            repo = g.get_repo(GITHUB_REPO)
-            
-            # 1. Check all open PRs for Copilot sessions
-            pulls = repo.get_pulls(state='open', sort='updated', direction='desc')
-            for pr in list(pulls)[:20]:  # Check 20 most recently updated PRs
-                if pr.number in monitored_prs:
-                    continue  # Already checked this PR
-                
-                try:
-                    # Check if PR has Copilot agent activity (created by copilot or mentions copilot)
-                    is_copilot_pr = (
-                        pr.user.login == 'github-actions[bot]' or
-                        'copilot' in (pr.title + (pr.body or '')).lower() or
-                        any('copilot' in comment.body.lower() for comment in pr.get_issue_comments()[:10])
-                    )
-                    
-                    if is_copilot_pr:
-                        logger.info(f"Found potential Copilot PR #{pr.number}: {pr.title}")
-                        
-                        # Try to find session ID for this PR
-                        proc = await asyncio.create_subprocess_exec(
-                            'gh', 'agent-task', 'view',
-                            str(pr.number),
-                            '-R', GITHUB_REPO,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=env
-                        )
-                        stdout, stderr = await proc.communicate()
-                        output = stdout.decode('utf-8', errors='replace')
-                        
-                        # Extract session ID from output
-                        import re
-                        uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-                        matches = re.findall(uuid_pattern, output)
-                        
-                        if matches:
-                            session_id = matches[0]
-                            if session_id not in monitored_sessions:
-                                logger.info(f"Starting background capture for session {session_id} (PR #{pr.number})")
-                                monitored_sessions.add(session_id)
-                                monitored_prs.add(pr.number)
-                                
-                                # Start background log capture (no websocket needed)
-                                asyncio.create_task(
-                                    capture_session_logs_background(session_id, pr.number)
-                                )
-                        else:
-                            # Mark as checked even if no session found
-                            monitored_prs.add(pr.number)
-                            
-                except Exception as e:
-                    logger.warning(f"Error checking PR #{pr.number} for Copilot session: {e}")
-            
-            # 2. Check for recent @copilot comments
-            # Get recent issue comments (issues include PRs in GitHub API)
-            issues = repo.get_issues(state='open', sort='updated', direction='desc')
-            for issue in list(issues)[:30]:  # Check 30 most recent
-                try:
-                    comments = issue.get_comments()
-                    for comment in list(comments)[-5:]:  # Last 5 comments
-                        if '@copilot' in comment.body.lower():
-                            # This might have spawned a session
-                            pr_number = issue.number if issue.pull_request else None
-                            if pr_number and pr_number not in monitored_prs:
-                                logger.info(f"Found @copilot comment in PR #{pr_number}, checking for session...")
-                                monitored_prs.add(pr_number)
-                                
-                                # Check for session (same logic as above)
-                                proc = await asyncio.create_subprocess_exec(
-                                    'gh', 'agent-task', 'view',
-                                    str(pr_number),
-                                    '-R', GITHUB_REPO,
-                                    stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.PIPE,
-                                    env=env
-                                )
-                                stdout, stderr = await proc.communicate()
-                                output = stdout.decode('utf-8', errors='replace')
-                                
-                                matches = re.findall(uuid_pattern, output)
-                                if matches:
-                                    session_id = matches[0]
-                                    if session_id not in monitored_sessions:
-                                        logger.info(f"Starting background capture for @copilot session {session_id} (PR #{pr_number})")
-                                        monitored_sessions.add(session_id)
-                                        asyncio.create_task(
-                                            capture_session_logs_background(session_id, pr_number)
-                                        )
-                except Exception as e:
-                    logger.warning(f"Error checking issue #{issue.number} for @copilot comments: {e}")
-            
-            logger.debug(f"Background monitor: Tracking {len(monitored_sessions)} sessions, {len(monitored_prs)} PRs")
-            
-        except Exception as e:
-            logger.error(f"Error in monitor_copilot_sessions: {e}", exc_info=True)
-            await asyncio.sleep(check_interval)
-
-
-async def capture_session_logs_background(session_id: str, pr_number: int):
-    """
-    Capture logs for a Copilot session in the background (no WebSocket client needed).
-    Stores everything in the database for later retrieval.
-    
-    Args:
-        session_id: Copilot session ID
-        pr_number: Associated PR number
-    """
-    global monitored_sessions
-    
-    logger.info(f"Background log capture started for session {session_id} (PR #{pr_number})")
-    
-    try:
-        # Create session in database
-        copilot_db.create_session(session_id, pr_number)
-        
-        # Fetch and store historical logs
-        await fetch_and_store_session_logs(session_id, pr_number)
-        
-        logger.info(f"Background log capture completed for session {session_id}")
-        
-    except Exception as e:
-        logger.error(f"Error in background log capture for session {session_id}: {e}")
-    finally:
-        # Keep session in monitored_sessions so we don't try to capture it again
-        pass
 
 
 async def main():
@@ -8198,7 +7890,6 @@ async def main():
     logger.info(f"Starting backend server on {HOST}:{PORT}")
     logger.info(f"Frame saving: {'enabled' if SAVE_FRAMES else 'disabled'}")
     logger.info(f"GitHub issue creation: {'enabled' if GITHUB_TOKEN else 'disabled'}")
-
     logger.info(
         "[Streaming] streaming_executor=%s nvidia_hosted_active=%s "
         "streaming_policy=%s",
@@ -8230,7 +7921,6 @@ async def main():
     # Start background tasks independently for resilience
     asyncio.create_task(broadcast_stats())
     asyncio.create_task(monitor_text_pause())
-    # Background Copilot monitoring disabled - we poll specific PRs when user comments with @copilot
 
     # Keep server running
     try:

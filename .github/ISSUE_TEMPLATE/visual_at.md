@@ -15,69 +15,26 @@ assignees: ''
 
 ## Task
 
-<!-- What should the tool determine from the camera image? -->
+<!-- What should the tool determine from the camera image or recent frames? -->
 
 ## Expected output
 
-<!-- What should the spoken answer contain? -->
+<!-- What should the concise spoken answer contain? -->
 
 ## Constraints / examples
 
 <!-- Important constraints, edge cases, and example inputs or answers. -->
 
-## Mode
+## Streaming context
 
-<!-- Enter exactly: take_photo or hosted_video_streaming. -->
-<!-- This is a parser suggestion. Copilot must correct it if the preserved
-original request clearly requires a different visual context. -->
+<!-- Describe whether Streaming can use a changed latest frame or needs recent chronological frames. -->
 
-<!-- Use take_photo for a static current-frame task, even if it may be run
-continuously. Use hosted_video_streaming only when the answer requires recent
-history, sequence, duration, before/after comparison, or what just happened. -->
+## Implementation guidance
 
-### Take-photo implementation guidance
+Implement the requested behavior in one Python file in `tools/`. Normally support both Take Photo and Streaming with `on_take_photo`, `on_stream_start`, `on_frame`, and `on_stream_stop`. Define one concise, task-specific `TOOL_PROMPT` shared by both entry points. Default to one direct instruction; add ordered steps only when a later conclusion genuinely depends on earlier visual findings.
 
-For a take-photo tool, author one concise, task-specific `TOOL_PROMPT` from
-Task, Expected output, and Constraints / examples. Preserve the requested
-behavior and output format, make the final answer accessible and audio-friendly,
-and include a clear fallback when the requested visual information is unavailable.
-Before writing the prompt, determine whether the task can be completed as one
-operation or contains genuinely dependent subproblems. Default to no steps. If
-one operation is sufficient, use one direct instruction even when the issue has
-multiple output constraints. Do not create steps merely to restate the issue
-fields. Only when a later conclusion depends on earlier visual findings should
-the single fused prompt contain a concise ordered sequence; numbered instructions
-are optional when they improve reliability.
+Choose models, frame selection, call timing, orchestration, and output behavior explicitly in the tool. Take Photo receives one current image. Streaming should decide whether to process a changed latest frame or selected chronological history through the runtime frame APIs. Use runtime state, cancellation, and `runtime.emit` as needed. Keep results concise, speech-ready, accessible to blind and low-vision users, and honest about unavailable or uncertain visual evidence.
 
-The sequence must request only the final answer. Never turn prompt-level steps
-into runtime stages, multiple model calls, router stages, specialist calls,
-cascades, evaluators, or verification calls. Do not include capability names
-unless naturally needed.
+Tools belong in `tools/` and use Python. Keep output concise and audio-friendly for blind and low-vision users, state uncertainty when evidence is insufficient, and restrict clock-face navigation to 9–12 and 1–3. Modify only the requested tool file unless the public runtime is genuinely insufficient.
 
-Every take-photo tool must define exactly one `TOOL_PROMPT`, call
-`call_take_photo_vlm` exactly once, and return its answer directly.
-It must declare `EXECUTION_MODE = "take_photo"` and must not declare
-`VIDEO_CONFIG`. The same tool may be streamed as independent single-frame calls.
-
-### Hosted-video streaming implementation guidance
-
-For `hosted_video_streaming`, generate only `TOOL_NAME`, `EXECUTION_MODE =
-"hosted_video_streaming"`, required literal `VIDEO_CONFIG`, optional literal `OUTPUT_CONFIG`,
-and a task-specific `TOOL_PROMPT`. The shared runtime owns FFmpeg clip encoding,
-hosted NVIDIA requests,
-filtering, deduplication, result delivery, and cleanup. Do not generate frame
-processing, buffers, asynchronous loops, model calls, or take-photo imports.
-`VIDEO_CONFIG` must include valid `window_seconds`, `interval_seconds`,
-`minimum_span_seconds`, and `minimum_unique_frames`. `TOOL_PROMPT` must state
-what chronological or early/late state-change evidence to compare.
-Temporal input does not imply a before/after output schema. Prefer concise plain
-text for recognition tasks. Declare `played_card_event` only for played-card
-detection; never reuse its card fields for unrelated temporal tools.
-The same temporal `TOOL_PROMPT` is also used by Take Photo with one current
-image. It must use static evidence when available, never infer unseen motion,
-and return a task-specific uncertainty response when one frame is insufficient.
-
-Tools belong in `tools/` and must be Python. Static tools expose
-`main(image, input_data)`; temporal hosted-video tools contain only the
-declarative constants above. The shared runtime still supports Take Photo for
-both contracts. Do not connect to the backend server or use WebSockets.
+Do not access credentials, environment variables, arbitrary networks, subprocesses, unrestricted filesystem writes, backend-private state, or WebSockets. Detailed APIs and examples are in `.github/copilot-instructions.md`.
