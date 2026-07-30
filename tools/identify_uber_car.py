@@ -22,6 +22,16 @@ TOOL_PROMPT = (
     "If no car is visible or details cannot be determined, state what is uncertain."
 )
 
+NAVIGATION_PROMPT = (
+    "Guide a blind user to the passenger-side door of the vehicle at the center of the scene. "
+    "1. Identify where the passenger-side door is located relative to the camera view. "
+    "2. Provide the direction using clock-face position (9-12 or 1-3 only, restricted to what's visible in front of the camera). "
+    "3. Estimate approximate distance if possible (e.g., 'about 10 feet'). "
+    "4. Give concise walking instructions to reach the door handle. "
+    "Example: 'Passenger door is at your 2 o'clock, about 12 feet away. Walk forward and slightly right.' "
+    "If the passenger door is not visible or identifiable, state that clearly."
+)
+
 SCENE_SIMILARITY_THRESHOLD = 0.985
 
 
@@ -73,10 +83,13 @@ async def on_stream_start(runtime, input_data):
     del input_data
     runtime.set_state("scene_anchor", None)
     runtime.set_state("last_result", None)
+    runtime.set_state("navigation_mode", False)
+    runtime.set_state("vehicle_confirmed", False)
+    runtime.set_state("consecutive_same_vehicle_count", 0)
 
 
 async def on_frame(runtime, frame):
-    """Process changed latest frame to identify car details."""
+    """Process changed latest frame to identify car details or provide navigation."""
     if runtime.is_cancelled():
         return
 
@@ -85,13 +98,29 @@ async def on_frame(runtime, frame):
     anchor = runtime.get_state("scene_anchor")
 
     if anchor is not None and is_same_scene(anchor, embedding):
-        # Same scene, skip processing
+        # Same scene detected
+        # If we're in navigation mode and vehicle is confirmed, continue providing navigation
+        if runtime.get_state("navigation_mode") and runtime.get_state("vehicle_confirmed"):
+            # Process navigation for the stable scene
+            navigation_response = await asyncio.to_thread(
+                call_model,
+                "gemini/gemini-3.1-flash-lite-preview",
+                [{"role": "user", "content": NAVIGATION_PROMPT}],
+                [frame.image],
+                {"timeout": 60, "num_retries": 0},
+            )
+
+            if runtime.is_cancelled():
+                return
+
+            navigation_result = extract_text(navigation_response)
+            await runtime.emit(navigation_result, final=True)
         return
 
     # New scene detected, update anchor
     runtime.set_state("scene_anchor", embedding)
 
-    # Analyze the frame
+    # Analyze the frame for vehicle identification
     response = await asyncio.to_thread(
         call_model,
         "gemini/gemini-3.1-flash-lite-preview",
@@ -105,6 +134,26 @@ async def on_frame(runtime, frame):
 
     result = extract_text(response)
     last_result = runtime.get_state("last_result")
+
+    # Track consecutive same vehicle sightings to infer confirmation
+    if result == last_result and last_result is not None:
+        count = runtime.get_state("consecutive_same_vehicle_count", 0) + 1
+        runtime.set_state("consecutive_same_vehicle_count", count)
+
+        # After seeing the same vehicle details 3 times, assume confirmed and enter navigation mode
+        if count >= 3 and not runtime.get_state("vehicle_confirmed"):
+            runtime.set_state("vehicle_confirmed", True)
+            runtime.set_state("navigation_mode", True)
+            await runtime.emit(
+                f"{result} Vehicle confirmed. Switching to navigation mode.",
+                final=True
+            )
+            return
+    else:
+        # Different result, reset counter
+        runtime.set_state("consecutive_same_vehicle_count", 0)
+        runtime.set_state("vehicle_confirmed", False)
+        runtime.set_state("navigation_mode", False)
 
     # Only emit if result is different from last time
     if result != last_result:
