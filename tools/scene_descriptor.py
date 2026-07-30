@@ -37,25 +37,9 @@ STATE_FRAME_COUNT = "frame_count"
 STATE_LAST_DESCRIPTION = "last_description"
 
 # Configuration
-FRAMES_FOR_DETAILED = 3  # Number of consistent frames before detailed description
+FRAMES_FOR_DETAILED = 6  # Number of consistent frames before detailed description (increased from 3)
 SCENE_CHANGE_THRESHOLD = 0.4  # Scene similarity threshold (lower = more different)
-YOLO_CONFIDENCE = 0.5  # Confidence threshold for YOLO object detection
-
-# COCO class names for YOLO detection
-COCO_CLASSES = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
-    'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
-    'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
-    'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
-    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
-    'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
-    'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
-    'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
-    'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
-    'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
-    'toothbrush'
-]
+YOLO_CONFIDENCE = 0.3  # Confidence threshold for YOLO object detection (lowered for YOLO-World)
 
 
 def compute_scene_hash(image_base64: str) -> str:
@@ -101,21 +85,40 @@ def scene_similarity(hash1: str, hash2: str) -> float:
 
 def detect_objects_yolo(image: np.ndarray) -> List[Dict[str, Any]]:
     """
-    Detect objects using YOLO for fast brief descriptions.
+    Detect objects using YOLO-World for open-vocabulary detection.
+
+    YOLO-World can detect objects beyond COCO classes, making it much more
+    powerful for general scene understanding.
 
     Args:
         image: Input image as numpy array
 
     Returns:
-        List of detection dictionaries with class_id, class_name, confidence
+        List of detection dictionaries with class_name and confidence
     """
     detections = []
 
     try:
         from ultralytics import YOLO
 
-        # Load YOLOv11n (nano) for speed
-        model = YOLO('yolo11n.pt')
+        # Load YOLO-World model (yolov8s-world.pt for open-vocabulary detection)
+        # This model can detect many more objects than standard COCO-trained models
+        model = YOLO('yolov8s-world.pt')
+
+        # Set custom classes for YOLO-World to look for
+        # These are common indoor/outdoor objects a blind user might encounter
+        model.set_classes([
+            "person", "child", "man", "woman", "face", "hand",
+            "chair", "table", "desk", "couch", "sofa", "bed", "cabinet", "shelf",
+            "door", "window", "wall", "floor", "ceiling", "stairs", "elevator",
+            "phone", "laptop", "computer", "keyboard", "mouse", "monitor", "screen",
+            "cup", "mug", "bottle", "glass", "plate", "bowl", "fork", "knife", "spoon",
+            "book", "paper", "pen", "pencil", "bag", "backpack", "purse",
+            "car", "bus", "truck", "bicycle", "motorcycle", "traffic light", "sign",
+            "tree", "plant", "flower", "grass", "bench", "sidewalk", "road",
+            "cat", "dog", "bird", "animal",
+            "light", "lamp", "clock", "picture", "mirror", "television", "tv"
+        ])
 
         # Run inference
         results = model(image, conf=YOLO_CONFIDENCE, verbose=False)
@@ -124,20 +127,19 @@ def detect_objects_yolo(image: np.ndarray) -> List[Dict[str, Any]]:
         for result in results:
             boxes = result.boxes
             for box in boxes:
-                class_id = int(box.cls[0])
                 confidence = float(box.conf[0])
 
-                # Get class name
-                class_name = COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else f"object_{class_id}"
+                # Get class name from the model
+                class_id = int(box.cls[0])
+                class_name = model.names[class_id] if hasattr(model, 'names') else f"object_{class_id}"
 
                 detections.append({
-                    'class_id': class_id,
                     'class_name': class_name,
                     'confidence': confidence
                 })
 
-    except ImportError:
-        # YOLO not available - return empty list, will fall back to Gemini
+    except Exception:
+        # YOLO-World not available or error - return empty list
         pass
 
     return detections
@@ -188,7 +190,9 @@ def create_brief_description_from_yolo(detections: List[Dict[str, Any]]) -> str:
 
 async def on_take_photo(runtime, image, input_data):
     """
-    Take Photo mode: Provide brief object listing using YOLO.
+    Take Photo mode: Provide brief object listing using YOLO-World.
+
+    Always returns YOLO results immediately - no Gemini fallback.
 
     Args:
         runtime: Tool runtime with state and emission
@@ -198,36 +202,15 @@ async def on_take_photo(runtime, image, input_data):
     Returns:
         Brief scene description
     """
-    # Try YOLO first for fast object detection
+    # Use YOLO-World for fast object detection
     detections = await asyncio.to_thread(detect_objects_yolo, image)
     description = create_brief_description_from_yolo(detections)
 
-    # If YOLO found objects, use that description
+    # Return YOLO description or "nothing detected" - no Gemini fallback
     if description:
         return description
-
-    # Fallback to Gemini if YOLO didn't find anything or isn't available
-    prompt = (
-        "Briefly list the main objects in this scene for a blind user. "
-        "Format as a natural comma-separated list. Keep it under 15 words. "
-        "Example: 'A desk, a chair, a laptop, and a coffee mug.'"
-    )
-
-    response = await asyncio.to_thread(
-        call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
-        [{"role": "user", "content": prompt}],
-        [image],
-    )
-
-    description = extract_text(response)
-
-    # Clean up and ensure concise
-    description = description.strip()
-    if len(description) > 200:
-        description = description[:200].rsplit(' ', 1)[0] + '...'
-
-    return description
+    else:
+        return "No clear objects detected"
 
 
 async def on_stream_start(runtime, input_data):
@@ -275,28 +258,13 @@ async def on_frame(runtime, frame):
 
     # Decide what type of description to provide
     if frame_count == 1:
-        # First frame of this scene - use YOLO for brief object listing
+        # First frame of this scene - use YOLO-World for immediate brief object listing
         detections = await asyncio.to_thread(detect_objects_yolo, frame.image)
         description = create_brief_description_from_yolo(detections)
 
-        # Fallback to Gemini if YOLO didn't find anything
+        # Return YOLO description immediately - no Gemini fallback
         if not description:
-            prompt = (
-                "Briefly list the main objects in this scene for a blind user. "
-                "Format as a natural comma-separated list. Keep it under 15 words. "
-                "Example: 'A desk, a chair, a laptop, and a coffee mug.'"
-            )
-
-            response = await asyncio.to_thread(
-                call_model,
-                "gemini/gemini-3.1-flash-lite-preview",
-                [{"role": "user", "content": prompt}],
-                [frame.image],
-            )
-
-            description = extract_text(response).strip()
-            if len(description) > 200:
-                description = description[:200].rsplit(' ', 1)[0] + '...'
+            description = "No clear objects detected"
 
         # Mark as brief description
         runtime.set_state(STATE_LAST_DESCRIPTION, f"BRIEF:{description}")
