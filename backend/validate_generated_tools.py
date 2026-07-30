@@ -506,7 +506,7 @@ def validate_generated_tool_source(
             )
     failures.extend(validate_no_stringified_copilot_results(tool_text, rel_path))
     failures.extend(validate_take_photo_tool(tool_text, "runtime", rel_path))
-    failures.extend(validate_rtvi_streaming_tool(tool_text, "runtime", rel_path))
+    failures.extend(validate_temporal_streaming_tool(tool_text, "runtime", rel_path))
     return failures
 
 
