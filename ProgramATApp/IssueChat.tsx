@@ -24,7 +24,9 @@ import {
   ActivityIndicator,
   AccessibilityInfo,
   findNodeHandle,
+  Modal,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { launchImageLibrary } from 'react-native-image-picker';
 import { useTheme } from './ThemeContext';
 import WebSocketService from './WebSocketService';
@@ -62,6 +64,7 @@ export default function IssueChat({
   const [activeToken, setActiveToken] = useState<string | null>(null);
   const [awaiting, setAwaiting] = useState<Awaiting>(null);
   const [understandingSummary, setUnderstandingSummary] = useState<string | null>(null);
+  const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
 
   const [brainstormingEnabled, setBrainstormingEnabled] = useState(true);
   const [basicMode, setBasicMode] = useState(false);
@@ -176,6 +179,7 @@ export default function IssueChat({
     setActiveToken(null);
     setAwaiting(null);
     setUnderstandingSummary(null);
+    setIsSummaryModalOpen(false);
     brainstormHistoryRef.current = [];
   };
 
@@ -771,26 +775,70 @@ export default function IssueChat({
       </ScrollView>
 
       {understandingSummary && (
-        <View
+        <TouchableOpacity
           style={[styles.summaryCard, { backgroundColor: theme.card, borderColor: theme.border }]}
+          onPress={() => setIsSummaryModalOpen(true)}
+          activeOpacity={0.7}
           accessible={true}
-          accessibilityRole="text"
+          accessibilityRole="button"
           accessibilityLiveRegion="polite"
-          accessibilityLabel={`What I understood so far: ${understandingSummary}`}
-          accessibilityHint="Long press to copy text">
-          <Text style={[styles.summaryCardLabel, { color: theme.textSecondary }]} accessible={false}>
-            What I understood
-          </Text>
+          accessibilityLabel={`What I understand: ${understandingSummary}`}
+          accessibilityHint="Double tap to view the full text">
+          <View style={styles.summaryCardHeader}>
+            <Text style={[styles.summaryCardLabel, { color: theme.textSecondary }]} accessible={false}>
+              What I understand
+            </Text>
+            <Text style={[styles.summaryCardExpandHint, { color: theme.primary }]} accessible={false}>
+              View full ›
+            </Text>
+          </View>
           <Text
             style={[styles.summaryCardText, { color: theme.text }]}
             accessible={false}
-            selectable={true}
             numberOfLines={3}
             ellipsizeMode="tail">
             {understandingSummary}
           </Text>
-        </View>
+        </TouchableOpacity>
       )}
+
+      <Modal
+        visible={isSummaryModalOpen}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setIsSummaryModalOpen(false)}>
+        <View style={styles.summaryModalOverlay}>
+          <SafeAreaView style={[styles.summaryModalSheet, { backgroundColor: theme.card }]} edges={['bottom']}>
+            <View style={[styles.summaryModalHeader, { borderBottomColor: theme.border }]}>
+              <Text
+                style={[styles.summaryModalTitle, { color: theme.text }]}
+                accessible={true}
+                accessibilityRole="header">
+                What I understand
+              </Text>
+              <TouchableOpacity
+                onPress={() => setIsSummaryModalOpen(false)}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel="Close"
+                accessibilityHint="Closes this dialog and returns to the conversation">
+                <Text style={[styles.summaryModalCloseText, { color: theme.primary }]}>Done</Text>
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.summaryModalScroll} contentContainerStyle={styles.summaryModalScrollContent}>
+              <Text
+                style={[styles.summaryModalText, { color: theme.text }]}
+                selectable={true}
+                accessible={true}
+                accessibilityRole="text"
+                accessibilityLabel={understandingSummary ?? ''}
+                accessibilityHint="Long press to copy text">
+                {understandingSummary}
+              </Text>
+            </ScrollView>
+          </SafeAreaView>
+        </View>
+      </Modal>
 
       <View style={[styles.composeBar, { backgroundColor: theme.background, borderTopColor: theme.border }]}>
         {!basicMode && stagedVideoUri && (
@@ -1057,16 +1105,61 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     borderWidth: 1,
   },
+  summaryCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
   summaryCardLabel: {
     fontSize: 12,
     fontWeight: '600',
-    marginBottom: 4,
     textTransform: 'uppercase',
     letterSpacing: 0.5,
+  },
+  summaryCardExpandHint: {
+    fontSize: 12,
+    fontWeight: '600',
   },
   summaryCardText: {
     fontSize: 15,
     lineHeight: 20,
+  },
+  summaryModalOverlay: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.4)',
+  },
+  summaryModalSheet: {
+    maxHeight: '70%',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+  },
+  summaryModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+  },
+  summaryModalTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  summaryModalCloseText: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  summaryModalScroll: {
+    flexGrow: 0,
+  },
+  summaryModalScrollContent: {
+    padding: 16,
+  },
+  summaryModalText: {
+    fontSize: 16,
+    lineHeight: 22,
   },
   composeBar: {
     padding: 12,
