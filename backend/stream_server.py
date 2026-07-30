@@ -5558,6 +5558,90 @@ async def generate_ideation_question(parsed_data: dict, video_summary: str, brai
     return "Is there anything specific about how the tool should behave in difficult conditions, like low lighting or a cluttered background?"
 
 
+def _truncate_at_sentence_boundary(text: str, max_chars: int = 600) -> str:
+    """Cap a generated summary so a runaway response can't permanently
+    crowd out the pinned card the client displays it in. Prefers cutting at
+    the last sentence-ending punctuation before the limit; hard-truncates
+    with an ellipsis if no such boundary exists."""
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    boundary = max(window.rfind('.'), window.rfind('!'), window.rfind('?'))
+    if boundary > 0:
+        return window[:boundary + 1]
+    return window.rstrip() + '…'
+
+
+async def generate_understanding_summary(parsed_data: dict, video_summary: str, brainstorm_context: list = None) -> str:
+    """
+    Ask the system LLM for a brief, conversational restatement of what the
+    user is asking for so far — the kind of "so you want a tool that..."
+    paraphrase a person gives before asking a follow-up question. This is
+    purely informational (shown in a pinned UI card), so on any failure we
+    return '' rather than a canned fallback: an uninformative placeholder
+    would be read aloud on every update and misrepresent what was understood.
+
+    Args:
+        parsed_data: The parsed issue data
+        video_summary: Optional video summary
+        brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
+
+    Returns a plain 1-3 sentence string, or '' on any error/empty result.
+    """
+    title = parsed_data.get('title', '')
+    description = parsed_data.get('description', '')
+    example_usage = parsed_data.get('example_usage', '')
+    additional = parsed_data.get('additional', '')
+
+    video_section = ''
+    if video_summary:
+        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
+
+    brainstorm_section = ''
+    if brainstorm_context:
+        brainstorm_pairs = []
+        for qa_pair in brainstorm_context:
+            q = qa_pair.get('question', '').strip()
+            a = qa_pair.get('answer', '').strip()
+            if q and a:
+                brainstorm_pairs.append(f"Q: {q}\nA: {a}")
+        if brainstorm_pairs:
+            brainstorm_section = "\n\nAdditional details the user gave in follow-up rounds:\n" + "\n\n".join(brainstorm_pairs)
+
+    prompt = (
+        "You are helping a blind or low-vision user design a camera-based assistive tool. "
+        "Below is everything they have told you so far about the tool they want. "
+        "Write a brief, natural restatement of what you understand they are asking for — "
+        "what the tool does and roughly how it works. "
+        "Write 1 to 3 sentences of plain conversational language, addressed to the user, "
+        "the way you would briefly restate someone's request back to them before asking a "
+        "follow-up question. Start with something like \"Got it —\" or \"So you want\". "
+        "Fold in every detail they have given, including their follow-up answers. "
+        "Do NOT ask a question. Do NOT add suggestions, caveats, or ideas of your own. "
+        "Do NOT use bullet points, headings, or field labels. "
+        "Return only the restatement, nothing else.\n\n"
+        f"Tool title: {title}\n"
+        f"Description: {description}\n"
+        f"Desired spoken answer: {example_usage}\n"
+        f"Constraints and extra context: {additional}"
+        f"{video_section}"
+        f"{brainstorm_section}"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            system_llm_call,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        summary = ' '.join(extract_text(response).strip().split())
+        if summary:
+            return _truncate_at_sentence_boundary(summary)
+    except Exception:
+        logger.warning("generate_understanding_summary failed", exc_info=True)
+
+    return ''
+
+
 def _log_to_all_sessions(level: str, message: str):
     """Helper to log a message to all active session logs."""
     for session_log in active_session_loggers.values():
@@ -6111,12 +6195,16 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
 
     Two-shape protocol:
       Shape A (first call)  — no token in metadata:
-        Parses transcript + video, generates ideation question.
-        Returns: {status: 'ideation', question, token}
+        Parses transcript + video, generates ideation question and an
+        understanding summary (a short conversational restatement of what
+        was understood so far, for display in the client's pinned summary UI).
+        Returns: {status: 'ideation', question, token, summary}
 
       Shape B (second call) — token + ideation_answer in metadata:
         Looks up stored parsed_data, folds in the answer, creates GitHub issue.
         Returns: {status: 'created', issue_number, issue_url, video_summary}
+        or, if the user chooses to keep brainstorming instead of building:
+        Returns: {status: 'brainstorm_choice', token, brainstorm_history, summary}
     """
     if not GITHUB_TOKEN:
         return web.json_response({'status': 'error', 'error': 'GitHub not configured'}, status=503)
@@ -6155,6 +6243,9 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 video_bytes = await part.read(decode=True)
                 filename = part.filename or 'upload.mp4'
                 video_suffix = Path(filename).suffix or '.mp4'
+    except web.HTTPRequestEntityTooLarge as e:
+        logger.error("Request too large in /submit-creation: %s", e)
+        return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
     except Exception as e:
         logger.error("Failed to parse multipart in /submit-creation: %s", e)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
@@ -6206,10 +6297,18 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
         else:
             # User chose to keep brainstorming; return choice
             logger.info("Sending user choice: keep brainstorming (token=%s)", token)
+            await _broadcast_ws({'type': 'progress', 'message': 'Summarizing what I understood…'})
+            summary = await generate_understanding_summary(
+                entry['parsed_data'], entry['video_summary'], brainstorm_history
+            )
+            if not summary:
+                summary = entry.get('last_summary', '')
+            entry['last_summary'] = summary
             return web.json_response({
                 'status': 'brainstorm_choice',
                 'token': token,
                 'brainstorm_history': brainstorm_history,
+                'summary': summary,
             })
         # Fall through to template fill + issue creation below using this parsed_data.
     else:
@@ -6261,12 +6360,16 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
 
         if brainstormingEnabled and not choice:
             # Generate ideation question and return it for the client to present.
-            await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Coming up with a follow-up question…'})
+            await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Summarizing what I understood…'})
             try:
-                question = await generate_ideation_question(parsed_data, video_summary)
+                question, summary = await asyncio.gather(
+                    generate_ideation_question(parsed_data, video_summary),
+                    generate_understanding_summary(parsed_data, video_summary),
+                )
             except Exception:
                 logger.warning("generate_ideation_question failed in HTTP path", exc_info=True)
                 question = "Is there anything specific about how the tool should behave in difficult conditions?"
+                summary = ''
 
             new_token = secrets.token_urlsafe(12)
             pending_ideation_http[new_token] = {
@@ -6274,10 +6377,11 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 'video_summary': video_summary,
                 'brainstorm_history': [],  # Will accumulate Q&A pairs
                 'last_question': question,  # Track the question we just asked
+                'last_summary': summary,  # Track the understanding summary we just showed
                 'created_at': datetime.now(),
             }
             logger.info("Sending ideation question via HTTP (token=%s)", new_token)
-            return web.json_response({'status': 'ideation', 'question': question, 'token': new_token})
+            return web.json_response({'status': 'ideation', 'question': question, 'token': new_token, 'summary': summary})
         elif not brainstormingEnabled:
             logger.info("Brainstorming disabled; proceeding directly to issue creation")
 
@@ -6341,7 +6445,8 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
 
     Generates the next brainstorming question based on existing brainstorm history.
     The answer to the current question was already stored when /submit-creation was called.
-    Returns the next question and updated brainstorm history.
+    Returns the next question, updated brainstorm history, and an updated
+    understanding summary (see handle_creation_submit's docstring).
     """
     try:
         data = await request.json()
@@ -6366,23 +6471,32 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     # Generate next question with brainstorm context
     parsed_data = entry['parsed_data']
     video_summary = entry['video_summary']
-    await _broadcast_ws({'type': 'progress', 'message': 'Generating next brainstorming question…'})
-    
+    await _broadcast_ws({'type': 'progress', 'message': 'Summarizing and generating the next question…'})
+
     try:
-        next_question = await generate_ideation_question(parsed_data, video_summary, brainstorm_history)
+        next_question, summary = await asyncio.gather(
+            generate_ideation_question(parsed_data, video_summary, brainstorm_history),
+            generate_understanding_summary(parsed_data, video_summary, brainstorm_history),
+        )
     except Exception:
         logger.warning("generate_ideation_question failed in /brainstorm-next-question", exc_info=True)
         next_question = "What other features or behaviors would be helpful for this tool?"
+        summary = ''
 
-    # Store the new question for next round
+    if not summary:
+        summary = entry.get('last_summary', '')
+
+    # Store the new question and summary for next round
     entry['last_question'] = next_question
-    
+    entry['last_summary'] = summary
+
     logger.info("Sending next brainstorming question (token=%s, history size=%d)", token, len(brainstorm_history))
     return web.json_response({
         'status': 'ideation',
         'question': next_question,
         'token': token,
         'brainstorm_history': brainstorm_history,
+        'summary': summary,
     })
 
 
@@ -6419,6 +6533,9 @@ async def handle_update_submit(request: web.Request) -> web.Response:
                 video_bytes = await part.read(decode=True)
                 filename = part.filename or 'upload.mp4'
                 video_suffix = Path(filename).suffix or '.mp4'
+    except web.HTTPRequestEntityTooLarge as e:
+        logger.error("Request too large in /submit-update: %s", e)
+        return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
     except Exception as e:
         logger.error("Failed to parse multipart in /submit-update: %s", e)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
@@ -6503,6 +6620,9 @@ async def handle_test_video_summary(request: web.Request) -> web.Response:
                 video_bytes = await part.read(decode=True)
                 filename = part.filename or 'test.mp4'
                 video_suffix = Path(filename).suffix or '.mp4'
+    except web.HTTPRequestEntityTooLarge as e:
+        logger.error("Request too large in /test-video-summary: %s", e)
+        return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
     except Exception as e:
         logger.error("Failed to parse multipart in /test-video-summary: %s", e)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
@@ -8217,7 +8337,10 @@ async def main():
         STREAMING_EXECUTION_POLICY,
     )
 
-    app = web.Application(client_max_size=20 * 1024 * 1024)
+    # 100MB — HTTP video-attachment uploads (/submit-creation, /submit-update)
+    # need more headroom than the 20MB WebSocket frame limit; a phone
+    # recording a minute or two at default camera quality can exceed 20MB.
+    app = web.Application(client_max_size=100 * 1024 * 1024)
     app.router.add_get('/', websocket_handler)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_post('/test-door-recognition', test_door_recognition)
