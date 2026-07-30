@@ -110,6 +110,55 @@ Take Photo receives one current image. It should use `TOOL_PROMPT`, explicitly c
 
 Streaming decides when and what to analyze. It may inspect the latest frame, skip similar frames, process confirmed scene changes, select recent frames, maintain state, or emit progressive results. Static tasks should generally avoid unnecessary temporal windows. Temporal tasks may pass selected frames in chronological order to the same `TOOL_PROMPT`.
 
+Intentional parallel execution is valid when the tool needs different models for the same input, independent analyses, progressive results, parallel latency reduction, or several distinct useful tasks. The unsafe pattern is accidental duplicate work, not concurrency itself.
+
+Assume `on_frame()` may run again while earlier async work is still running. Before an expensive call, decide what unit of work it represents, such as one scene analysis, one temporal window, one model in an intentional multi-model batch, or one distinct phase. Avoid launching another identical call for the same unit of work unless retries or parallel duplicates are explicitly intended. Repeated frames should not independently start the same model call while equivalent work is already in flight, but intentional calls to different models may run concurrently, intentional progressive execution may emit each result as it completes, and a new scene, generation, temporal window, or distinct phase may start new work.
+
+Record an in-flight task, generation, window id, or request key before awaiting. Validate cancellation and relevance again before emitting, clear completed task state in `finally` or a completion callback, and cancel or invalidate obsolete work when appropriate. Do not rely on `if no_result_yet: result = await call_model(...); save_result(result)`, because several overlapping `on_frame()` calls can all pass that check before any result is saved. Do not use one global lock around all model calls; guard only equivalent work so unrelated or intentionally parallel calls remain concurrent.
+
+Use a small runtime-state guard, not backend-owned scheduling. For example:
+
+```python
+async def on_frame(runtime, frame):
+    scene_generation = int(runtime.get_state("scene_generation", 0))
+    key = ("detailed_scene", scene_generation)
+    tasks = dict(runtime.get_state("in_flight", {}))
+    existing = tasks.get(key)
+    if existing is not None and not existing.done():
+        return
+
+    async def run():
+        try:
+            text = await analyze_scene(frame.image)
+            if runtime.is_cancelled():
+                return
+            if runtime.get_state("scene_generation") != scene_generation:
+                return
+            await runtime.emit(text, final=True, replace=True)
+        finally:
+            current = dict(runtime.get_state("in_flight", {}))
+            if current.get(key) is task:
+                current.pop(key, None)
+                runtime.set_state("in_flight", current)
+
+    task = asyncio.create_task(run())
+    tasks[key] = task
+    runtime.set_state("in_flight", tasks)
+```
+
+For static single-frame streaming tasks, prefer changed-latest-frame behavior: compare the current frame to a recent anchor, skip visually equivalent scenes, and emit only when the scene meaningfully changed or enough time has passed to justify a refresh. `tools/empty_seat_detection.py` is the reference pattern for this kind of gating.
+
+For multi-frame streaming tasks, one task still means one in-flight analysis. The difference is only frame selection: gather the needed recent chronological frames, analyze that window once, and avoid launching a second overlapping window until the current one finishes or becomes stale. Use multi-frame only when the answer genuinely depends on motion, ordering, duration, transitions, or evidence spread across several recent frames.
+
+When deciding between single-frame and multi-frame Streaming:
+
+- Use a changed latest frame when one image is enough and motion history is not required.
+- Use recent chronological frames only when a single image would lose essential evidence such as sign motion, before-versus-after state, or a short recent event.
+- If Take Photo would have to answer "cannot determine motion from one image", Streaming is a strong candidate for multi-frame.
+- Do not upgrade a static scene-description, OCR, object-identification, or navigation task to multi-frame unless the request explicitly depends on change over time.
+
+Do not use JPEG bytes, base64 fragments, or string-prefix hashes as visual scene similarity. Use a stable visual signal such as a lightweight embedding, histogram, tracked generation, explicit temporal window, or another image-derived comparison designed for repeated frames. Cache heavyweight local models instead of loading them on every frame.
+
 Each hook independently decides whether to return once or emit results that append, replace, remain partial, or finalize. The backend only transports accepted results and rejects stale or cancelled work.
 
 ## Tool quality and accessibility conventions
