@@ -123,6 +123,9 @@ jobs:
       
           echo "=== Git config ==="
           git config --list | grep -E 'credential|extraheader|url' || true
+
+          git remote set-url origin \
+          "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
       
           if [ -z "${CLAUDE_BRANCH:-}" ]; then
             branch_prefix="claude/issue-${ISSUE_NUMBER}-"
