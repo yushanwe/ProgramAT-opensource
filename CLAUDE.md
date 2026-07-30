@@ -213,6 +213,16 @@ concurrent. A lock or in-flight map only prevents duplicates when equivalent
 work shares the same stable key. A per-frame or constantly changing generation
 key does not deduplicate temporal work.
 
+This is enforced, not just advisory: `backend/validate_generated_tools.py`
+statically rejects any `on_frame()` whose first `await` in its own body
+precedes any `runtime.set_state(...)` call, both in CI and at load time
+before the backend `exec()`s the tool. If a generated tool computes something
+cheap (an embedding, a change-detection score) before deciding whether to
+launch expensive work, wrap even that computation in a tracked task and claim
+its slot first, exactly like the awaited model call below — do not call
+`await asyncio.to_thread(...)` directly in `on_frame()`'s body before any
+state claim.
+
 Use a small runtime-state guard, not backend-owned scheduling. For example:
 
 ```python
