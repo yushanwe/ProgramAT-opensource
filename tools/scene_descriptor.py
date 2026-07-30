@@ -18,7 +18,8 @@ This tool implements both Take Photo and Streaming modes with shared prompt.
 """
 
 import asyncio
-from typing import Dict, Any, Optional
+import numpy as np
+from typing import Dict, Any, Optional, List
 from litellm_utils import call_model, extract_text
 
 TOOL_NAME = "scene_descriptor"
@@ -38,6 +39,23 @@ STATE_LAST_DESCRIPTION = "last_description"
 # Configuration
 FRAMES_FOR_DETAILED = 3  # Number of consistent frames before detailed description
 SCENE_CHANGE_THRESHOLD = 0.4  # Scene similarity threshold (lower = more different)
+YOLO_CONFIDENCE = 0.5  # Confidence threshold for YOLO object detection
+
+# COCO class names for YOLO detection
+COCO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
+    'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
+    'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
+    'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+    'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
+    'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+    'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+    'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+    'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+    'toothbrush'
+]
 
 
 def compute_scene_hash(image_base64: str) -> str:
@@ -81,9 +99,96 @@ def scene_similarity(hash1: str, hash2: str) -> float:
     return matches / max_len if max_len > 0 else 0.0
 
 
+def detect_objects_yolo(image: np.ndarray) -> List[Dict[str, Any]]:
+    """
+    Detect objects using YOLO for fast brief descriptions.
+
+    Args:
+        image: Input image as numpy array
+
+    Returns:
+        List of detection dictionaries with class_id, class_name, confidence
+    """
+    detections = []
+
+    try:
+        from ultralytics import YOLO
+
+        # Load YOLOv11n (nano) for speed
+        model = YOLO('yolo11n.pt')
+
+        # Run inference
+        results = model(image, conf=YOLO_CONFIDENCE, verbose=False)
+
+        # Process results
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+
+                # Get class name
+                class_name = COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else f"object_{class_id}"
+
+                detections.append({
+                    'class_id': class_id,
+                    'class_name': class_name,
+                    'confidence': confidence
+                })
+
+    except ImportError:
+        # YOLO not available - return empty list, will fall back to Gemini
+        pass
+
+    return detections
+
+
+def create_brief_description_from_yolo(detections: List[Dict[str, Any]]) -> str:
+    """
+    Create a concise comma-separated list from YOLO detections.
+
+    Args:
+        detections: List of YOLO detection dictionaries
+
+    Returns:
+        Brief description string like "A desk, a chair, a laptop, and a coffee mug"
+    """
+    if not detections:
+        return ""
+
+    # Count objects by class
+    from collections import defaultdict
+    counts = defaultdict(int)
+    for det in detections:
+        counts[det['class_name']] += 1
+
+    # Build object list with counts
+    object_parts = []
+    for class_name, count in sorted(counts.items()):
+        if count == 1:
+            object_parts.append(f"a {class_name}")
+        else:
+            # Pluralize (simple approach)
+            plural = f"{class_name}s" if not class_name.endswith('s') else class_name
+            object_parts.append(f"{count} {plural}")
+
+    # Format as natural list
+    if len(object_parts) == 0:
+        return ""
+    elif len(object_parts) == 1:
+        return object_parts[0].capitalize()
+    elif len(object_parts) == 2:
+        return f"{object_parts[0].capitalize()} and {object_parts[1]}"
+    else:
+        # Multiple items: "A, B, C, and D"
+        last_item = object_parts[-1]
+        other_items = ", ".join(object_parts[:-1])
+        return f"{other_items.capitalize()}, and {last_item}"
+
+
 async def on_take_photo(runtime, image, input_data):
     """
-    Take Photo mode: Provide brief object listing.
+    Take Photo mode: Provide brief object listing using YOLO.
 
     Args:
         runtime: Tool runtime with state and emission
@@ -93,14 +198,21 @@ async def on_take_photo(runtime, image, input_data):
     Returns:
         Brief scene description
     """
-    # Use brief description for single photo
+    # Try YOLO first for fast object detection
+    detections = await asyncio.to_thread(detect_objects_yolo, image)
+    description = create_brief_description_from_yolo(detections)
+
+    # If YOLO found objects, use that description
+    if description:
+        return description
+
+    # Fallback to Gemini if YOLO didn't find anything or isn't available
     prompt = (
         "Briefly list the main objects in this scene for a blind user. "
         "Format as a natural comma-separated list. Keep it under 15 words. "
         "Example: 'A desk, a chair, a laptop, and a coffee mug.'"
     )
 
-    # Call model
     response = await asyncio.to_thread(
         call_model,
         "gemini/gemini-3.1-flash-lite-preview",
@@ -163,14 +275,36 @@ async def on_frame(runtime, frame):
 
     # Decide what type of description to provide
     if frame_count == 1:
-        # First frame of this scene - brief object listing
-        prompt = (
-            "Briefly list the main objects in this scene for a blind user. "
-            "Format as a natural comma-separated list. Keep it under 15 words. "
-            "Example: 'A desk, a chair, a laptop, and a coffee mug.'"
-        )
+        # First frame of this scene - use YOLO for brief object listing
+        detections = await asyncio.to_thread(detect_objects_yolo, frame.image)
+        description = create_brief_description_from_yolo(detections)
+
+        # Fallback to Gemini if YOLO didn't find anything
+        if not description:
+            prompt = (
+                "Briefly list the main objects in this scene for a blind user. "
+                "Format as a natural comma-separated list. Keep it under 15 words. "
+                "Example: 'A desk, a chair, a laptop, and a coffee mug.'"
+            )
+
+            response = await asyncio.to_thread(
+                call_model,
+                "gemini/gemini-3.1-flash-lite-preview",
+                [{"role": "user", "content": prompt}],
+                [frame.image],
+            )
+
+            description = extract_text(response).strip()
+            if len(description) > 200:
+                description = description[:200].rsplit(' ', 1)[0] + '...'
+
+        # Mark as brief description
+        runtime.set_state(STATE_LAST_DESCRIPTION, f"BRIEF:{description}")
+        await runtime.emit(description, final=True)
+        return
+
     elif frame_count >= FRAMES_FOR_DETAILED:
-        # Prolonged focus - provide detailed description (only once)
+        # Prolonged focus - provide detailed description using Gemini (only once)
         last_desc = runtime.get_state(STATE_LAST_DESCRIPTION)
         if last_desc and last_desc.startswith("DETAILED"):
             # Already gave detailed description, skip to avoid repetition
@@ -182,31 +316,27 @@ async def on_frame(runtime, frame):
             "Keep it under 30 words and speech-ready. "
             "Example: 'A cat sitting on top of a white desk near the window, looking outside.'"
         )
+
+        # Use Gemini for detailed description
+        response = await asyncio.to_thread(
+            call_model,
+            "gemini/gemini-3.1-flash-lite-preview",
+            [{"role": "user", "content": prompt}],
+            [frame.image],
+        )
+
+        description = extract_text(response).strip()
+        if len(description) > 300:
+            description = description[:300].rsplit(' ', 1)[0] + '...'
+
+        # Mark as detailed description
+        runtime.set_state(STATE_LAST_DESCRIPTION, f"DETAILED:{description}")
+        await runtime.emit(description, final=True)
+        return
+
     else:
         # In between - skip to avoid spam
         return
-
-    # Call model
-    response = await asyncio.to_thread(
-        call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
-        [{"role": "user", "content": prompt}],
-        [frame.image],
-    )
-
-    description = extract_text(response)
-
-    # Clean up
-    description = description.strip()
-    if len(description) > 300:
-        description = description[:300].rsplit(' ', 1)[0] + '...'
-
-    # Mark description type in state
-    desc_type = "DETAILED" if frame_count >= FRAMES_FOR_DETAILED else "BRIEF"
-    runtime.set_state(STATE_LAST_DESCRIPTION, f"{desc_type}:{description}")
-
-    # Emit result
-    await runtime.emit(description, final=True)
 
 
 async def on_stream_stop(runtime):
