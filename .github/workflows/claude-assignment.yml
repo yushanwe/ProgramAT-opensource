@@ -100,8 +100,7 @@ jobs:
             commit the result, and push the branch for workflow-managed PR creation.
             When this run was triggered from an open PR comment, update that
             existing PR branch instead of creating another PR.
-          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(find:*),Bash(ls:*),Read,View,Glob,GlobTool,Grep,GrepTool,Write,Edit" --max-turns 100 --model claude-sonnet-4-5'
-
+          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(find:*),Bash(ls:*),Bash(python3:*),Bash(cd:*),Read,View,Glob,GlobTool,Grep,GrepTool,Write,Edit" --max-turns 100 --model claude-sonnet-4-5'
       - name: Create PR for Claude branch if needed
         if: github.event.issue.pull_request == null
         env:
