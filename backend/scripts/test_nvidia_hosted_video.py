@@ -40,7 +40,7 @@ def make_sample(path: Path, seconds: float, fps: float) -> None:
 
 
 def played_card_prompt() -> str:
-    path = BACKEND_DIR.parent / "tools" / "played_card_rtvi.py"
+    path = BACKEND_DIR.parent / "tools" / "played_card.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
@@ -50,7 +50,7 @@ def played_card_prompt() -> str:
             value = ast.literal_eval(node.value)
             if isinstance(value, str):
                 return value
-    raise NvidiaHostedError("played_card_rtvi has no literal TOOL_PROMPT")
+    raise NvidiaHostedError("played_card tool has no literal TOOL_PROMPT")
 
 
 async def run(video_path: Path | None, prompt: str, validate_cards: bool) -> int:
@@ -106,7 +106,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("video", nargs="?", type=Path)
     parser.add_argument("--prompt")
-    parser.add_argument("--played-card", action="store_true", help="Use and validate played_card_rtvi JSON output")
+    parser.add_argument("--played-card", action="store_true", help="Use and validate played_card tool JSON output")
     args = parser.parse_args()
     if args.video is not None and not args.video.is_file():
         parser.error(f"Video does not exist: {args.video}")

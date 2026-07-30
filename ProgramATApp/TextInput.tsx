@@ -6,7 +6,7 @@
  * @format
  */
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -25,7 +25,6 @@ import { useTheme } from './ThemeContext';
 import WebSocketService from './WebSocketService';
 import TextToSpeechService from './TextToSpeechService';
 import VideoRecorderModal from './VideoRecorderModal';
-import { isBrainstormingEnabled } from './Settings';
 
 interface TextInputProps {
   serverFeedback?: string;
@@ -64,13 +63,6 @@ export default function TextInputComponent({
   // Brainstorm choice state: set when server returns {status:'brainstorm_choice'}
   // Allows user to choose between "Keep Brainstorming" or "Start Building"
   const [brainstormChoice, setBrainstormChoice] = useState<{token: string; brainstormHistory: Array<{question: string; answer: string}>} | null>(null);
-
-  // Brainstorming preference from settings
-  const [brainstormingEnabled, setBrainstormingEnabled] = useState(true);
-
-  useEffect(() => {
-    isBrainstormingEnabled().then(setBrainstormingEnabled).catch(() => setBrainstormingEnabled(true));
-  }, []);
 
   const isCreateMode = !selectedIssue;
 
@@ -141,10 +133,7 @@ export default function TextInputComponent({
         }));
       } else {
         // Shape A: first submission — include text and optional video.
-        formData.append('metadata', JSON.stringify({
-          text: inputText.trim(),
-          brainstormingEnabled: brainstormingEnabled,
-        }));
+        formData.append('metadata', JSON.stringify({ text: inputText.trim() }));
         if (videoUri) {
           formData.append('video', buildVideoPart(videoUri));
         }

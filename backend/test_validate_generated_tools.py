@@ -32,9 +32,9 @@ Capability: navigation
         path.write_text(text, encoding="utf-8")
         return path
 
-    def test_rejects_local_router_and_direct_provider_patterns(self):
+    def test_allows_local_detector_and_model_constants(self):
         path = self._write_temp_tool(
-            "bad_generated_tool.py",
+            "good_generated_tool.py",
             """
 from ultralytics import YOLO
 
@@ -50,16 +50,7 @@ def detect_vehicles(image):
 """,
         )
 
-        failures = validate_generated_tools.validate_files([path])
-
-        self.assertTrue(any("direct ultralytics import" in failure for failure in failures))
-        self.assertTrue(any("direct YOLO import" in failure for failure in failures))
-        self.assertTrue(any("direct YOLO call" in failure for failure in failures))
-        self.assertTrue(any("hardcoded YOLO model name" in failure for failure in failures))
-        self.assertTrue(any("DEFAULT_MODEL constant" in failure for failure in failures))
-        self.assertTrue(any("local ModelRouter class" in failure for failure in failures))
-        self.assertTrue(any("COCO class list" in failure for failure in failures))
-        self.assertTrue(any("model file reference" in failure for failure in failures))
+        self.assertEqual(validate_generated_tools.validate_files([path]), [])
 
     def test_allows_tool_policy_client_import(self):
         path = self._write_temp_tool(
@@ -245,7 +236,7 @@ EXECUTION_MODE = "hosted_video_streaming"
 VIDEO_CONFIG = {"window_seconds": 6}
 TOOL_PROMPT = "Describe the door."
 '''
-        failures = validate_generated_tools.validate_rtvi_streaming_tool(
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
             incomplete, issue, Path("tools/door_change.py")
         )
         self.assertTrue(any("VIDEO_CONFIG is missing" in failure for failure in failures))
@@ -263,7 +254,7 @@ VIDEO_CONFIG = {
 TOOL_PROMPT = "Compare chronological early and late frames and report whether the door changed."
 '''
         self.assertEqual(
-            validate_generated_tools.validate_rtvi_streaming_tool(
+            validate_generated_tools.validate_temporal_streaming_tool(
                 complete, issue, Path("tools/door_change.py")
             ),
             [],
@@ -297,7 +288,7 @@ TOOL_PROMPT = (
 )
 '''
         self.assertEqual(
-            validate_generated_tools.validate_rtvi_streaming_tool(
+            validate_generated_tools.validate_temporal_streaming_tool(
                 tool, issue, Path("tools/recent_sign_language.py")
             ),
             [],
@@ -330,7 +321,7 @@ TOOL_PROMPT = "Compare chronological early and late hand movement and identify t
             [],
         )
         self.assertEqual(
-            validate_generated_tools.validate_rtvi_streaming_tool(
+            validate_generated_tools.validate_temporal_streaming_tool(
                 temporal_tool, issue_with_wrong_suggestion, path
             ),
             [],
@@ -350,7 +341,7 @@ VIDEO_CONFIG = {
 OUTPUT_CONFIG = {"schema": "played_card_event"}
 TOOL_PROMPT = "Inspect chronological hand motion and identify the signed phrase."
 '''
-        failures = validate_generated_tools.validate_rtvi_streaming_tool(
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
             tool, issue, Path("tools/recent_sign_language.py")
         )
         self.assertTrue(any("card-specific prompt" in failure for failure in failures))

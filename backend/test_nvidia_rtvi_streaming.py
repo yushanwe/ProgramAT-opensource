@@ -19,7 +19,7 @@ from nvidia_rtvi_client import (
     parse_stream_registration,
 )
 from rtsp_publisher import RtspPublisher, RtspPublisherConfig, safe_rtsp_path
-from validate_generated_tools import validate_rtvi_streaming_tool
+from validate_generated_tools import validate_temporal_streaming_tool
 
 
 class TestRtviResponseParsing(unittest.TestCase):
@@ -110,12 +110,12 @@ class TestRtviStreamingBoundary(unittest.IsolatedAsyncioTestCase):
         stream_server.active_streaming_tasks.clear()
         stream_server.active_rtvi_sessions.clear()
 
-    def test_played_card_tool_is_explicitly_rtvi_and_declarative(self):
+    def test_played_card_tool_is_hosted_video_and_declarative(self):
         tool_path = Path(__file__).resolve().parent.parent / "tools" / "played_card_rtvi.py"
         tool_text = tool_path.read_text(encoding="utf-8")
         self.assertEqual(stream_server._tool_execution_mode(tool_text), "hosted_video_streaming")
         self.assertEqual(
-            validate_rtvi_streaming_tool(
+            validate_temporal_streaming_tool(
                 tool_text, "## Mode\n\nhosted_video_streaming\n", tool_path
             ),
             [],

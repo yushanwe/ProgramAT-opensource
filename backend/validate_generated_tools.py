@@ -18,16 +18,6 @@ TOOLS_DIR = REPO_ROOT / "tools"
 FORBIDDEN_PATTERNS = [
     ("import litellm", re.compile(r"^\s*(?:import|from)\s+litellm\b", re.MULTILINE)),
     ("litellm.completion", re.compile(r"\blitellm\s*\.\s*completion\s*\(")),
-    ("direct ultralytics import", re.compile(r"^\s*(?:import\s+ultralytics\b|from\s+ultralytics\s+import\b)", re.MULTILINE)),
-    ("direct YOLO import", re.compile(r"^\s*(?:import\s+YOLO\b|from\s+\S+\s+import\s+.*\bYOLO\b)", re.MULTILINE)),
-    ("direct YOLO call", re.compile(r"\bYOLO\s*\(")),
-    ("hardcoded YOLO model name", re.compile(r"\byolo11\w*\b", re.IGNORECASE)),
-    ("direct Google Vision import", re.compile(r"^\s*(?:import\s+google\.cloud\.vision\b|from\s+google\.cloud\s+import\s+vision\b)", re.MULTILINE)),
-    ("direct provider SDK import", re.compile(r"^\s*(?:import|from)\s+(?:openai|anthropic|google\.genai|google\.generativeai)\b", re.MULTILINE)),
-    ("DEFAULT_MODEL constant", re.compile(r"\bDEFAULT_MODEL\b")),
-    ("local ModelRouter class", re.compile(r"\bclass\s+ModelRouter\b")),
-    ("COCO class list", re.compile(r"\bCOCO_CLASSES\b")),
-    ("provider fallback logic", re.compile(r"\b(?:fallback_models|fallback_model|provider_fallback|fallback_provider)\b")),
     ("backend policy orchestration", re.compile(r"\bexecute_resolved_tool_policy\b")),
     ("unsafe process import", re.compile(r"^\s*(?:import|from)\s+(?:subprocess|multiprocessing)\b", re.MULTILINE)),
     ("unsafe environment access", re.compile(r"^\s*(?:import|from)\s+(?:os|dotenv)\b|\bos\s*\.\s*(?:environ|getenv)\b", re.MULTILINE)),
@@ -38,7 +28,6 @@ FORBIDDEN_PATTERNS = [
     ("custom output transport", re.compile(r"\b(?:websocket|event_emitter|result_callback|response_callback|on_progress)\b", re.IGNORECASE)),
     ("raw credential access", re.compile(r"\b(?:api_key|explicit_api_key|GEMINI_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY)\b")),
     ("filesystem access", re.compile(r"\b(?:open|Path)\s*\(|\.(?:write_text|write_bytes|unlink|mkdir|rename|replace)\s*\(")),
-    ("model file reference", re.compile(r"\.pt\b|['\"][^'\"]+\.pt['\"]")),
     ("model file discovery", re.compile(r"\b(?:glob|rglob)\s*\([^)]*\.pt[^)]*\)|os\.walk\s*\(")),
 ]
 
@@ -199,16 +188,6 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
                 f"{rel_path}: use one shared TOOL_PROMPT instead of mode-specific prompts: "
                 + ", ".join(found_mode_prompts)
             )
-        imported_names = {
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-            for alias in node.names
-        }
-        if any(name in {"litellm", "openai", "anthropic"} for name in imported_names):
-            failures.append(
-                f"{rel_path}: tools must use litellm_utils instead of provider SDKs."
-            )
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -333,7 +312,7 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
     return failures
 
 
-def validate_rtvi_streaming_tool(
+def validate_temporal_streaming_tool(
     tool_text: str, issue_text: str, rel_path: Path
 ) -> List[str]:
     """Require hosted-video tools to remain declarative and runtime-owned."""
@@ -352,9 +331,9 @@ def validate_rtvi_streaming_tool(
         return []
     failures = []
     if not isinstance(constants.get('TOOL_NAME'), str):
-        failures.append(f"{rel_path}: RTVI tools require one string TOOL_NAME.")
+        failures.append(f"{rel_path}: temporal tools require one string TOOL_NAME.")
     if not isinstance(constants.get('TOOL_PROMPT'), str) or not constants.get('TOOL_PROMPT', '').strip():
-        failures.append(f"{rel_path}: RTVI tools require one non-empty string TOOL_PROMPT.")
+        failures.append(f"{rel_path}: temporal tools require one non-empty string TOOL_PROMPT.")
     video_config = constants.get('VIDEO_CONFIG')
     required_settings = {
         'window_seconds', 'interval_seconds', 'minimum_span_seconds',
@@ -409,7 +388,7 @@ def validate_rtvi_streaming_tool(
     found = sorted(set(found) | (forbidden & imported))
     if found:
         failures.append(
-            f"{rel_path}: RTVI runtime owns streaming; forbidden tool symbols: "
+            f"{rel_path}: temporal streaming runtime owns execution; forbidden tool symbols: "
             + ', '.join(found)
         )
     module_state = [
@@ -421,7 +400,7 @@ def validate_rtvi_streaming_tool(
         }
     ]
     if module_state:
-        failures.append(f"{rel_path}: RTVI tools must not keep module state: {module_state}")
+        failures.append(f"{rel_path}: temporal tools must not keep module state: {module_state}")
     allowed_names = {
         'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'TOOL_POLICY', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
     }
@@ -437,7 +416,7 @@ def validate_rtvi_streaming_tool(
         non_declarative.append(type(node).__name__)
     if non_declarative:
         failures.append(
-            f"{rel_path}: RTVI tools may contain only declarative constants: "
+            f"{rel_path}: temporal tools may contain only declarative constants: "
             + ', '.join(non_declarative)
         )
     return failures
@@ -487,7 +466,7 @@ def validate_files(paths: Iterable[Path], issue_text: Optional[str] = None) -> L
         failures.extend(validate_no_stringified_copilot_results(text, rel_path))
         if issue_text:
             failures.extend(validate_take_photo_tool(text, issue_text, rel_path))
-            failures.extend(validate_rtvi_streaming_tool(text, issue_text, rel_path))
+            failures.extend(validate_temporal_streaming_tool(text, issue_text, rel_path))
 
     return failures
 
@@ -506,7 +485,7 @@ def validate_generated_tool_source(
             )
     failures.extend(validate_no_stringified_copilot_results(tool_text, rel_path))
     failures.extend(validate_take_photo_tool(tool_text, "runtime", rel_path))
-    failures.extend(validate_rtvi_streaming_tool(tool_text, "runtime", rel_path))
+    failures.extend(validate_temporal_streaming_tool(tool_text, "runtime", rel_path))
     return failures
 
 

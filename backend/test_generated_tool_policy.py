@@ -58,16 +58,7 @@ class GeneratedToolPolicyValidationTests(unittest.TestCase):
         self.assertTrue(any("must not use call_take_photo_vlm" in failure for failure in failures))
         self.assertTrue(any("require a literal TOOL_POLICY" in failure for failure in failures))
 
-    def test_rejects_custom_provider_calls_and_routing_loops(self):
-        direct_provider = tool(
-            'TOOL_POLICY = {"strategy": "single", "models": ["gemini-3.1-flash-lite"]}',
-            ", policy=TOOL_POLICY",
-        ) + "\nfrom openai import OpenAI\n"
-        self.assertTrue(any(
-            label == "direct provider SDK import" and pattern.search(direct_provider)
-            for label, pattern in FORBIDDEN_PATTERNS
-        ))
-
+    def test_rejects_custom_routing_loops(self):
         looped = tool(
             'TOOL_POLICY = {"strategy": "single", "models": ["gemini-3.1-flash-lite"]}',
             ", policy=TOOL_POLICY",
