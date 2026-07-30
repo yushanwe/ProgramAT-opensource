@@ -18,16 +18,6 @@ TOOLS_DIR = REPO_ROOT / "tools"
 FORBIDDEN_PATTERNS = [
     ("import litellm", re.compile(r"^\s*(?:import|from)\s+litellm\b", re.MULTILINE)),
     ("litellm.completion", re.compile(r"\blitellm\s*\.\s*completion\s*\(")),
-    ("direct ultralytics import", re.compile(r"^\s*(?:import\s+ultralytics\b|from\s+ultralytics\s+import\b)", re.MULTILINE)),
-    ("direct YOLO import", re.compile(r"^\s*(?:import\s+YOLO\b|from\s+\S+\s+import\s+.*\bYOLO\b)", re.MULTILINE)),
-    ("direct YOLO call", re.compile(r"\bYOLO\s*\(")),
-    ("hardcoded YOLO model name", re.compile(r"\byolo11\w*\b", re.IGNORECASE)),
-    ("direct Google Vision import", re.compile(r"^\s*(?:import\s+google\.cloud\.vision\b|from\s+google\.cloud\s+import\s+vision\b)", re.MULTILINE)),
-    ("direct provider SDK import", re.compile(r"^\s*(?:import|from)\s+(?:openai|anthropic|google\.genai|google\.generativeai)\b", re.MULTILINE)),
-    ("DEFAULT_MODEL constant", re.compile(r"\bDEFAULT_MODEL\b")),
-    ("local ModelRouter class", re.compile(r"\bclass\s+ModelRouter\b")),
-    ("COCO class list", re.compile(r"\bCOCO_CLASSES\b")),
-    ("provider fallback logic", re.compile(r"\b(?:fallback_models|fallback_model|provider_fallback|fallback_provider)\b")),
     ("backend policy orchestration", re.compile(r"\bexecute_resolved_tool_policy\b")),
     ("unsafe process import", re.compile(r"^\s*(?:import|from)\s+(?:subprocess|multiprocessing)\b", re.MULTILINE)),
     ("unsafe environment access", re.compile(r"^\s*(?:import|from)\s+(?:os|dotenv)\b|\bos\s*\.\s*(?:environ|getenv)\b", re.MULTILINE)),
@@ -38,7 +28,6 @@ FORBIDDEN_PATTERNS = [
     ("custom output transport", re.compile(r"\b(?:websocket|event_emitter|result_callback|response_callback|on_progress)\b", re.IGNORECASE)),
     ("raw credential access", re.compile(r"\b(?:api_key|explicit_api_key|GEMINI_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY)\b")),
     ("filesystem access", re.compile(r"\b(?:open|Path)\s*\(|\.(?:write_text|write_bytes|unlink|mkdir|rename|replace)\s*\(")),
-    ("model file reference", re.compile(r"\.pt\b|['\"][^'\"]+\.pt['\"]")),
     ("model file discovery", re.compile(r"\b(?:glob|rglob)\s*\([^)]*\.pt[^)]*\)|os\.walk\s*\(")),
 ]
 
@@ -198,16 +187,6 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
             failures.append(
                 f"{rel_path}: use one shared TOOL_PROMPT instead of mode-specific prompts: "
                 + ", ".join(found_mode_prompts)
-            )
-        imported_names = {
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-            for alias in node.names
-        }
-        if any(name in {"litellm", "openai", "anthropic"} for name in imported_names):
-            failures.append(
-                f"{rel_path}: tools must use litellm_utils instead of provider SDKs."
             )
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

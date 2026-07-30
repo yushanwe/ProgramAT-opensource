@@ -32,9 +32,9 @@ Capability: navigation
         path.write_text(text, encoding="utf-8")
         return path
 
-    def test_rejects_local_router_and_direct_provider_patterns(self):
+    def test_allows_local_detector_and_model_constants(self):
         path = self._write_temp_tool(
-            "bad_generated_tool.py",
+            "good_generated_tool.py",
             """
 from ultralytics import YOLO
 
@@ -50,16 +50,7 @@ def detect_vehicles(image):
 """,
         )
 
-        failures = validate_generated_tools.validate_files([path])
-
-        self.assertTrue(any("direct ultralytics import" in failure for failure in failures))
-        self.assertTrue(any("direct YOLO import" in failure for failure in failures))
-        self.assertTrue(any("direct YOLO call" in failure for failure in failures))
-        self.assertTrue(any("hardcoded YOLO model name" in failure for failure in failures))
-        self.assertTrue(any("DEFAULT_MODEL constant" in failure for failure in failures))
-        self.assertTrue(any("local ModelRouter class" in failure for failure in failures))
-        self.assertTrue(any("COCO class list" in failure for failure in failures))
-        self.assertTrue(any("model file reference" in failure for failure in failures))
+        self.assertEqual(validate_generated_tools.validate_files([path]), [])
 
     def test_allows_tool_policy_client_import(self):
         path = self._write_temp_tool(
