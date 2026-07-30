@@ -148,7 +148,11 @@ async def on_frame(runtime, frame):
 
 For static single-frame streaming tasks, prefer changed-latest-frame behavior: compare the current frame to a recent anchor, skip visually equivalent scenes, and emit only when the scene meaningfully changed or enough time has passed to justify a refresh. `tools/empty_seat_detection.py` is the reference pattern for this kind of gating.
 
-For multi-frame streaming tasks, one task still means one in-flight analysis. The difference is only frame selection: gather the needed recent chronological frames, analyze that window once, and avoid launching a second overlapping window until the current one finishes or becomes stale. Use multi-frame only when the answer genuinely depends on motion, ordering, duration, transitions, or evidence spread across several recent frames.
+For multi-frame streaming tasks, separate frame collection, temporal window scheduling, and model execution. `on_frame()` may keep updating recent frame history, motion evidence, scene state, gesture state, or candidate-event state without calling a model. Before a multi-frame model call, define what one unit of temporal analysis represents, such as one gesture attempt, one swipe, one scene transition, one card-play event, one fixed non-overlapping monitoring interval, or one user-requested continuous update period.
+
+Give each candidate temporal window an identity such as `window_key = (event_generation, start_frame_id, end_frame_id)`. Strongly overlapping frame histories should not automatically become separate analyses when they represent the same event. Once a window is ready, select a small chronological set of representative frames, start one analysis for that window, mark the window or generation in flight before awaiting, avoid starting an equivalent analysis for the same window while it is running, mark that window analyzed after completion, and re-check cancellation plus generation relevance before emitting.
+
+Multi-frame means several ordered frames may be passed in one model call. It does not mean making one model call for every arriving frame.
 
 When deciding between single-frame and multi-frame Streaming:
 
@@ -156,6 +160,47 @@ When deciding between single-frame and multi-frame Streaming:
 - Use recent chronological frames only when a single image would lose essential evidence such as sign motion, before-versus-after state, or a short recent event.
 - If Take Photo would have to answer "cannot determine motion from one image", Streaming is a strong candidate for multi-frame.
 - Do not upgrade a static scene-description, OCR, object-identification, or navigation task to multi-frame unless the request explicitly depends on change over time.
+
+For the same temporal window, intentional parallel execution remains valid when several different models are deliberately compared, progressive results are requested, independent subtasks are useful, or parallel execution reduces latency. In that case, one temporal window may intentionally launch several keyed calls such as `call_key = (window_key, model_name, phase)`. Prevent accidental duplicates of the same temporal work, not intentional parallel calls for distinct models or subtasks.
+
+Do not let adjacent overlapping histories schedule new equivalent work by default, such as `frame 20 -> frames 12-20`, `frame 21 -> frames 13-21`, `frame 22 -> frames 14-22`, unless the user explicitly asked for continuous sliding-window monitoring at that frequency.
+
+Before implementing a temporal tool, decide whether it is event-driven or continuous monitoring. Event-driven tools should define what begins an event, when enough frames have been collected, when the event is complete, and what resets the tool for the next event. Continuous monitoring tools should define an explicit interval or non-overlapping window progression and should not let every `on_frame()` independently schedule another analysis.
+
+This pattern is unsafe:
+
+```python
+if enough_frames and not result_exists:
+    result = await call_model(...)
+    runtime.set_state("result", result)
+```
+
+Several overlapping `on_frame()` calls may all pass that condition before any one call stores its result. Reserve equivalent temporal work before the first `await`, for example:
+
+```python
+window_key = build_window_key(selected_frames)
+in_flight = dict(runtime.get_state("in_flight", {}))
+if window_key in in_flight:
+    return
+if runtime.get_state("last_analyzed_window") == window_key:
+    return
+
+task = asyncio.create_task(analyze(selected_frames))
+in_flight[window_key] = task
+runtime.set_state("in_flight", in_flight)
+```
+
+Then remove the task in `finally`, mark the window analyzed, and verify the current generation before emitting. The exact mechanism may use tasks, generations, state flags, locks, or window ids, but equivalent temporal work must be deduplicated before the first `await`.
+
+Before writing temporal streaming code, answer these questions:
+
+1. What event or interval does one model call represent?
+2. Which chronological frames belong to that unit?
+3. When is the unit ready to analyze?
+4. How is it uniquely identified?
+5. How is duplicate analysis of the same unit prevented?
+6. What permits the next unit to begin?
+7. Is any parallel execution intentional, and if so, which distinct models or subtasks are parallel?
 
 Do not use JPEG bytes, base64 fragments, or string-prefix hashes as visual scene similarity. Use a stable visual signal such as a lightweight embedding, histogram, tracked generation, explicit temporal window, or another image-derived comparison designed for repeated frames. Cache heavyweight local models instead of loading them on every frame.
 
