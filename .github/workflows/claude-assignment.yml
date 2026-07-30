@@ -112,16 +112,21 @@ jobs:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
           echo "Issue number: $ISSUE_NUMBER"
           echo "Base branch: $BASE_BRANCH"
           echo "Claude branch output: ${CLAUDE_BRANCH:-<empty>}"
+          echo "=== Git remotes ==="
+          git remote -v
+          
+          echo "=== Git config ==="
+          git config --list | grep -E 'credential|extraheader|url'
 
           if [ -z "${CLAUDE_BRANCH:-}" ]; then
             branch_prefix="claude/issue-${ISSUE_NUMBER}-"
             echo "Claude branch output was empty; searching for remote branches with prefix: $branch_prefix"
-            matching_branches="$(git ls-remote --heads origin "refs/heads/${branch_prefix}*" \
+            matching_branches="$( ls-remote --heads origin "refs/heads/${branch_prefix}*" \
               | awk '{sub("refs/heads/","",$2); print $2}')"
             if [ -z "$matching_branches" ]; then
               echo "::error::No remote Claude branch found for issue #$ISSUE_NUMBER."
@@ -132,16 +137,16 @@ jobs:
 
           echo "Detected Claude branch: $CLAUDE_BRANCH"
 
-          remote_branch_sha="$(git ls-remote --heads origin "refs/heads/$CLAUDE_BRANCH" | awk '{print $1}' | head -n 1)"
+          remote_branch_sha="$( ls-remote --heads origin "refs/heads/$CLAUDE_BRANCH" | awk '{print $1}' | head -n 1)"
           if [ -z "$remote_branch_sha" ]; then
             echo "::error::Remote branch '$CLAUDE_BRANCH' does not exist on origin."
             exit 1
           fi
           echo "Remote branch SHA: $remote_branch_sha"
 
-          git fetch --no-tags origin "$BASE_BRANCH" "$CLAUDE_BRANCH"
+           fetch --no-tags origin "$BASE_BRANCH" "$CLAUDE_BRANCH"
 
-          ahead_count="$(git rev-list --count "origin/${BASE_BRANCH}..origin/${CLAUDE_BRANCH}")"
+          ahead_count="$( rev-list --count "origin/${BASE_BRANCH}..origin/${CLAUDE_BRANCH}")"
           echo "Commits ahead of ${BASE_BRANCH}: $ahead_count"
           if [ "$ahead_count" -eq 0 ]; then
             echo "::error::Branch '$CLAUDE_BRANCH' has no commits ahead of '$BASE_BRANCH'; refusing to open a PR."
