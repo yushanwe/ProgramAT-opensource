@@ -138,7 +138,7 @@ Billing:
 3. Click **Create API Key**, give it a name, and click **Submit**.
 4. Copy the generated key immediately — you won't be able to see it again.
 5. Paste the key into `backend/.env` as `GROQ_API_KEY`.
-6. Add the Groq-hosted implementation to `backend/execution_policy.yaml` and reference it from the desired global or capability policy.
+6. The Groq key is used by the fixed infrastructure model.
 
 #### Mistral API Key
 
@@ -147,7 +147,7 @@ Billing:
 3. Click **Create new key**, give it a name, and click **Create**.
 4. Copy the generated key immediately — you won't be able to see it again.
 5. Paste the key into `backend/.env` as `MISTRAL_API_KEY`.
-6. Add the Mistral implementation to `backend/execution_policy.yaml` and reference it from the desired global or capability policy.
+6. Add a model entry to `backend/model_registry.py` if it should be available to tool policies.
 
 #### Google Application Credentials
 
@@ -247,7 +247,7 @@ If you do a release build for Android, the server will not connect to ws address
 Since you are working from a fork of this repository, GitHub-related features may need a few repo-level settings that are not always copied over from the upstream project.
 
 1. Make sure **Issues** are enabled in **Settings** -> **General** -> **Features**.
-2. Make sure the workflow **Auto-assign to Copilot** is visible in **Actions**. If it is missing, delete and re-upload [`.github/workflows/copilot-assignment.yml`](.github/workflows/copilot-assignment.yml).
+2. Make sure the workflow **Claude VAT Implementation** is visible in **Actions**.
 3. Go to **Settings** -> **Secrets and variables** -> **Actions**, click **New repository secret**, create a secret named `COPILOT_PAT`, and set its value to your GitHub personal access token.
 4. If you use `gh auth login`, make sure that token has the required scopes, including `repo`, `workflow`, and `admin:org`.
 
@@ -260,9 +260,9 @@ Since you are working from a fork of this repository, GitHub-related features ma
 5. **Tool creation** — To instead create a new tool, from development mode, select the "Create New Issue Instead" button in the PRs tab. Then, type or dictate the tool you would like to make into the text box, then submit. If more information is needed, the app will ask for it: in this case, dictate or type an answer to the request and resubmit, it will be appended to your initial request. Once the request is complete, the app will tell you it has made a new issue successfully. Copilot will automatically be assigned and create a relevant pull request. From there, wait for it to generate, and then run it as described in the earlier usage steps!
 
    * If you prefer to do this from desktop, you can also fill out the issue template titled "Visual Assistive Technology" on the Github website
-6. **Tool iteration** — To update or modify a tool, in development mode, click a relevant PR, and instead of choosing open tools as you would to run a tool, select update issue. Then, type or dictate the change you would like to make and submit. Copilot will automatically be assigned and make the desired changes to the relevant tool.
+6. **Tool iteration** — To update or modify a tool, in development mode, click a relevant PR, and instead of choosing open tools as you would to run a tool, select update issue. Then, type or dictate the change you would like to make and submit. Claude will update the existing linked pull request with the requested tool changes.
 
-   * If you would prefer to do this from desktop, you can also simply leave a comment on the relevant pull request from the Github website. In this case, you will be responsible for appending `@copilot` to your comment to assign Copilot.
+   * If you would prefer to do this from desktop, you can also leave a comment on the relevant pull request from the GitHub website. Include `@claude` to trigger Claude on that existing PR.
 
 ## Supported Input Modes
 
@@ -281,10 +281,10 @@ Since you are working from a fork of this repository, GitHub-related features ma
 ## Meta Ray-Ban Integration (iOS)
 
 ProgramAT can use **Meta Ray-Ban** glasses as a camera source instead of the phone
-camera. Streaming tools use the glasses' live frames and take-photo tools use a
-captured frame; results are spoken back through the same audio path as the phone
-camera. This integration is **iOS-only** and built on Meta's Device Access Toolkit
-(DAT).
+camera. A tool's Streaming entry point uses the glasses' live frames, while its
+Take Photo entry point receives one captured frame; results are spoken back
+through the same audio path as the phone camera. This integration is **iOS-only**
+and built on Meta's Device Access Toolkit (DAT).
 
 ### Setup (developers)
 
@@ -461,7 +461,7 @@ For iOS:
 ### Backend
 
 - **Python 3.11** with async `websockets`
-- **LiteLLM (configurable providers)** — Model runtime used for AI parsing and model-backed capability implementations. System/default models, concrete implementations, routing toggle, and capability cascades live in `backend/execution_policy.yaml`.
+- **LiteLLM (configurable providers)** — Model runtime used by the models in `backend/model_registry.py`; tool execution strategies are defined in `backend/strategy_registry.py`.
 - **Google Cloud Vision API** — OCR
 - **Ultralytics (YOLOv11 / YOLOWorld)** — Object detection
 - **OpenCV / NumPy / Pillow** — Image processing
