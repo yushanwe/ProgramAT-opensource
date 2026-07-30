@@ -131,6 +131,8 @@ For navigation, use body-relative or clock-face directions, approximate distance
 
 Avoid GPU-heavy packages unless strictly necessary. Reuse approved shared backend helpers and useful patterns, but do not import one tool module from another or duplicate infrastructure. Prefer changing only the requested tool file unless the public runtime genuinely lacks a required capability. After the code works and is tested, avoid unnecessary documentation and finish promptly.
 
+If you would ever call `validate_rtvi_streaming_tool`, call `validate_temporal_streaming_tool` instead.
+
 ## Safety and accessibility
 
 Allowed:
