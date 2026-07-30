@@ -113,70 +113,108 @@ jobs:
           CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
         run: |
           set -euxo pipefail
-
+      
           echo "Issue number: $ISSUE_NUMBER"
           echo "Base branch: $BASE_BRANCH"
           echo "Claude branch output: ${CLAUDE_BRANCH:-<empty>}"
+      
           echo "=== Git remotes ==="
           git remote -v
-          
+      
           echo "=== Git config ==="
-          git config --list | grep -E 'credential|extraheader|url'
-
+          git config --list | grep -E 'credential|extraheader|url' || true
+      
           if [ -z "${CLAUDE_BRANCH:-}" ]; then
             branch_prefix="claude/issue-${ISSUE_NUMBER}-"
             echo "Claude branch output was empty; searching for remote branches with prefix: $branch_prefix"
-            matching_branches="$( ls-remote --heads origin "refs/heads/${branch_prefix}*" \
-              | awk '{sub("refs/heads/","",$2); print $2}')"
+      
+            matching_branches="$(
+              git ls-remote --heads origin "refs/heads/${branch_prefix}*" \
+                | awk '{sub("refs/heads/","",$2); print $2}'
+            )"
+      
             if [ -z "$matching_branches" ]; then
               echo "::error::No remote Claude branch found for issue #$ISSUE_NUMBER."
               exit 1
             fi
+      
             CLAUDE_BRANCH="$(printf '%s\n' "$matching_branches" | tail -n 1)"
           fi
-
+      
           echo "Detected Claude branch: $CLAUDE_BRANCH"
-
-          remote_branch_sha="$( ls-remote --heads origin "refs/heads/$CLAUDE_BRANCH" | awk '{print $1}' | head -n 1)"
+      
+          remote_branch_sha="$(
+            git ls-remote --heads origin "refs/heads/$CLAUDE_BRANCH" \
+              | awk '{print $1}' \
+              | head -n 1
+          )"
+      
           if [ -z "$remote_branch_sha" ]; then
             echo "::error::Remote branch '$CLAUDE_BRANCH' does not exist on origin."
             exit 1
           fi
+      
           echo "Remote branch SHA: $remote_branch_sha"
-
-           fetch --no-tags origin "$BASE_BRANCH" "$CLAUDE_BRANCH"
-
-          ahead_count="$( rev-list --count "origin/${BASE_BRANCH}..origin/${CLAUDE_BRANCH}")"
+      
+          git fetch --no-tags origin "$BASE_BRANCH" "$CLAUDE_BRANCH"
+      
+          ahead_count="$(
+            git rev-list --count "origin/${BASE_BRANCH}..origin/${CLAUDE_BRANCH}"
+          )"
+      
           echo "Commits ahead of ${BASE_BRANCH}: $ahead_count"
+      
           if [ "$ahead_count" -eq 0 ]; then
             echo "::error::Branch '$CLAUDE_BRANCH' has no commits ahead of '$BASE_BRANCH'; refusing to open a PR."
             exit 1
           fi
-
+      
           echo "Looking for existing open PRs for branch '$CLAUDE_BRANCH'"
-          existing_pr_json="$(gh pr list --state open --head "$CLAUDE_BRANCH" --json number,url,headRefName)"
+      
+          existing_pr_json="$(
+            gh pr list \
+              --state open \
+              --head "$CLAUDE_BRANCH" \
+              --json number,url,headRefName
+          )"
+      
           echo "Existing PR lookup: ${existing_pr_json:-[]}"
-          existing_pr_url="$(printf '%s' "$existing_pr_json" | jq -r '.[0].url // empty')"
+      
+          existing_pr_url="$(
+            printf '%s' "$existing_pr_json" | jq -r '.[0].url // empty'
+          )"
+      
           if [ -n "$existing_pr_url" ]; then
             echo "Final PR URL: $existing_pr_url"
             exit 0
           fi
-
-          existing_issue_pr_url="$(gh pr list --state open --limit 100 --json number,url,title,body \
-            --jq ".[] | select(((.title // \"\") + \" \" + (.body // \"\")) | contains(\"#${ISSUE_NUMBER}\")) | .url" \
-            | head -n 1)"
+      
+          existing_issue_pr_url="$(
+            gh pr list \
+              --state open \
+              --limit 100 \
+              --json number,url,title,body \
+              --jq ".[] | select(((.title // \"\") + \" \" + (.body // \"\")) | contains(\"#${ISSUE_NUMBER}\")) | .url" \
+              | head -n 1
+          )"
+      
           echo "Existing issue-linked PR lookup: ${existing_issue_pr_url:-<none>}"
+      
           if [ -n "$existing_issue_pr_url" ]; then
             echo "Final PR URL: $existing_issue_pr_url"
             exit 0
           fi
-
+      
           echo "Creating PR from branch '$CLAUDE_BRANCH' to '$BASE_BRANCH'"
-          pr_url="$(gh pr create \
-            --base "$BASE_BRANCH" \
-            --head "$CLAUDE_BRANCH" \
-            --title "$ISSUE_TITLE" \
-            --body "Fixes #$ISSUE_NUMBER")"
+      
+          pr_url="$(
+            gh pr create \
+              --base "$BASE_BRANCH" \
+              --head "$CLAUDE_BRANCH" \
+              --title "$ISSUE_TITLE" \
+              --body "Fixes #$ISSUE_NUMBER"
+          )"
+      
           echo "PR creation result: $pr_url"
           echo "Final PR URL: $pr_url"
 
