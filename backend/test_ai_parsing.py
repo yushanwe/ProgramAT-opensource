@@ -59,7 +59,7 @@ def load_stream_server_function(name: str):
 
 
 class TestIssueTemplateGuidance(unittest.TestCase):
-    """Test Copilot-facing issue template guidance."""
+    """Test Claude-facing issue template guidance."""
 
     def test_visual_at_template_uses_executable_tool_lifecycle(self):
         template_path = Path(__file__).resolve().parent.parent / ".github" / "ISSUE_TEMPLATE" / "visual_at.md"
@@ -74,18 +74,15 @@ class TestIssueTemplateGuidance(unittest.TestCase):
         self.assertNotIn("call_take_photo_vlm", template)
         self.assertNotIn("execute_tool_policy", template)
         self.assertNotIn("TOOL_POLICY", template)
-        self.assertIn("TOOL_PROMPT", template)
-        self.assertIn("one concise, task-specific `TOOL_PROMPT`", template)
         self.assertNotIn("Task Stages", template)
         self.assertNotIn("copilot_llm_call", template)
-        self.assertIn("Choose models", template)
-        self.assertIn("on_take_photo", template)
-        self.assertIn("on_frame", template)
-        self.assertIn("runtime.emit", template)
+        self.assertIn("repository-root `CLAUDE.md`", template)
+        self.assertIn("Modify only the requested tool file", template)
 
-        instructions_path = template_path.parent.parent / "copilot-instructions.md"
+        instructions_path = template_path.parent.parent.parent / "CLAUDE.md"
         instructions = instructions_path.read_text(encoding="utf-8")
-        self.assertTrue(instructions.startswith("# ProgramAT code-agent instructions\n"))
+        normalized_instructions = " ".join(instructions.split())
+        self.assertTrue(instructions.startswith("# ProgramAT\n"))
         self.assertIn("call_model", instructions)
         self.assertIn("call_openai_responses_model", instructions)
         self.assertIn("get_recent_frames", instructions)
@@ -98,13 +95,13 @@ class TestIssueTemplateGuidance(unittest.TestCase):
         self.assertIn("compatibility with older tools", instructions)
         self.assertIn("## Tool quality and accessibility conventions", instructions)
         self.assertIn("Python in `tools/`", instructions)
-        self.assertIn("must not connect to the backend or use WebSockets", instructions)
-        self.assertIn("plain language, not JSON", instructions)
-        self.assertIn("does not prove the requested target is absent", instructions)
+        self.assertIn("must not connect to the backend or use WebSockets", normalized_instructions)
+        self.assertIn("plain language, not JSON", normalized_instructions)
+        self.assertIn("does not prove the requested target is absent", normalized_instructions)
         self.assertIn("9–12 and 1–3", instructions)
         self.assertIn("Avoid GPU-heavy packages", instructions)
-        self.assertIn("do not import one tool module from another", instructions)
-        self.assertIn("approved shared backend helpers", instructions)
+        self.assertIn("do not import one tool module from another", normalized_instructions)
+        self.assertIn("approved shared backend helpers", normalized_instructions)
         self.assertIn("avoid unnecessary documentation", instructions)
         self.assertIn("If one instruction is enough", instructions)
         self.assertIn("short numbered sequence", instructions)
@@ -123,28 +120,38 @@ class TestIssueTemplateGuidance(unittest.TestCase):
         self.assertIn("Intentional parallel execution is valid", instructions)
         self.assertIn("Assume `on_frame()` may run again while earlier async work is still running", instructions)
         self.assertIn("decide what unit of work it represents", instructions)
-        self.assertIn("Avoid launching another identical call for the same unit of work", instructions)
-        self.assertIn("intentional calls to different models may run concurrently", instructions)
-        self.assertIn("Record an in-flight task, generation, window id, or request key before awaiting", instructions)
-        self.assertIn("Validate cancellation and relevance again before emitting", instructions)
-        self.assertIn("clear completed task state in `finally` or a completion callback", instructions)
+        self.assertIn("Avoid launching another identical call for the same unit of work", normalized_instructions)
+        self.assertIn("intentional calls to different models may run concurrently", normalized_instructions)
+        self.assertIn("Record an in-flight task, generation, window id, or request key before awaiting", normalized_instructions)
+        self.assertIn("Validate cancellation and relevance again before emitting", normalized_instructions)
+        self.assertIn("clear completed task state in `finally` or a completion callback", normalized_instructions)
         self.assertIn("Do not use one global lock around all model calls", instructions)
+        self.assertIn("separate frame collection, temporal window scheduling, and model execution", normalized_instructions)
+        self.assertIn("Strongly overlapping frame histories should not automatically become separate analyses", normalized_instructions)
+        self.assertIn("Multi-frame means several ordered frames may be passed in one model call", normalized_instructions)
+        self.assertIn("call_key = (window_key, model_name, phase)", instructions)
+        self.assertIn("Event-driven tools should define what begins an event", normalized_instructions)
+        self.assertIn("Continuous monitoring tools should define an explicit interval", normalized_instructions)
+        self.assertIn("window_key = build_window_key(selected_frames)", instructions)
+        self.assertIn("What event or interval does one model call represent?", instructions)
+        self.assertIn("A per-frame or constantly changing generation key does not deduplicate temporal work", normalized_instructions)
+        self.assertIn("Scene change, motion, and temporal-window identity are not the same thing", normalized_instructions)
+        self.assertIn("Motion may contribute frames to the current gesture or event window", normalized_instructions)
+        self.assertIn("idle -> collecting -> analyzing -> waiting_for_reset -> idle", instructions)
         self.assertIn("Do not use JPEG bytes, base64 fragments", instructions)
-        self.assertIn("Cache heavyweight local models instead of loading them on every frame", instructions)
+        self.assertIn("Cache heavyweight local models instead of loading them on every frame", normalized_instructions)
         self.assertIn("key = (\"detailed_scene\", scene_generation)", instructions)
         self.assertIn("tasks[key] = task", instructions)
         self.assertIn("if runtime.get_state(\"scene_generation\") != scene_generation", instructions)
+        self.assertIn("source of truth for generated-tool instructions", instructions)
 
-        self.assertIn("Default to one direct instruction", template)
-        self.assertIn("genuinely depends on earlier visual findings", template)
-        self.assertIn("TOOL_PROMPT", template)
-        self.assertIn("runtime frame APIs", template)
+        compatibility_path = template_path.parent.parent / "copilot-instructions.md"
+        compatibility = compatibility_path.read_text(encoding="utf-8")
+        self.assertIn("Compatibility note", compatibility)
+        self.assertIn("source of truth is the repository-root `CLAUDE.md`", compatibility)
+
         self.assertNotIn("EXECUTION_MODE", template)
         self.assertNotIn("hosted_video_streaming", template)
-        self.assertIn("Tools belong in `tools/` and use Python", template)
-        self.assertIn("audio-friendly for blind and low-vision users", template)
-        self.assertIn("state uncertainty when evidence is insufficient", template)
-        self.assertIn("9–12 and 1–3", template)
 
     def test_temporal_sign_language_request_cannot_be_downgraded_to_take_photo(self):
         request = """Problem:

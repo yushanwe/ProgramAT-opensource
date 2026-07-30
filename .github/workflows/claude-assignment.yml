@@ -36,22 +36,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Add implementation note and assign issue creator
+      - name: Assign issue creator
         if: github.event_name == 'issues'
         uses: actions/github-script@v7
         with:
           script: |
             const issue = context.payload.issue;
-            const implementationNote =
-              "\n\nImplementation note: Read `.github/copilot-instructions.md`, then modify only the requested Python tool in `tools/` unless the public runtime is genuinely insufficient. Normally implement both Take Photo and Streaming lifecycle hooks and define one concise `TOOL_PROMPT` shared by both. Default the prompt to one direct instruction; add ordered steps only for genuinely dependent visual reasoning. Explicitly choose each entry point's models, frame selection, call timing, orchestration, state, and output behavior. Take Photo uses one current image. Streaming decides whether a changed latest frame or selected chronological history is appropriate. Use runtime frames, state, cancellation, and emission APIs. Keep output concise and audio-friendly for blind and low-vision users, state uncertainty when evidence is insufficient, and restrict clock-face navigation to 9–12 and 1–3. Open a pull request rather than pushing to main.";
-            if (!issue.body.includes("Write the code for this tool inside the tools folder")) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                body: issue.body + implementationNote
-              });
-            }
             await github.rest.issues.addAssignees({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -89,10 +79,10 @@ jobs:
             Latest request comment:
             ${{ github.event.comment.body }}
 
-            Read the issue or PR title, body, and latest request comment. Then read
-            `.github/copilot-instructions.md` and follow it exactly. The issue body,
-            that instruction file, and the implementation note appended to a new
-            issue are the authoritative requirements.
+            Read the issue or PR title, body, latest request comment, and the
+            repository-root `CLAUDE.md`. Follow `CLAUDE.md` as the generated-tool
+            instruction source of truth. The issue body, latest request comment,
+            and root `CLAUDE.md` are the authoritative requirements.
 
             Modify only the requested Python tool in `tools/` unless the public
             runtime is genuinely insufficient. Do not edit unrelated files and

@@ -49,8 +49,8 @@ so one tool can support both entry points. Legacy `main(image, input_data)` and
 declarative execution modes remain supported for compatibility.
 
 The connection and dispatch paths live in `handle_client` and the streaming
-scheduler in `stream_server.py`. The detailed generated-tool contract lives in
-`.github/copilot-instructions.md`, with a short pointer in `tools/CLAUDE.md`.
+scheduler in `stream_server.py`. The generated-tool contract now lives in the
+repository-root `CLAUDE.md`.
 
 ## Gotchas
 
