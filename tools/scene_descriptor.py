@@ -7,7 +7,7 @@ import asyncio
 import cv2
 import numpy as np
 
-from litellm_utils import call_model, extract_text
+from litellm_utils import call_model, call_openai_responses_model, extract_text
 
 TOOL_NAME = "scene_descriptor"
 
@@ -17,10 +17,18 @@ TOOL_PROMPT = (
     "be determined."
 )
 
-BRIEF_PROMPT = (
-    "List the main objects in this scene very briefly, like 'A desk, a cabinet, "
-    "a printer, and a cat.' Keep it to one short sentence naming the key items."
-)
+YOLO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
+    'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop',
+    'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
 
 DETAILED_PROMPT = (
     "Describe this scene in more detail for a blind user. Include spatial "
@@ -82,13 +90,15 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("scene_anchor", None)
     runtime.set_state("scene_generation", 0)
     runtime.set_state("brief_done", False)
-    runtime.set_state("detailed_done", False)
+    runtime.set_state("gemini_detailed_done", False)
+    runtime.set_state("gpt5_detailed_done", False)
     runtime.set_state("in_flight_brief", None)
-    runtime.set_state("in_flight_detailed", None)
+    runtime.set_state("in_flight_gemini_detailed", None)
+    runtime.set_state("in_flight_gpt5_detailed", None)
 
 
 async def on_frame(runtime, frame):
-    """Emit brief description on new scene, detailed on same scene continuation."""
+    """Emit brief YOLO description, then parallel Gemini and GPT-5 detailed descriptions."""
     if runtime.is_cancelled():
         return
 
@@ -105,34 +115,63 @@ async def on_frame(runtime, frame):
         runtime.set_state("scene_generation", generation)
         runtime.set_state("scene_anchor", embedding)
         runtime.set_state("brief_done", False)
-        runtime.set_state("detailed_done", False)
+        runtime.set_state("gemini_detailed_done", False)
+        runtime.set_state("gpt5_detailed_done", False)
 
-        # Cancel any in-flight detailed analysis from previous scene
-        detailed_task = runtime.get_state("in_flight_detailed")
-        if detailed_task and not detailed_task.done():
-            detailed_task.cancel()
-        runtime.set_state("in_flight_detailed", None)
+        # Cancel any in-flight detailed analyses from previous scene
+        gemini_task = runtime.get_state("in_flight_gemini_detailed")
+        if gemini_task and not gemini_task.done():
+            gemini_task.cancel()
+        gpt5_task = runtime.get_state("in_flight_gpt5_detailed")
+        if gpt5_task and not gpt5_task.done():
+            gpt5_task.cancel()
+        runtime.set_state("in_flight_gemini_detailed", None)
+        runtime.set_state("in_flight_gpt5_detailed", None)
 
     # Decide what to emit
     brief_done = runtime.get_state("brief_done", False)
-    detailed_done = runtime.get_state("detailed_done", False)
+    gemini_detailed_done = runtime.get_state("gemini_detailed_done", False)
+    gpt5_detailed_done = runtime.get_state("gpt5_detailed_done", False)
 
     if not brief_done:
-        # Emit brief description for new or unprocessed scene
+        # Emit brief YOLO-based description for new or unprocessed scene
         brief_task = runtime.get_state("in_flight_brief")
         if brief_task and not brief_task.done():
             return  # Already analyzing
 
         async def run_brief():
             try:
-                response = await asyncio.to_thread(
-                    call_model,
-                    "gemini/gemini-3.1-flash-lite-preview",
-                    [{"role": "user", "content": BRIEF_PROMPT}],
-                    [frame.image],
-                    {"timeout": 60, "num_retries": 0},
-                )
-                text = extract_text(response)
+                from PIL import Image
+                from ultralytics import YOLO
+                import io
+
+                # Use YOLO for object detection
+                pil_image = Image.fromarray(frame.image[:, :, ::-1].copy()).convert("RGB")
+                model = YOLO("yolo11n.pt")
+                detections = []
+                for result in model(pil_image, verbose=False):
+                    for box in result.boxes:
+                        label = str(result.names[int(box.cls[0])])
+                        detections.append(label)
+
+                # Format as brief sentence
+                if detections:
+                    unique_objects = []
+                    seen = set()
+                    for obj in detections:
+                        if obj.lower() not in seen:
+                            unique_objects.append(obj)
+                            seen.add(obj.lower())
+                    if len(unique_objects) == 1:
+                        text = f"A {unique_objects[0]}."
+                    elif len(unique_objects) == 2:
+                        text = f"A {unique_objects[0]} and a {unique_objects[1]}."
+                    else:
+                        text = ", ".join(f"a {obj}" for obj in unique_objects[:-1])
+                        text = f"{text}, and a {unique_objects[-1]}."
+                else:
+                    text = "No objects detected."
+
                 if (
                     runtime.is_cancelled()
                     or runtime.get_state("scene_generation") != generation
@@ -147,35 +186,67 @@ async def on_frame(runtime, frame):
         task = asyncio.create_task(run_brief())
         runtime.set_state("in_flight_brief", task)
 
-    elif not detailed_done:
-        # Scene is stable - emit detailed description
-        detailed_task = runtime.get_state("in_flight_detailed")
-        if detailed_task and not detailed_task.done():
-            return  # Already analyzing
+    elif not gemini_detailed_done or not gpt5_detailed_done:
+        # Scene is stable - launch parallel detailed descriptions
 
-        async def run_detailed():
-            try:
-                response = await asyncio.to_thread(
-                    call_model,
-                    "gemini/gemini-3.1-flash-lite-preview",
-                    [{"role": "user", "content": DETAILED_PROMPT}],
-                    [frame.image],
-                    {"timeout": 60, "num_retries": 0},
-                )
-                text = extract_text(response)
-                if (
-                    runtime.is_cancelled()
-                    or runtime.get_state("scene_generation") != generation
-                ):
-                    return
-                await runtime.emit(text, final=True, replace=True)
-                runtime.set_state("detailed_done", True)
-            finally:
-                if runtime.get_state("in_flight_detailed") is task:
-                    runtime.set_state("in_flight_detailed", None)
+        # Launch Gemini detailed if not done
+        if not gemini_detailed_done:
+            gemini_task = runtime.get_state("in_flight_gemini_detailed")
+            if not gemini_task or gemini_task.done():
+                async def run_gemini_detailed():
+                    try:
+                        response = await asyncio.to_thread(
+                            call_model,
+                            "gemini/gemini-3.1-flash-lite-preview",
+                            [{"role": "user", "content": DETAILED_PROMPT}],
+                            [frame.image],
+                            {"timeout": 60, "num_retries": 0},
+                        )
+                        text = extract_text(response)
+                        if (
+                            runtime.is_cancelled()
+                            or runtime.get_state("scene_generation") != generation
+                        ):
+                            return
+                        # Emit as non-final if GPT-5 is still pending
+                        gpt5_done = runtime.get_state("gpt5_detailed_done", False)
+                        await runtime.emit(text, final=gpt5_done, replace=True)
+                        runtime.set_state("gemini_detailed_done", True)
+                    finally:
+                        if runtime.get_state("in_flight_gemini_detailed") is task:
+                            runtime.set_state("in_flight_gemini_detailed", None)
 
-        task = asyncio.create_task(run_detailed())
-        runtime.set_state("in_flight_detailed", task)
+                task = asyncio.create_task(run_gemini_detailed())
+                runtime.set_state("in_flight_gemini_detailed", task)
+
+        # Launch GPT-5 detailed if not done
+        if not gpt5_detailed_done:
+            gpt5_task = runtime.get_state("in_flight_gpt5_detailed")
+            if not gpt5_task or gpt5_task.done():
+                async def run_gpt5_detailed():
+                    try:
+                        text = await asyncio.to_thread(
+                            call_openai_responses_model,
+                            "gpt-5",
+                            DETAILED_PROMPT,
+                            frame.image,
+                            reasoning_effort="medium",
+                            timeout=90,
+                        )
+                        if (
+                            runtime.is_cancelled()
+                            or runtime.get_state("scene_generation") != generation
+                        ):
+                            return
+                        # Emit as final - this is the most accurate model
+                        await runtime.emit(text, final=True, replace=True)
+                        runtime.set_state("gpt5_detailed_done", True)
+                    finally:
+                        if runtime.get_state("in_flight_gpt5_detailed") is task:
+                            runtime.set_state("in_flight_gpt5_detailed", None)
+
+                task = asyncio.create_task(run_gpt5_detailed())
+                runtime.set_state("in_flight_gpt5_detailed", task)
 
 
 async def on_stream_stop(runtime):
@@ -187,12 +258,16 @@ async def on_stream_stop(runtime):
     brief_task = runtime.get_state("in_flight_brief")
     if brief_task and not brief_task.done():
         brief_task.cancel()
-    detailed_task = runtime.get_state("in_flight_detailed")
-    if detailed_task and not detailed_task.done():
-        detailed_task.cancel()
+    gemini_task = runtime.get_state("in_flight_gemini_detailed")
+    if gemini_task and not gemini_task.done():
+        gemini_task.cancel()
+    gpt5_task = runtime.get_state("in_flight_gpt5_detailed")
+    if gpt5_task and not gpt5_task.done():
+        gpt5_task.cancel()
 
     runtime.set_state("in_flight_brief", None)
-    runtime.set_state("in_flight_detailed", None)
+    runtime.set_state("in_flight_gemini_detailed", None)
+    runtime.set_state("in_flight_gpt5_detailed", None)
 
 
 __all__ = [
