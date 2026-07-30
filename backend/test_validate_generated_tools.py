@@ -245,7 +245,7 @@ EXECUTION_MODE = "hosted_video_streaming"
 VIDEO_CONFIG = {"window_seconds": 6}
 TOOL_PROMPT = "Describe the door."
 '''
-        failures = validate_generated_tools.validate_rtvi_streaming_tool(
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
             incomplete, issue, Path("tools/door_change.py")
         )
         self.assertTrue(any("VIDEO_CONFIG is missing" in failure for failure in failures))
@@ -263,7 +263,7 @@ VIDEO_CONFIG = {
 TOOL_PROMPT = "Compare chronological early and late frames and report whether the door changed."
 '''
         self.assertEqual(
-            validate_generated_tools.validate_rtvi_streaming_tool(
+            validate_generated_tools.validate_temporal_streaming_tool(
                 complete, issue, Path("tools/door_change.py")
             ),
             [],
@@ -297,7 +297,7 @@ TOOL_PROMPT = (
 )
 '''
         self.assertEqual(
-            validate_generated_tools.validate_rtvi_streaming_tool(
+            validate_generated_tools.validate_temporal_streaming_tool(
                 tool, issue, Path("tools/recent_sign_language.py")
             ),
             [],
@@ -330,7 +330,7 @@ TOOL_PROMPT = "Compare chronological early and late hand movement and identify t
             [],
         )
         self.assertEqual(
-            validate_generated_tools.validate_rtvi_streaming_tool(
+            validate_generated_tools.validate_temporal_streaming_tool(
                 temporal_tool, issue_with_wrong_suggestion, path
             ),
             [],
@@ -350,7 +350,7 @@ VIDEO_CONFIG = {
 OUTPUT_CONFIG = {"schema": "played_card_event"}
 TOOL_PROMPT = "Inspect chronological hand motion and identify the signed phrase."
 '''
-        failures = validate_generated_tools.validate_rtvi_streaming_tool(
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
             tool, issue, Path("tools/recent_sign_language.py")
         )
         self.assertTrue(any("card-specific prompt" in failure for failure in failures))
