@@ -8,7 +8,8 @@
 import WebSocketService from './WebSocketService';
 import { CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
 
-const REQUEST_TIMEOUT_MS = 120_000; // video summarization + two Gemini calls can take 20s+
+const REQUEST_TIMEOUT_MS = 120_000; // text-only requests: brainstorm question, no video
+const VIDEO_REQUEST_TIMEOUT_MS = 300_000; // video upload + summarization + two Gemini calls; uploads over a tunnel (e.g. ngrok) can be slow
 
 /** Convert the WebSocket URL to an HTTP base URL for REST endpoints. */
 export function getHttpBaseUrl(): string {
@@ -34,9 +35,14 @@ export function buildVideoPart(uri: string) {
   return { uri, type, name: `recording.${ext}` } as any;
 }
 
-async function postWithTimeout(url: string, body: FormData | string, headers?: Record<string, string>): Promise<Response> {
+async function postWithTimeout(
+  url: string,
+  body: FormData | string,
+  headers?: Record<string, string>,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<Response> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, {
       method: 'POST',
@@ -77,7 +83,12 @@ export async function submitCreation(args: SubmitCreationArgs): Promise<Creation
   }
 
   try {
-    const response = await postWithTimeout(`${baseUrl}/submit-creation`, formData);
+    const response = await postWithTimeout(
+      `${baseUrl}/submit-creation`,
+      formData,
+      undefined,
+      args.videoUri ? VIDEO_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
+    );
     const result = await response.json();
     console.log('[IssueSubmissionService] submit-creation response status=', response.status, 'body=', JSON.stringify(result));
     return result as CreationResponse;
@@ -109,7 +120,12 @@ export async function submitUpdate(args: SubmitUpdateArgs): Promise<UpdateRespon
   }
 
   try {
-    const response = await postWithTimeout(`${baseUrl}/submit-update`, formData);
+    const response = await postWithTimeout(
+      `${baseUrl}/submit-update`,
+      formData,
+      undefined,
+      args.videoUri ? VIDEO_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
+    );
     const result = await response.json();
     console.log('[IssueSubmissionService] submit-update response status=', response.status, 'body=', JSON.stringify(result));
     return result as UpdateResponse;

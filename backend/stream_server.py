@@ -6024,8 +6024,11 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
     except web.HTTPRequestEntityTooLarge as e:
         logger.error("Request too large in /submit-creation: %s", e)
         return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
+    except (ConnectionResetError, asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
+        logger.error("Upload connection dropped in /submit-creation: %s: %s", type(e).__name__, e)
+        return web.json_response({'status': 'error', 'error': 'The upload was interrupted. Please check your connection and try again.'}, status=400)
     except Exception as e:
-        logger.error("Failed to parse multipart in /submit-creation: %s", e)
+        logger.error("Failed to parse multipart in /submit-creation: %s: %s", type(e).__name__, e, exc_info=True)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
 
     if not text or not text.strip():
@@ -6314,8 +6317,11 @@ async def handle_update_submit(request: web.Request) -> web.Response:
     except web.HTTPRequestEntityTooLarge as e:
         logger.error("Request too large in /submit-update: %s", e)
         return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
+    except (ConnectionResetError, asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
+        logger.error("Upload connection dropped in /submit-update: %s: %s", type(e).__name__, e)
+        return web.json_response({'status': 'error', 'error': 'The upload was interrupted. Please check your connection and try again.'}, status=400)
     except Exception as e:
-        logger.error("Failed to parse multipart in /submit-update: %s", e)
+        logger.error("Failed to parse multipart in /submit-update: %s: %s", type(e).__name__, e, exc_info=True)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
 
     if not text or not text.strip():
@@ -6401,8 +6407,11 @@ async def handle_test_video_summary(request: web.Request) -> web.Response:
     except web.HTTPRequestEntityTooLarge as e:
         logger.error("Request too large in /test-video-summary: %s", e)
         return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
+    except (ConnectionResetError, asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
+        logger.error("Upload connection dropped in /test-video-summary: %s: %s", type(e).__name__, e)
+        return web.json_response({'status': 'error', 'error': 'The upload was interrupted. Please check your connection and try again.'}, status=400)
     except Exception as e:
-        logger.error("Failed to parse multipart in /test-video-summary: %s", e)
+        logger.error("Failed to parse multipart in /test-video-summary: %s: %s", type(e).__name__, e, exc_info=True)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
 
     if not video_bytes:
