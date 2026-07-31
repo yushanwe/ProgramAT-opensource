@@ -83,6 +83,9 @@ jobs:
             repository-root `CLAUDE.md`. Follow `CLAUDE.md` as the generated-tool
             instruction source of truth. The issue body, latest request comment,
             and root `CLAUDE.md` are the authoritative requirements.
+            Before implementing any temporal or multi-frame Streaming tool,
+            inspect the relevant repository runtime and existing tool patterns
+            referenced by `CLAUDE.md` rather than inventing scheduling from scratch.
 
             Modify only the requested Python tool in `tools/` unless the public
             runtime is genuinely insufficient. Do not edit unrelated files and

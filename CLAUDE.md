@@ -135,6 +135,18 @@ scene anchors, prior results, generations, and temporary tasks in runtime
 state rather than module globals. Check cancellation and a tool-owned
 generation or scene identifier before emitting work that may be stale.
 
+Before implementing any temporal or multi-frame Streaming tool, inspect the
+real repository code instead of inventing scheduling from scratch. Read the
+generated-tool runtime API in `backend/generated_tool_runtime.py`, especially
+`runtime.get_recent_frames(...)`, `runtime.get_latest_frame()`,
+`runtime.emit(...)`, `runtime.is_cancelled()`, and `cancel_tasks(...)`. Also
+inspect the Streaming lifecycle and cancellation flow in
+`backend/stream_server.py`, including backend frame scheduling, visual-state
+gating, and how `on_stream_stop` is invoked. Then inspect one or two existing
+Streaming tools that already behave correctly for the requested pattern and
+reuse their cleanup and state-management style where it fits. Prefer adapting a
+proven repository pattern over inventing a new scheduler.
+
 The tool may define a small literal frame configuration when the backend needs
 settings before delivering frames. Do not use configuration as a substitute
 for executable frame selection. Prefer runtime selection for latest-frame,
@@ -213,7 +225,12 @@ concurrent. A lock or in-flight map only prevents duplicates when equivalent
 work shares the same stable key. A per-frame or constantly changing generation
 key does not deduplicate temporal work.
 
-Use a small runtime-state guard, not backend-owned scheduling. For example:
+Use a small runtime-state guard, not backend-owned scheduling. Equivalent work
+must share a stable key. A per-frame or constantly changing generation key is
+not a real lock for temporal work.
+
+For static or scene-based Streaming, a keyed runtime-task guard can be enough.
+For example:
 
 ```python
 async def on_frame(runtime, frame):
@@ -243,11 +260,47 @@ async def on_frame(runtime, frame):
     runtime.set_state("in_flight", tasks)
 ```
 
+Keep the active task in runtime state when using `asyncio.create_task`, log or
+surface task exceptions, clear or recover task state after model errors, and
+return or emit a fallback when model output is empty. If the tool records a
+cooldown, store the cooldown timestamp at the actual transition into cooldown,
+not from a stale time captured before inference. In `on_stream_stop`, cancel
+and await active tasks so the stream cannot leave detached work running.
+
 For static single-frame streaming tasks, prefer changed-latest-frame behavior:
 compare the current frame to a recent anchor, skip visually equivalent scenes,
 and emit only when the scene meaningfully changed or enough time has passed to
 justify a refresh. `tools/empty_seat_detection.py` is the reference pattern for
 this kind of gating.
+
+For temporal or multi-frame Streaming, first decide which behavior the request
+actually needs:
+
+1. Continuous analysis:
+   Use when the user expects ongoing updates during Streaming.
+2. Event-driven analysis:
+   Use for discrete gestures, card plays, state transitions, or one-time
+   actions.
+3. Periodic window analysis:
+   Use when the user expects regular summaries over non-overlapping or
+   deliberately advanced windows.
+
+Multi-frame input and repeated execution are separate decisions. A tool may use
+multi-frame input once for one event, or repeatedly for ongoing continuous
+analysis. Do not assume that using several frames means calling the model on
+every frame.
+
+For every temporal tool, explicitly decide all of the following before writing
+code:
+
+1. What one model call represents.
+2. How frames are collected and ordered.
+3. When a window becomes ready.
+4. Whether the next window overlaps the prior one.
+5. What prevents accidental duplicate calls.
+6. Whether any parallel calls are intentional.
+7. What state permits the next analysis.
+8. How failures, cancellation, and stream stop reset the tool.
 
 For multi-frame streaming tasks, separate frame collection, temporal window
 scheduling, and model execution. `on_frame()` may keep updating recent frame
@@ -273,6 +326,32 @@ generation relevance before emitting.
 
 Multi-frame means several ordered frames may be passed in one model call. It
 does not mean making one model call for every arriving frame.
+
+For continuous analysis, do not force a gesture-style cooldown or a permanent
+`waiting_for_reset` state. Prefer a stable pattern such as:
+
+```text
+collect recent frames
+-> start one analysis
+-> block equivalent work while it is running
+-> emit result
+-> advance to a meaningfully new frame/window
+-> allow the next analysis
+```
+
+The next analysis must not reuse the exact same work unit. Use a stable marker
+such as `last_processed_frame_id`, `window_start/window_end`, a timestamp
+boundary, or `generation + frame range`.
+
+For event-driven analysis, use a bounded event lifecycle such as
+`idle -> collecting -> analyzing -> waiting_for_reset -> idle`. Do not use
+scene change as a substitute for event identity when the motion itself is the
+signal being analyzed.
+
+For periodic window analysis, define an explicit non-overlapping or
+deliberately advanced window schedule. Do not let repeated `on_frame()` calls
+create accidental sliding-window duplicates unless continuous overlapping
+windows were explicitly intended by the request.
 
 When deciding between single-frame and multi-frame Streaming:
 
@@ -335,6 +414,11 @@ current generation before emitting. The exact mechanism may use tasks,
 generations, state flags, locks, or window ids, but equivalent temporal work
 must be deduplicated before the first `await`.
 
+When using `asyncio.create_task`, keep the task object in runtime state, clear
+it in `finally` or a completion callback, and either handle exceptions inside
+the task or inspect the finished task so failures are not silently dropped. A
+model failure must not permanently freeze the tool's state machine.
+
 Before writing temporal streaming code, answer these questions:
 
 1. What event or interval does one model call represent?
@@ -350,6 +434,15 @@ scene similarity. Use a stable visual signal such as a lightweight embedding,
 histogram, tracked generation, explicit temporal window, or another
 image-derived comparison designed for repeated frames. Cache heavyweight local
 models instead of loading them on every frame.
+
+Before finishing a temporal or multi-frame tool, verify all of the following:
+
+1. Repeated `on_frame()` calls cannot launch equivalent work.
+2. Intentional parallel calls still work.
+3. A model failure cannot permanently freeze the tool state.
+4. `on_stream_stop` cannot leave detached tasks running.
+5. Continuous tools can continue producing later results after one analysis finishes.
+6. Event-based tools do not repeatedly emit the same event.
 
 Each hook independently decides whether to return once or emit results that
 append, replace, remain partial, or finalize. The backend only transports
