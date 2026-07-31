@@ -260,12 +260,11 @@ async def on_frame(runtime, frame):
     runtime.set_state("in_flight", tasks)
 ```
 
-Keep the active task in runtime state when using `asyncio.create_task`, log or
-surface task exceptions, clear or recover task state after model errors, and
-return or emit a fallback when model output is empty. If the tool records a
-cooldown, store the cooldown timestamp at the actual transition into cooldown,
-not from a stale time captured before inference. In `on_stream_stop`, cancel
-and await active tasks so the stream cannot leave detached work running.
+Do not use detached `asyncio.create_task()` scheduling by default. For ordinary
+continuous temporal tools, prefer the simpler single-in-flight recent-history
+pattern used by the working Copilot implementation. Only switch to detached
+tasks, event generations, cooldown states, motion thresholds, or scene-change
+machinery when the requested behavior genuinely requires them.
 
 For static single-frame streaming tasks, prefer changed-latest-frame behavior:
 compare the current frame to a recent anchor, skip visually equivalent scenes,
@@ -290,6 +289,13 @@ multi-frame input once for one event, or repeatedly for ongoing continuous
 analysis. Do not assume that using several frames means calling the model on
 every frame.
 
+Choose single-frame or multi-frame deliberately:
+
+- Use single-frame analysis when one image is enough, such as object identity, color, visible text, a stable hand pose, or the current spatial layout.
+- Use multi-frame analysis when the task depends on change, motion, order, or recent history, such as waving, finger motion, a card being played, a person entering or leaving, a signed sequence, or a before-versus-after change.
+- A tool may support both: Take Photo can use one image while Streaming uses recent chronological frames only when temporal evidence is actually useful.
+- Do not use multi-frame input merely because the tool runs in Streaming mode.
+
 For every temporal tool, explicitly decide all of the following before writing
 code:
 
@@ -302,27 +308,92 @@ code:
 7. What state permits the next analysis.
 8. How failures, cancellation, and stream stop reset the tool.
 
-For multi-frame streaming tasks, separate frame collection, temporal window
-scheduling, and model execution. `on_frame()` may keep updating recent frame
-history, motion evidence, scene state, gesture state, or candidate-event state
-without calling a model. Before a multi-frame model call, define what one unit
-of temporal analysis represents, such as one gesture attempt, one swipe, one
-scene transition, one card-play event, one fixed non-overlapping monitoring
-interval, or one user-requested continuous update period.
+For ordinary continuous temporal tools, prefer this simple proven pattern:
 
-Give each candidate temporal window an identity such as
-`window_key = (event_generation, start_frame_id, end_frame_id)`. Scene change,
-motion, and temporal-window identity are not the same thing. Motion may
-contribute frames to the current gesture or event window; it should not
-automatically create a new analysis generation. One gesture or event window
-should keep one stable identity from collection start until analysis
-completes. Strongly overlapping frame histories should not automatically become
-separate analyses when they represent the same event. Once a window is ready,
-select a small chronological set of representative frames, start one analysis
-for that window, mark the window or generation in flight before awaiting,
-avoid starting an equivalent analysis for the same window while it is running,
-mark that window analyzed after completion, and re-check cancellation plus
-generation relevance before emitting.
+1. `on_frame()` checks cancellation.
+2. If an equivalent analysis is already running, return immediately.
+3. Ignore a frame already processed.
+4. Read recent frames from the runtime.
+5. Sort them chronologically.
+6. Pass the selected images together in one model call.
+7. Emit the result.
+8. Record the processed frame and result.
+9. Clear the analyzing flag in `finally` so later frames can trigger another analysis.
+
+The intended flow is:
+
+```text
+new frame arrives
+-> no equivalent analysis currently running
+-> obtain recent chronological history
+-> make one multi-frame model call
+-> emit result
+-> release analysis guard
+-> a later frame may start the next analysis
+```
+
+This is continuous analysis with single-in-flight scheduling. It is not one
+call per frame.
+
+Use a pattern equivalent to:
+
+```python
+async def on_stream_start(runtime, input_data):
+    runtime.set_state("is_analyzing", False)
+    runtime.set_state("last_processed_frame_id", None)
+    runtime.set_state("last_result_text", None)
+
+
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+
+    if runtime.get_state("is_analyzing", False):
+        return
+
+    if runtime.get_state("last_processed_frame_id") == frame.frame_id:
+        return
+
+    recent_frames = runtime.get_recent_frames(seconds=WINDOW_SECONDS) or [frame]
+    ordered_frames = sorted(recent_frames, key=lambda candidate: candidate.timestamp)
+    images = [candidate.image for candidate in ordered_frames if candidate.image is not None]
+
+    if not images:
+        return
+
+    runtime.set_state("is_analyzing", True)
+    try:
+        text = await analyze_images(images)
+        text = (text or FALLBACK_TEXT).strip() or FALLBACK_TEXT
+
+        if runtime.is_cancelled():
+            return
+
+        if text != runtime.get_state("last_result_text"):
+            await runtime.emit(
+                text,
+                final=True,
+                metadata={
+                    "frame_id": frame.frame_id,
+                    "frame_count": len(images),
+                },
+            )
+            runtime.set_state("last_result_text", text)
+
+        runtime.set_state("last_processed_frame_id", frame.frame_id)
+    finally:
+        runtime.set_state("is_analyzing", False)
+```
+
+The exact variable names may differ, but preserve these properties:
+
+- one active equivalent analysis at a time;
+- multiple chronological frames in one call when temporal evidence is needed;
+- state reserved before the first `await`;
+- state always released in `finally`;
+- later frames can continue producing later analyses;
+- no detached task unless there is a clear reason;
+- normal final emits without `replace=True` unless progressive output is intentional.
 
 Multi-frame means several ordered frames may be passed in one model call. It
 does not mean making one model call for every arriving frame.
@@ -343,15 +414,28 @@ The next analysis must not reuse the exact same work unit. Use a stable marker
 such as `last_processed_frame_id`, `window_start/window_end`, a timestamp
 boundary, or `generation + frame range`.
 
-For event-driven analysis, use a bounded event lifecycle such as
-`idle -> collecting -> analyzing -> waiting_for_reset -> idle`. Do not use
-scene change as a substitute for event identity when the motion itself is the
-signal being analyzed.
+When the simple continuous pattern is not enough, upgrade deliberately:
 
-For periodic window analysis, define an explicit non-overlapping or
-deliberately advanced window schedule. Do not let repeated `on_frame()` calls
-create accidental sliding-window duplicates unless continuous overlapping
-windows were explicitly intended by the request.
+- Event-driven analysis:
+  Use a bounded lifecycle such as `idle -> collecting -> analyzing -> waiting_for_reset -> idle`. Do not use scene change as a substitute for event identity when the motion itself is the signal being analyzed.
+- Periodic window analysis:
+  Define an explicit non-overlapping or deliberately advanced window schedule. Do not let repeated `on_frame()` calls create accidental sliding-window duplicates unless continuous overlapping windows were explicitly intended by the request.
+- Richer event/window identity:
+  If one call represents a discrete gesture, card play, transition, or other bounded event, separate frame collection, temporal window scheduling, and model execution. `on_frame()` may keep updating recent history or motion evidence without calling a model. Give the work unit a stable identity such as `window_key = (event_generation, start_frame_id, end_frame_id)`, reserve it before awaiting, avoid equivalent overlapping analyses, and re-check cancellation and staleness before emitting.
+
+When using multiple frames:
+
+- obtain them through the runtime's existing recent-frame API;
+- sort frames chronologically;
+- select a bounded number of representative frames when history is large;
+- preserve earliest-to-latest order;
+- avoid passing hundreds of full-resolution frames;
+- ensure at least one valid image exists;
+- use a text fallback when model output is empty.
+
+For bounded sampling, prefer representative sampling across the full recent
+interval rather than only the last few frames when the action may have
+occurred earlier.
 
 When deciding between single-frame and multi-frame Streaming:
 
@@ -368,21 +452,8 @@ keyed calls such as `call_key = (window_key, model_name, phase)`. Prevent
 accidental duplicates of the same temporal work, not intentional parallel
 calls for distinct models or subtasks.
 
-Do not let adjacent overlapping histories schedule new equivalent work by
-default, such as `frame 20 -> frames 12-20`, `frame 21 -> frames 13-21`,
-`frame 22 -> frames 14-22`, unless the user explicitly asked for continuous
-sliding-window monitoring at that frequency.
-
-Before implementing a temporal tool, decide whether it is event-driven or
-continuous monitoring. Event-driven tools should define what begins an event,
-when enough frames have been collected, when the event is complete, and what
-resets the tool for the next event. A useful state machine is
-`idle -> collecting -> analyzing -> waiting_for_reset -> idle`. Collect frames
-first, analyze that window once, then require a reset such as a stable or
-neutral period, cooldown plus new motion, or another clearly new event before
-creating the next window. Continuous monitoring tools should define an explicit
-interval or non-overlapping window progression and should not let every
-`on_frame()` independently schedule another analysis.
+Do not confuse motion inside a temporal window, a new scene, and a new
+model-call generation. They are not automatically the same thing.
 
 This pattern is unsafe:
 
@@ -417,7 +488,12 @@ must be deduplicated before the first `await`.
 When using `asyncio.create_task`, keep the task object in runtime state, clear
 it in `finally` or a completion callback, and either handle exceptions inside
 the task or inspect the finished task so failures are not silently dropped. A
-model failure must not permanently freeze the tool's state machine.
+model failure must not permanently freeze the tool's state machine. Log or
+surface task exceptions, clear or recover state after model errors, and if the
+tool records a cooldown, use `time.time()` at the actual transition into
+cooldown rather than a stale timestamp captured before inference. In
+`on_stream_stop`, cancel and await active tasks so the stream cannot leave
+detached work running.
 
 Before writing temporal streaming code, answer these questions:
 
@@ -443,6 +519,9 @@ Before finishing a temporal or multi-frame tool, verify all of the following:
 4. `on_stream_stop` cannot leave detached tasks running.
 5. Continuous tools can continue producing later results after one analysis finishes.
 6. Event-based tools do not repeatedly emit the same event.
+7. Empty model outputs are replaced with a fallback.
+8. The emit contract matches a known working repository pattern.
+9. Unnecessary event-state complexity has been avoided.
 
 Each hook independently decides whether to return once or emit results that
 append, replace, remain partial, or finalize. The backend only transports
