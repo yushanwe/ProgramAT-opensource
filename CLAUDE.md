@@ -173,6 +173,13 @@ Choose model strategy from the requested output behavior:
 Model strategy remains tool-controlled. The backend must not turn a multi-model
 tool into parallel progressive execution.
 
+All three strategies are implemented directly in `on_take_photo` and `on_frame`
+using `asyncio.create_task`, `asyncio.to_thread`, and `await runtime.emit(...)`. Do
+not declare `TOOL_POLICY` in any new tool — not even to request parallel progressive
+output. `TOOL_POLICY` is a legacy contract for older declarative take-photo tools
+only; the validator rejects it in any tool that also declares executable lifecycle
+hooks (`on_take_photo`, `on_frame`, etc.).
+
 ## Entry-point behavior
 
 Take Photo receives one current image. It should use `TOOL_PROMPT`, explicitly
