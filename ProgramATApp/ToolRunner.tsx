@@ -627,15 +627,17 @@ export default function ToolRunner({
             return;
           }
           lastProgressiveResultIndexRef.current = message.result_index;
-          if (message.final) {
-            if (message.mode === 'streaming') {
-              setIsStreamProcessing(false);
-            } else {
-              setIsRunning(progressiveInvocationIsRunning(message));
-            }
-            return;
-          }
           const labeledText = formatProgressiveResult(message);
+          console.log(
+            '[ToolProgress] render_candidate',
+            'invocation_id=', message.invocation_id,
+            'mode=', message.mode || 'unknown',
+            'final=', Boolean(message.final),
+            'partial=', Boolean(message.partial),
+            'replace=', Boolean(message.replace),
+            'text_length=', typeof message.text === 'string' ? message.text.length : 0,
+            'renderable=', Boolean(labeledText),
+          );
           if (labeledText) {
             setToolOutput(labeledText);
             if (audioEnabled) {
@@ -650,6 +652,14 @@ export default function ToolRunner({
                 {queue: true},
               );
             }
+          }
+          if (message.final) {
+            if (message.mode === 'streaming') {
+              setIsStreamProcessing(false);
+            } else {
+              setIsRunning(progressiveInvocationIsRunning(message));
+            }
+            return;
           }
         } else if (message.type === 'tool_result') {
           console.log('[ToolRunner] Tool result received:', message.status);

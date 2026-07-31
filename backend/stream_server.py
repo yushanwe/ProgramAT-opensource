@@ -606,9 +606,92 @@ def _tool_frame(
 def _generated_emit_callback(websocket, client_id: str, owner: Dict[str, Any], mode: str):
     async def emit(event: Dict[str, Any]) -> bool:
         if owner.get("cancelled"):
+            logger.info(
+                "[GeneratedToolTransport] emit_rejected client=%s tool=%s session=%s "
+                "request=%s index=%s reason=cancelled mode=%s",
+                client_id,
+                event.get("tool_name"),
+                event.get("session_id"),
+                event.get("request_id"),
+                event.get("result_index"),
+                mode,
+            )
             return False
         if mode == "streaming" and active_streaming_tools.get(client_id) is not owner:
+            logger.info(
+                "[GeneratedToolTransport] emit_rejected client=%s tool=%s session=%s "
+                "request=%s index=%s reason=stale_owner mode=%s",
+                client_id,
+                event.get("tool_name"),
+                event.get("session_id"),
+                event.get("request_id"),
+                event.get("result_index"),
+                mode,
+            )
             return False
+        if mode == "streaming":
+            payload = {
+                "type": "tool_stream_result",
+                "tool_name": event["tool_name"],
+                "result": event["text"],
+                "execution_id": event["result_index"],
+                "partial": event["partial"],
+                "final": event["final"],
+                "replace": event["replace"],
+                "request_id": event["request_id"],
+                "session_id": event["session_id"],
+                "metadata": event["metadata"],
+                "audio": {
+                    "type": "speech",
+                    "text": event["text"],
+                    "rate": 1.0,
+                    "interrupt": False,
+                } if event["text"] else None,
+                "timestamp": datetime.now().isoformat(),
+            }
+            logger.info(
+                "[GeneratedToolTransport] payload_ready client=%s tool=%s session=%s "
+                "request=%s index=%s type=%s partial=%s final=%s replace=%s "
+                "text_length=%s mode=%s frontend_type=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                event["result_index"],
+                "tool_stream_result",
+                event["partial"],
+                event["final"],
+                event["replace"],
+                len(event["text"] or ""),
+                mode,
+                payload["type"],
+            )
+            logger.info(
+                "[GeneratedToolTransport] send_result client=%s tool=%s session=%s "
+                "request=%s index=%s partial=%s final=%s replace=%s text_length=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                event["result_index"],
+                event["partial"],
+                event["final"],
+                event["replace"],
+                len(event["text"] or ""),
+                mode,
+            )
+            await websocket.send(json.dumps(payload))
+            logger.info(
+                "[GeneratedToolTransport] send_result_complete client=%s tool=%s session=%s "
+                "request=%s index=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                event["result_index"],
+                mode,
+            )
+            return True
         payload = {
             "type": "tool_progress_result",
             "invocation_id": event["invocation_id"],
@@ -626,7 +709,33 @@ def _generated_emit_callback(websocket, client_id: str, owner: Dict[str, Any], m
             "mode": mode,
             "timestamp": datetime.now().isoformat(),
         }
+        logger.info(
+            "[GeneratedToolTransport] payload_ready client=%s tool=%s session=%s "
+            "request=%s index=%s type=%s partial=%s final=%s replace=%s "
+            "text_length=%s mode=%s frontend_type=%s",
+            client_id,
+            event["tool_name"],
+            event["session_id"],
+            event["request_id"],
+            event["result_index"],
+            "tool_progress_result",
+            event["partial"],
+            event["final"],
+            event["replace"],
+            len(event["text"] or ""),
+            mode,
+            payload["type"],
+        )
         if event["result_index"] == 1:
+            logger.info(
+                "[GeneratedToolTransport] send_started client=%s tool=%s session=%s "
+                "request=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                mode,
+            )
             await websocket.send(json.dumps({
                 "type": "tool_progress_started",
                 "invocation_id": event["invocation_id"],
@@ -634,7 +743,40 @@ def _generated_emit_callback(websocket, client_id: str, owner: Dict[str, Any], m
                 "mode": mode,
                 "timestamp": datetime.now().isoformat(),
             }))
+            logger.info(
+                "[GeneratedToolTransport] send_started_complete client=%s tool=%s "
+                "session=%s request=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                mode,
+            )
+        logger.info(
+            "[GeneratedToolTransport] send_result client=%s tool=%s session=%s "
+            "request=%s index=%s partial=%s final=%s replace=%s text_length=%s mode=%s",
+            client_id,
+            event["tool_name"],
+            event["session_id"],
+            event["request_id"],
+            event["result_index"],
+            event["partial"],
+            event["final"],
+            event["replace"],
+            len(event["text"] or ""),
+            mode,
+        )
         await websocket.send(json.dumps(payload))
+        logger.info(
+            "[GeneratedToolTransport] send_result_complete client=%s tool=%s session=%s "
+            "request=%s index=%s mode=%s",
+            client_id,
+            event["tool_name"],
+            event["session_id"],
+            event["request_id"],
+            event["result_index"],
+            mode,
+        )
         return True
 
     return emit

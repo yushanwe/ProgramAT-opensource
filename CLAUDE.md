@@ -42,13 +42,13 @@ Read these instead of guessing:
 
 ## Generated-tool contract
 
-ProgramAT tools are executable Python modules in `tools/`. New tools own their
-model selection, prompts, frame selection, temporal logic, call timing,
-concurrency, state, and output behavior. The backend supplies decoded frames,
-isolated runtime state, cancellation, approved model-call helpers, and result
-transport.
+ProgramAT tools are executable Python modules in `tools/`. A generated tool
+should normally modify only one Python file under `tools/`. The tool owns its
+prompt, model selection, frame selection, runtime state, and output behavior.
+The backend supplies decoded frames, isolated state, cancellation, approved
+model helpers, and result transport.
 
-Normally implement both entry points of the same tool:
+Normally implement the hooks the task actually needs:
 
 ```python
 TOOL_NAME = "concise_snake_case_name"
@@ -67,51 +67,46 @@ async def on_stream_stop(runtime):
     ...
 ```
 
-Infer supported behavior from the hooks. Do not declare `EXECUTION_MODE`,
-`TOOL_POLICY`, or call `execute_tool_policy()` in new tools. Those declarative
-contracts remain only for compatibility with older tools.
+Do not declare `EXECUTION_MODE`, `TOOL_POLICY`, or call
+`execute_tool_policy()` in new tools.
 
-Every visual tool should support Take Photo unless a single image is genuinely
-meaningless. Implement meaningful Streaming behavior when possible. A static
-task can process one changed latest frame; a temporal task can select recent
-chronological frames. Do not force multiple frames when one is enough.
+## What generated tools may do
 
-## One shared prompt
+- Call approved model helpers such as `call_model`, `extract_text`, and
+  `call_openai_responses_model`.
+- Use one current image or recent runtime frames.
+- Keep isolated runtime state with `runtime.get_state(...)` and
+  `runtime.set_state(...)`.
+- Emit spoken results through `runtime.emit(...)`.
+- Choose their own model strategy.
+- Use normal asyncio control flow and approved packages that pass the
+  validator.
 
-Build one `TOOL_PROMPT` from the task, expected output, constraints, and
-examples, and use it in both Take Photo and Streaming.
+## What generated tools must not do
 
-Before writing it, briefly decide whether one direct instruction is enough or
-whether the task has dependent parts that benefit from a few ordered steps:
+- Modify `ToolRunner`, `stream_server.py`, or shared runtime code merely to
+  make one tool work.
+- Change generated-tool validation.
+- Add WebSocket, transport, or backend event code.
+- Access API keys directly, use arbitrary networking, or add unsupported
+  imports.
+- Bypass `_validated_generated_namespace()`.
 
-- If one instruction is enough, keep it direct and do not add steps.
-- If later conclusions depend on earlier findings, put a short numbered sequence such as 1, 2, 3 inside the same `TOOL_PROMPT`.
-- Do not create separate prompts, planner stages, or model calls for individual steps.
-- Do not add steps merely to restate the issue fields.
+Before finishing, make sure the source passes the existing generated-tool
+validator.
+
+## Prompt and output
+
+Build one `TOOL_PROMPT` for the tool and use it in both Take Photo and
+Streaming. Keep it concise, speech-ready, and clear about uncertainty.
+
+All user-facing results must be non-empty, concise, plain language, and safe
+for a blind or low-vision user. Normalize model output:
 
 ```python
-TOOL_PROMPT = (
-    "Assist a blind user in finding an indoor exit. "
-    "1. Find visible doors, doorways, or exit signs. "
-    "2. Decide which one is the most likely exit. "
-    "3. Report its clock-face direction and give concise guidance toward it."
-)
+text = extract_text(response).strip()
+text = text or FALLBACK_TEXT
 ```
-
-A simple task should stay simple:
-
-```python
-TOOL_PROMPT = "Read the medication label and report the text concisely."
-```
-
-The prompt should preserve the requested output, be concise and speech-ready
-for blind and low-vision users, normalize a stable format when useful, and
-state when evidence is insufficient. It must work with one image or several
-chronological frames: never invent motion from one image, and use
-chronological order when several frames are supplied.
-
-Take Photo and Streaming may use different models, frames, timing,
-orchestration, state, and output behavior while sharing this prompt.
 
 ## Runtime API
 
@@ -131,303 +126,124 @@ await runtime.emit(text, partial=False, final=False, replace=False, metadata=Non
 ```
 
 State is isolated by client, tool source version, and streaming session. Keep
-scene anchors, prior results, generations, and temporary tasks in runtime
-state rather than module globals. Check cancellation and a tool-owned
-generation or scene identifier before emitting work that may be stale.
+tool-specific state in the runtime, not in module globals, unless it is a
+read-only helper cache such as a lazily loaded local model.
 
-The tool may define a small literal frame configuration when the backend needs
-settings before delivering frames. Do not use configuration as a substitute
-for executable frame selection. Prefer runtime selection for latest-frame,
-changed-scene, sparse-history, or dense chronological behavior.
+## Choose the input type
 
-## Model calls
+Decide first whether the task needs one frame or several frames.
 
-Select models explicitly in tool code. Default ordinary visual tasks to Gemini
-3.1 Flash Lite, but choose a faster, stronger, or specialized configured model
-when justified. The registry in `backend/model_registry.py` is advisory; the
-backend does not replace the selected model.
+- Use one frame when the answer depends on the current visible state, such as
+  OCR, object identification, color, scene description, current layout, or a
+  static hand pose.
+- Use several chronological frames only when the answer depends on motion,
+  order, before-and-after change, a gesture sequence, or recent temporal
+  context.
 
-```python
-import asyncio
-from litellm_utils import call_model, extract_text
+Streaming does not automatically mean multi-frame. Progressive output does not
+automatically mean multi-frame.
 
-response = await asyncio.to_thread(
-    call_model,
-    "gemini/gemini-3.1-flash-lite-preview",
-    [{"role": "user", "content": TOOL_PROMPT}],
-    [image],
-)
-text = extract_text(response)
+## Choose the model strategy
+
+Treat model strategy separately from frame strategy.
+
+### Single model
+
+Use one model when the user only needs one normal answer.
+
+### Conditional cascade
+
+Use a fast model first and a stronger model only when the first result is
+empty, uncertain, insufficient, or clearly wrong. Return one final answer.
+
+### Progressive
+
+Use progressive only when the user explicitly wants early usefulness followed
+by more detail or accuracy, for example:
+
+- “Give me a quick answer first, then a more detailed one.”
+- “Use several models and report each result as it finishes.”
+- “Start with a fast rough description, then provide a stronger description.”
+
+For executable Streaming tools, progressive means several useful normal
+Streaming results over time:
+
+```text
+quick result
+-> later detailed result
+-> optional stronger result
 ```
 
-Use `call_openai_responses_model()` only for a configured model that requires
-the Responses API. Do not split prompt steps into separate model calls. Take
-Photo and Streaming may each choose the model appropriate to their entry point.
+Each result should be non-empty and understandable on its own.
 
-Choose model strategy from the requested output behavior:
-
-- Use one model when the user does not request escalation or multiple results. Use one faster model if the user wants it to be faster, and use one more accurate model if the user wants it to be more accurate.
-- Use a conditional cascade when the user wants normal cases to be fast but difficult, uncertain, empty, or insufficient cases to receive additional accuracy. Call the fast model first, inspect its result, and call the stronger model only when escalation is needed; deliver one final answer.
-- Use parallel progressive only when the user explicitly wants multiple model results delivered as they complete. Do not infer progressive output merely from requests for speed, accuracy, multiple models, or better handling of difficult cases.
-
-Model strategy remains tool-controlled. The backend must not turn a multi-model
-tool into parallel progressive execution.
-
-All three strategies are implemented directly in `on_take_photo` and `on_frame`
-using `asyncio.create_task`, `asyncio.to_thread`, and `await runtime.emit(...)`. Do
-not declare `TOOL_POLICY` in any new tool — not even to request parallel progressive
-output. `TOOL_POLICY` is a legacy contract for older declarative take-photo tools
-only; the validator rejects it in any tool that also declares executable lifecycle
-hooks (`on_take_photo`, `on_frame`, etc.).
-
-## Entry-point behavior
-
-Take Photo receives one current image. It should use `TOOL_PROMPT`, explicitly
-call its chosen model or models, and return or emit concise results. If motion
-or history is essential, report that it cannot be determined from one image.
-
-Streaming decides when and what to analyze. It may inspect the latest frame,
-skip similar frames, process confirmed scene changes, select recent frames,
-maintain state, or emit progressive results. Static tasks should generally
-avoid unnecessary temporal windows. Temporal tasks may pass selected frames in
-chronological order to the same `TOOL_PROMPT`.
-
-Intentional parallel execution is valid when the tool needs different models
-for the same input, independent analyses, progressive results, parallel
-latency reduction, or several distinct useful tasks. The unsafe pattern is
-accidental duplicate work, not concurrency itself.
-
-Assume `on_frame()` may run again while earlier async work is still running.
-Before an expensive call, decide what unit of work it represents, such as one
-scene analysis, one temporal window, one model in an intentional multi-model
-batch, or one distinct phase. Avoid launching another identical call for the
-same unit of work unless retries or parallel duplicates are explicitly
-intended. Repeated frames should not independently start the same model call
-while equivalent work is already in flight, but intentional calls to different
-models may run concurrently, intentional progressive execution may emit each
-result as it completes, and a new scene, generation, temporal window, or
-distinct phase may start new work.
-
-Record an in-flight task, generation, window id, or request key before
-awaiting. Validate cancellation and relevance again before emitting, clear
-completed task state in `finally` or a completion callback, and cancel or
-invalidate obsolete work when appropriate. Do not rely on
-`if no_result_yet: result = await call_model(...); save_result(result)`,
-because several overlapping `on_frame()` calls can all pass that check before
-any result is saved. Do not use one global lock around all model calls; guard
-only equivalent work so unrelated or intentionally parallel calls remain
-concurrent. A lock or in-flight map only prevents duplicates when equivalent
-work shares the same stable key. A per-frame or constantly changing generation
-key does not deduplicate temporal work.
-
-This is enforced, not just advisory: `backend/validate_generated_tools.py`
-statically rejects any `on_frame()` whose first `await` in its own body
-precedes any `runtime.set_state(...)` call, both in CI and at load time
-before the backend `exec()`s the tool. If a generated tool computes something
-cheap (an embedding, a change-detection score) before deciding whether to
-launch expensive work, wrap even that computation in a tracked task and claim
-its slot first, exactly like the awaited model call below — do not call
-`await asyncio.to_thread(...)` directly in `on_frame()`'s body before any
-state claim.
-
-Two patterns satisfy this rule:
-- **`asyncio.create_task` pattern (preferred)**: put all `await` calls inside the nested `run()` async function and launch it with `asyncio.create_task(run())`. `on_frame()`'s own body never suspends — there is no `await` for the validator to find, and `runtime.set_state(...)` is called at the end of `on_frame()`'s body before the function returns.
-- **`set_state`-first pattern**: call `runtime.set_state(...)` at least once in `on_frame()`'s own body before its first `await`. The simplest form is an `analyzing` flag: claim it before awaiting a helper, reset it in `finally`. All awaited work moves into the helper `async def`.
+Use normal emits such as:
 
 ```python
-# set_state-first: analyzing flag delegates all awaited work to a helper
-async def on_frame(runtime, frame):
-    if runtime.is_cancelled():
-        return
-    if runtime.get_state("analyzing"):
-        return
-    runtime.set_state("analyzing", True)   # claimed before the first await
-    try:
-        await _describe_frame(runtime, frame)  # all awaits are inside the helper
-    finally:
-        runtime.set_state("analyzing", False)
-
-async def _describe_frame(runtime, frame):
-    # The helper may freely await — it is not on_frame's own body.
-    embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
-    generation = int(runtime.get_state("scene_generation", 0))
-    anchor = runtime.get_state("scene_anchor")
-    if anchor is None or not is_same_scene(anchor, embedding):
-        generation += 1
-        runtime.set_state("scene_generation", generation)
-        runtime.set_state("scene_anchor", embedding)
-    if runtime.is_cancelled():
-        return
-    text = await asyncio.to_thread(call_model, ...)
-    if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
-        return
-    await runtime.emit(extract_text(text), final=True, replace=True)
+await runtime.emit(text, final=True, metadata={"phase": phase})
 ```
 
-The following are the most common wrong patterns — each produces the validator error above:
+Do not use `replace=True` by default. Do not emit empty final markers. Do not
+depend on `tool_progress_started` or `tool_progress_result`; those belong to
+the separate backend-coordinated one-shot progressive path.
 
-```python
-# WRONG — on_frame() awaits with no prior set_state; fails even without in-flight tracking
-async def on_frame(runtime, frame):
-    response = await asyncio.to_thread(call_model, ...)  # validator rejects this
-    await runtime.emit(extract_text(response), final=True)
+## Keep implementations simple
 
-# WRONG — set_state is read but not written before the await
-async def on_frame(runtime, frame):
-    if runtime.get_state("in_flight"):
-        return
-    response = await asyncio.to_thread(call_model, ...)  # validator rejects this
-    runtime.set_state("in_flight", False)  # too late: comes after the await
+Prefer the simplest implementation that satisfies the request.
 
-# WRONG — even a cheap await (embedding, change-detection score) before set_state is rejected
-async def on_frame(runtime, frame):
-    embedding = await asyncio.to_thread(compute_embedding, frame.image)  # validator rejects this
-    runtime.set_state("last_embedding", embedding)
-```
+For ordinary Streaming tools:
 
-`await runtime.emit(...)` also counts as an `await` for this rule. Any `await` in `on_frame()`'s direct body — not inside a nested `async def` or lambda — must follow at least one `runtime.set_state(...)` call. Reads (`runtime.get_state(...)`) and `runtime.is_cancelled()` checks do not count.
+- Prevent accidental duplicate equivalent calls.
+- Keep a small in-flight flag or tracked task when needed.
+- Clear state in `finally`.
+- Check cancellation before emitting.
+- Cancel and await tracked work in `on_stream_stop`.
 
-Use a small runtime-state guard, not backend-owned scheduling. For example:
+Do not add scene generations, motion thresholds, cooldowns, temporal windows,
+detached tasks, or complex state machines unless the task truly requires them.
+Do not create two different code paths that can emit the same stage. Do not
+create untracked `asyncio.create_task()` work.
 
-```python
-async def on_frame(runtime, frame):
-    scene_generation = int(runtime.get_state("scene_generation", 0))
-    key = ("detailed_scene", scene_generation)
-    tasks = dict(runtime.get_state("in_flight", {}))
-    existing = tasks.get(key)
-    if existing is not None and not existing.done():
-        return
+Before using unusual imports or patterns, inspect the actual validator and one
+accepted generated tool from this repository. Do not assume every Python
+standard-library import is allowed.
 
-    async def run():
-        try:
-            text = await analyze_scene(frame.image)
-            if runtime.is_cancelled():
-                return
-            if runtime.get_state("scene_generation") != scene_generation:
-                return
-            await runtime.emit(text, final=True, replace=True)
-        finally:
-            current = dict(runtime.get_state("in_flight", {}))
-            if current.get(key) is task:
-                current.pop(key, None)
-                runtime.set_state("in_flight", current)
+For intentionally progressive multi-model tools, each model or stage should
+fail independently. One failure should not suppress other intentional results.
 
-    task = asyncio.create_task(run())
-    tasks[key] = task
-    runtime.set_state("in_flight", tasks)
-```
+## Streaming output contract
 
-For static single-frame streaming tasks, prefer changed-latest-frame behavior:
-compare the current frame to a recent anchor, skip visually equivalent scenes,
-and emit only when the scene meaningfully changed or enough time has passed to
-justify a refresh. `tools/empty_seat_detection.py` is the reference pattern for
-this kind of gating.
+Two result transports exist:
 
-For multi-frame streaming tasks, separate frame collection, temporal window
-scheduling, and model execution. `on_frame()` may keep updating recent frame
-history, motion evidence, scene state, gesture state, or candidate-event state
-without calling a model. Before a multi-frame model call, define what one unit
-of temporal analysis represents, such as one gesture attempt, one swipe, one
-scene transition, one card-play event, one fixed non-overlapping monitoring
-interval, or one user-requested continuous update period.
+- Backend-coordinated one-shot progressive:
+  uses `tool_progress_started` and `tool_progress_result`.
+- Tool-controlled executable Streaming progression:
+  a generated tool calls `runtime.emit(...)`, and each meaningful update is
+  transported as a normal `tool_stream_result`.
 
-Give each candidate temporal window an identity such as
-`window_key = (event_generation, start_frame_id, end_frame_id)`. Scene change,
-motion, and temporal-window identity are not the same thing. Motion may
-contribute frames to the current gesture or event window; it should not
-automatically create a new analysis generation. One gesture or event window
-should keep one stable identity from collection start until analysis
-completes. Strongly overlapping frame histories should not automatically become
-separate analyses when they represent the same event. Once a window is ready,
-select a small chronological set of representative frames, start one analysis
-for that window, mark the window or generation in flight before awaiting,
-avoid starting an equivalent analysis for the same window while it is running,
-mark that window analyzed after completion, and re-check cancellation plus
-generation relevance before emitting.
+For normal executable Streaming:
 
-Multi-frame means several ordered frames may be passed in one model call. It
-does not mean making one model call for every arriving frame.
+- Every emit should contain useful non-empty text.
+- Use `final=True` for normal standalone results.
+- Use `replace=True` only when the public runtime contract clearly requires it.
+- Do not change frontend or backend transport for one generated tool.
 
-When deciding between single-frame and multi-frame Streaming:
+`accepted=True` only means the runtime accepted the event locally; it does not
+prove frontend delivery.
 
-- Use a changed latest frame when one image is enough and motion history is not required.
-- Use recent chronological frames only when a single image would lose essential evidence such as sign motion, before-versus-after state, or a short recent event.
-- If Take Photo would have to answer "cannot determine motion from one image", Streaming is a strong candidate for multi-frame.
-- Do not upgrade a static scene-description, OCR, object-identification, or navigation task to multi-frame unless the request explicitly depends on change over time.
+## Final checks
 
-For the same temporal window, intentional parallel execution remains valid when
-several different models are deliberately compared, progressive results are
-requested, independent subtasks are useful, or parallel execution reduces
-latency. In that case, one temporal window may intentionally launch several
-keyed calls such as `call_key = (window_key, model_name, phase)`. Prevent
-accidental duplicates of the same temporal work, not intentional parallel
-calls for distinct models or subtasks.
+Before completing a generated tool, verify:
 
-Do not let adjacent overlapping histories schedule new equivalent work by
-default, such as `frame 20 -> frames 12-20`, `frame 21 -> frames 13-21`,
-`frame 22 -> frames 14-22`, unless the user explicitly asked for continuous
-sliding-window monitoring at that frequency.
-
-Before implementing a temporal tool, decide whether it is event-driven or
-continuous monitoring. Event-driven tools should define what begins an event,
-when enough frames have been collected, when the event is complete, and what
-resets the tool for the next event. A useful state machine is
-`idle -> collecting -> analyzing -> waiting_for_reset -> idle`. Collect frames
-first, analyze that window once, then require a reset such as a stable or
-neutral period, cooldown plus new motion, or another clearly new event before
-creating the next window. Continuous monitoring tools should define an explicit
-interval or non-overlapping window progression and should not let every
-`on_frame()` independently schedule another analysis.
-
-This pattern is unsafe:
-
-```python
-if enough_frames and not result_exists:
-    result = await call_model(...)
-    runtime.set_state("result", result)
-```
-
-Several overlapping `on_frame()` calls may all pass that condition before any
-one call stores its result. Reserve equivalent temporal work before the first
-`await`, for example:
-
-```python
-window_key = build_window_key(selected_frames)
-in_flight = dict(runtime.get_state("in_flight", {}))
-if window_key in in_flight:
-    return
-if runtime.get_state("last_analyzed_window") == window_key:
-    return
-
-task = asyncio.create_task(analyze(selected_frames))
-in_flight[window_key] = task
-runtime.set_state("in_flight", in_flight)
-```
-
-Then remove the task in `finally`, mark the window analyzed, and verify the
-current generation before emitting. The exact mechanism may use tasks,
-generations, state flags, locks, or window ids, but equivalent temporal work
-must be deduplicated before the first `await`.
-
-Before writing temporal streaming code, answer these questions:
-
-1. What event or interval does one model call represent?
-2. Which chronological frames belong to that unit?
-3. When is the unit ready to analyze?
-4. How is it uniquely identified?
-5. How is duplicate analysis of the same unit prevented?
-6. What permits the next unit to begin?
-7. Is any parallel execution intentional, and if so, which distinct models or subtasks are parallel?
-
-Do not use JPEG bytes, base64 fragments, or string-prefix hashes as visual
-scene similarity. Use a stable visual signal such as a lightweight embedding,
-histogram, tracked generation, explicit temporal window, or another
-image-derived comparison designed for repeated frames. Cache heavyweight local
-models instead of loading them on every frame.
-
-Each hook independently decides whether to return once or emit results that
-append, replace, remain partial, or finalize. The backend only transports
-accepted results and rejects stale or cancelled work.
+1. Only the intended tool file was changed.
+2. The source passes the validator.
+3. Single-frame versus multi-frame was chosen deliberately.
+4. Model strategy matches the user’s request.
+5. Progressive was used only when explicitly requested.
+6. Every emit contains useful non-empty text.
+7. No unsupported backend or frontend changes were made.
+8. No untracked async task remains.
+9. The tool can stop cleanly.
+10. The implementation is simpler than any unnecessary alternative.
 
 ## Tool quality and accessibility conventions
 
