@@ -12,6 +12,29 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+RETRYABLE_CODES = {503, 429}
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 2.0  # seconds, doubles each attempt
+
+
+async def _with_retry(func, *args, **kwargs):
+    """Run a blocking Gemini SDK call in a thread, retrying on transient errors."""
+    from google.genai import errors  # noqa: PLC0415
+
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(func, *args, **kwargs)
+        except errors.APIError as exc:
+            if exc.code not in RETRYABLE_CODES or attempt == RETRY_ATTEMPTS - 1:
+                raise
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "Gemini call failed with %s (attempt %d/%d) — retrying in %.0fs",
+                exc.code, attempt + 1, RETRY_ATTEMPTS, delay,
+            )
+            await asyncio.sleep(delay)
+
+
 MODEL = 'gemini-3-flash-preview'
 PROMPT = (
     "This video should provide an example of how a hypothetical tool for visual assistance should work"
@@ -97,7 +120,7 @@ async def infer_images_with_gemini(
     if client is None:
         raise RuntimeError("GEMINI_API_KEY is required for Gemini image inference")
     parts = [types.Part.from_bytes(data=image, mime_type="image/jpeg") for image in images]
-    response = await asyncio.to_thread(
+    response = await _with_retry(
         client.models.generate_content,
         model=model.removeprefix('gemini/'),
         contents=[prompt, *parts],
@@ -134,7 +157,7 @@ async def infer_mp4_with_gemini(path: Path, prompt: str, model: str):
     loop = asyncio.get_running_loop()
     uploaded = None
     try:
-        uploaded = await asyncio.to_thread(client.files.upload, file=path)
+        uploaded = await _with_retry(client.files.upload, file=path)
         deadline = loop.time() + POLL_TIMEOUT
         while not _is_active(uploaded):
             state = getattr(getattr(uploaded, 'state', None), 'name', str(getattr(uploaded, 'state', '')))
@@ -143,8 +166,8 @@ async def infer_mp4_with_gemini(path: Path, prompt: str, model: str):
             if loop.time() >= deadline:
                 raise TimeoutError("Gemini MP4 processing timed out")
             await asyncio.sleep(POLL_INTERVAL)
-            uploaded = await asyncio.to_thread(client.files.get, name=uploaded.name)
-        response = await asyncio.to_thread(
+            uploaded = await _with_retry(client.files.get, name=uploaded.name)
+        response = await _with_retry(
             client.models.generate_content,
             model=model.removeprefix('gemini/'),
             contents=[prompt, uploaded],
@@ -205,7 +228,7 @@ async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
                 contents=[part, PROMPT],
             )
 
-        response = await loop.run_in_executor(None, _generate)
+        response = await _with_retry(_generate)
         summary = (response.text or "").strip()
         logger.info("GCS video summary generated (%d chars)", len(summary))
         return summary
@@ -255,14 +278,12 @@ async def summarize_video(video_path: str) -> str:
 
             logger.info("Uploading %s to Gemini Files API (%s) …", path.name, mime_type)
 
-            uploaded_file = await loop.run_in_executor(
-                None,
-                lambda: client.files.upload(
-                    file=str(path),
-                    config=types.UploadFileConfig(
-                        mime_type=mime_type,
-                        display_name=path.name,
-                    ),
+            uploaded_file = await _with_retry(
+                client.files.upload,
+                file=str(path),
+                config=types.UploadFileConfig(
+                    mime_type=mime_type,
+                    display_name=path.name,
                 ),
             )
 
@@ -276,21 +297,15 @@ async def summarize_video(video_path: str) -> str:
                     raise TimeoutError("File API polling timed out")
                 await asyncio.sleep(POLL_INTERVAL)
                 elapsed += POLL_INTERVAL
-                uploaded_file = await loop.run_in_executor(
-                    None,
-                    lambda n=file_name: client.files.get(name=n),
-                )
+                uploaded_file = await _with_retry(client.files.get, name=file_name)
                 logger.debug("File state: %s (%.0fs elapsed)", uploaded_file.state, elapsed)
 
             logger.info("File ACTIVE — generating summary …")
 
-            file_ref = uploaded_file
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.models.generate_content(
-                    model=MODEL,
-                    contents=[file_ref, PROMPT],
-                ),
+            response = await _with_retry(
+                client.models.generate_content,
+                model=MODEL,
+                contents=[uploaded_file, PROMPT],
             )
 
             summary = (response.text or "").strip()
