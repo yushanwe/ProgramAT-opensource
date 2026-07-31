@@ -223,6 +223,47 @@ shared runtime code merely to support the tool. A generated tool should
 normally solve its behavior inside its own file using the existing runtime
 contract.
 
+For a brief-then-detailed executable Streaming tool, keep one clearly owned
+progression:
+
+```text
+new confirmed scene
+-> run or obtain brief result
+-> emit brief result
+-> schedule or launch detailed work once
+-> emit detailed result once
+-> mark progression complete for that scene
+```
+
+Do not create two independent paths that can both emit the detailed stage,
+such as a later `on_frame()` branch plus a delayed background task. Choose one
+progression path. If the detailed result is delayed, store the task in runtime
+state, do not create another active detail task for the same scene, clear it
+through a task-specific completion callback or `finally`, inspect or log
+exceptions, cancel and await it in `on_stream_stop`, and check cancellation
+plus scene generation before emitting. Do not create untracked detached tasks.
+
+Do not let multiple nested coroutines close over one shared mutable variable
+such as `task`. Each task must have stable ownership of its own runtime key.
+Prefer a helper equivalent to:
+
+```python
+def register_task(runtime, key, task):
+    runtime.set_state(key, task)
+
+    def clear(completed):
+        if runtime.get_state(key) is completed:
+            runtime.set_state(key, None)
+        if not completed.cancelled():
+            error = completed.exception()
+            if error is not None:
+                logger.error("Task failed", exc_info=error)
+    task.add_done_callback(clear)
+```
+
+Do not reuse one outer `task` variable for brief, Gemini, GPT, or delayed
+detail tasks.
+
 ## Entry-point behavior
 
 Take Photo receives one current image. It should use `TOOL_PROMPT`, explicitly
@@ -262,6 +303,17 @@ only equivalent work so unrelated or intentionally parallel calls remain
 concurrent. A lock or in-flight map only prevents duplicates when equivalent
 work shares the same stable key. A per-frame or constantly changing generation
 key does not deduplicate temporal work.
+
+Before completing a generated tool, inspect the actual generated-source
+validator and one accepted generated tool from this repository. Do not assume
+every Python standard-library import is allowed. Only use imports and
+constructs permitted by the generated-tool contract. Avoid unnecessary
+imports. For example, do not add `logging` unless it is actually used, the
+validator allows it, and repository examples confirm the pattern. Do not
+advise bypassing or disabling `_validated_generated_namespace()`. When a
+generated tool would require an unsupported construct, adapt the tool to the
+public allowed runtime rather than modifying validator or backend
+infrastructure.
 
 This is enforced, not just advisory: `backend/validate_generated_tools.py`
 statically rejects any `on_frame()` whose first `await` in its own body
@@ -720,6 +772,9 @@ Rules:
 - If the model call or emit fails, log the exception and recover tool state so future analyses remain possible.
 - Include small diagnostic metadata such as frame count or window range, but do not expose debugging text to the user.
 - Prefer copying the emit structure from a known working repository tool rather than inventing a new event shape.
+- For intentionally progressive multi-model tools, each stage or model should fail independently.
+- Normalize each model output with `.strip()`, provide a non-empty fallback, catch model-specific failures, avoid suppressing successful sibling results, keep task state recoverable, and verify the current scene or window before emitting.
+- One failed model must not freeze the full progression.
 
 `runtime.emit()` strips text and turns `None` into `""`. Backend
 `accepted=True` only proves the runtime accepted the event; it does not prove
@@ -728,6 +783,42 @@ executable Streaming, accepted emits become normal `tool_stream_result`
 updates; for backend-owned one-shot progressive execution, the backend uses
 `tool_progress_started` and `tool_progress_result`. Do not mix the two
 contracts inside a generated Streaming tool.
+
+Progressive output does not automatically imply multi-frame input. Decide
+first whether the task requires temporal evidence:
+
+- Use one frame for static scene description, OCR, object identity, color, or current layout.
+- Use several chronological frames only for motion, sequence, before/after change, or recent temporal context.
+- A static scene descriptor may be progressive because it emits a fast result followed by a stronger result from the same frame.
+
+For handheld camera scenes, do not reset a progressive scene pipeline from a
+single fragile visual comparison. Prefer a proven repository pattern with some
+combination of stable visual embedding, anchor comparison, frame-to-frame
+comparison, multiple confirmations before scene reset, anchor blending, and a
+per-runtime scheduling lock or equivalent single-owner scheduler. Do not
+cancel brief or detailed work because of minor camera jitter, exposure
+variation, or small motion within the same scene. Only reset progression after
+a confirmed new scene.
+
+Do not instantiate heavyweight local models inside every frame or scene task.
+Use a permitted lazy module-level cache or an existing shared helper when
+allowed by the validator and repository conventions. Remove unused constants,
+imports, and duplicated model metadata.
+
+Before finishing a future progressive executable Streaming tool, verify all of
+the following:
+
+1. The source passes the generated-tool validator.
+2. Every emitted result is non-empty.
+3. Executable Streaming emits normal `tool_stream_result` updates.
+4. `replace=True` is not used by default.
+5. Each stage emits at most once per scene or window.
+6. No detached task is left untracked.
+7. Task cleanup references the correct task object.
+8. One model failure does not suppress other intended outputs.
+9. Scene progression does not reset from minor jitter.
+10. `on_stream_stop()` cancels and awaits active work.
+11. No shared backend or frontend files were changed unnecessarily.
 
 ## Tool quality and accessibility conventions
 
