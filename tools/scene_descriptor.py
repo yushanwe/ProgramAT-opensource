@@ -1,4 +1,4 @@
-"""Progressive scene description: brief object list then detailed description."""
+"""Progressive scene description: YOLO brief list then Gemini detailed description."""
 
 from __future__ import annotations
 
@@ -15,14 +15,6 @@ TOOL_PROMPT = (
     "Describe the scene for a blind user. "
     "List the main objects present in a brief, concise manner. "
     "Use body-relative directions when describing locations. "
-    "Do not use colors or other visual-only landmarks as the sole navigation cue. "
-    "Be concise and speech-ready."
-)
-
-DETAILED_PROMPT = (
-    "Provide a detailed description of the scene for a blind user. "
-    "Describe the spatial relationships between objects, their positions, and any notable details. "
-    "Use body-relative directions such as left, right, straight ahead, or clock-face positions (9-12 and 1-3 only). "
     "Do not use colors or other visual-only landmarks as the sole navigation cue. "
     "Be concise and speech-ready."
 )
@@ -57,21 +49,72 @@ def is_same_scene(
     return cosine_similarity(reference, current) >= threshold
 
 
+def _get_yolo_description(image: np.ndarray) -> str:
+    """Get brief YOLO-based object description."""
+    try:
+        from ultralytics import YOLO
+
+        model = YOLO("yolo11n.pt")
+        results = model(image, conf=0.5, verbose=False)
+
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                class_id = int(box.cls[0])
+                class_name = _get_coco_class_name(class_id)
+                detections.append(class_name)
+
+        if not detections:
+            return "No objects detected."
+
+        # Count objects
+        from collections import Counter
+        counts = Counter(detections)
+
+        # Build concise description
+        parts = []
+        for obj, count in counts.most_common():
+            if count == 1:
+                parts.append(f"1 {obj}")
+            else:
+                parts.append(f"{count} {obj}s")
+
+        return "I see: " + ", ".join(parts)
+    except Exception:
+        return "Unable to detect objects."
+
+
+def _get_coco_class_name(class_id: int) -> str:
+    """Get COCO class name from class ID."""
+    COCO_CLASSES = [
+        'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
+        'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
+        'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
+        'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+        'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+        'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
+        'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+        'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+        'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+        'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+        'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+        'toothbrush'
+    ]
+    if 0 <= class_id < len(COCO_CLASSES):
+        return COCO_CLASSES[class_id]
+    return f"object_{class_id}"
+
+
 async def on_take_photo(runtime, image, input_data):
-    """Return brief scene description for a single photo."""
+    """Return brief YOLO-based scene description for a single photo."""
     del runtime, input_data
     if image is None:
         return "No camera image is available."
 
-    response = await asyncio.to_thread(
-        call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
-        [{"role": "user", "content": TOOL_PROMPT}],
-        [image],
-        {"timeout": 60, "num_retries": 0},
-    )
-    text = extract_text(response).strip()
-    return text or "Unable to describe the scene."
+    # Use YOLO for brief description
+    description = await asyncio.to_thread(_get_yolo_description, image)
+    return description or "Unable to describe the scene."
 
 
 async def on_stream_start(runtime, input_data):
@@ -113,15 +156,15 @@ async def _analyze_frame(runtime, frame):
     # Check if scene has changed
     if anchor is not None and is_same_scene(anchor, embedding):
         # Same scene - check if we can progress to detailed description
-        if current_stage == "brief":
-            # Emit detailed description
+        if current_stage == "yolo_brief":
+            # Escalate to Gemini for detailed description
             if runtime.is_cancelled():
                 return
 
             response = await asyncio.to_thread(
                 call_model,
                 "gemini/gemini-3.1-flash-lite-preview",
-                [{"role": "user", "content": DETAILED_PROMPT}],
+                [{"role": "user", "content": TOOL_PROMPT}],
                 [frame.image],
                 {"timeout": 60, "num_retries": 0},
             )
@@ -136,12 +179,12 @@ async def _analyze_frame(runtime, frame):
                 text,
                 final=True,
                 metadata={
-                    "stage": "detailed",
+                    "stage": "gemini_detailed",
                     "scene_generation": generation,
                     "frame_id": frame.frame_id,
                 },
             )
-            runtime.set_state("progression_stage", "detailed")
+            runtime.set_state("progression_stage", "gemini_detailed")
         # If already at detailed stage, do nothing
         return
     else:
@@ -151,34 +194,27 @@ async def _analyze_frame(runtime, frame):
         runtime.set_state("scene_anchor", embedding)
         runtime.set_state("progression_stage", None)
 
-    # Emit brief description for new scene
+    # Emit brief YOLO description for new scene
     if runtime.is_cancelled():
         return
 
-    response = await asyncio.to_thread(
-        call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
-        [{"role": "user", "content": TOOL_PROMPT}],
-        [frame.image],
-        {"timeout": 60, "num_retries": 0},
-    )
+    yolo_description = await asyncio.to_thread(_get_yolo_description, frame.image)
 
     if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
         return
 
-    text = extract_text(response).strip()
-    text = text or "Unable to describe the scene."
+    text = yolo_description or "Unable to describe the scene."
 
     await runtime.emit(
         text,
         final=True,
         metadata={
-            "stage": "brief",
+            "stage": "yolo_brief",
             "scene_generation": generation,
             "frame_id": frame.frame_id,
         },
     )
-    runtime.set_state("progression_stage", "brief")
+    runtime.set_state("progression_stage", "yolo_brief")
 
 
 async def on_stream_stop(runtime):
@@ -198,4 +234,6 @@ __all__ = [
     "on_stream_start",
     "on_stream_stop",
     "on_take_photo",
+    "TOOL_NAME",
+    "TOOL_PROMPT",
 ]
