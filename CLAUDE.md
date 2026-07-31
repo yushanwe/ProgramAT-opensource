@@ -145,7 +145,11 @@ inspect the Streaming lifecycle and cancellation flow in
 gating, and how `on_stream_stop` is invoked. Then inspect one or two existing
 Streaming tools that already behave correctly for the requested pattern and
 reuse their cleanup and state-management style where it fits. Prefer adapting a
-proven repository pattern over inventing a new scheduler.
+proven repository pattern over inventing a new scheduler. For Streaming output,
+also inspect where `[GeneratedTool] emit ... accepted=%s` is logged, how
+`backend/stream_server.py` converts generated-tool events into websocket
+messages, and how `ProgramATApp/ToolRunner.tsx` plus
+`ProgramATApp/progressiveResults.ts` accept or ignore those events.
 
 The tool may define a small literal frame configuration when the backend needs
 settings before delivering frames. Do not use configuration as a substitute
@@ -308,92 +312,119 @@ code:
 7. What state permits the next analysis.
 8. How failures, cancellation, and stream stop reset the tool.
 
+For ordinary continuous temporal tools, prefer a simple recent-history pattern
+with one configured time window and one configured analysis interval. Choose:
+
+```python
+WINDOW_SECONDS = ...
+INTERVAL_SECONDS = ...
+MAX_SAMPLE_FRAMES = ...
+```
+
+- `WINDOW_SECONDS`: how much recent history one model call sees.
+- `INTERVAL_SECONDS`: the minimum time between analysis starts.
+- `MAX_SAMPLE_FRAMES`: the maximum number of representative chronological frames sent in one call.
+
 For ordinary continuous temporal tools, prefer this simple proven pattern:
 
 1. `on_frame()` checks cancellation.
-2. If an equivalent analysis is already running, return immediately.
-3. Ignore a frame already processed.
+2. Wait until the next configured analysis time.
+3. If an equivalent analysis is already running, return immediately.
 4. Read recent frames from the runtime.
-5. Sort them chronologically.
+5. Sort and sample them chronologically.
 6. Pass the selected images together in one model call.
-7. Emit the result.
-8. Record the processed frame and result.
+7. Emit one valid final result.
+8. Advance the next analysis time by the configured interval.
 9. Clear the analyzing flag in `finally` so later frames can trigger another analysis.
 
 The intended flow is:
 
 ```text
-new frame arrives
--> no equivalent analysis currently running
--> obtain recent chronological history
--> make one multi-frame model call
--> emit result
--> release analysis guard
--> a later frame may start the next analysis
+frames continuously arrive
+-> wait until the next configured analysis time
+-> obtain the previous WINDOW_SECONDS of frames
+-> sort and sample them chronologically
+-> make one model call
+-> emit one valid final result
+-> wait until the next configured interval
 ```
 
 This is continuous analysis with single-in-flight scheduling. It is not one
-call per frame.
+call per frame, and model completion must not immediately trigger the next
+request.
 
 Use a pattern equivalent to:
 
 ```python
+import time
+
+
 async def on_stream_start(runtime, input_data):
-    runtime.set_state("is_analyzing", False)
-    runtime.set_state("last_processed_frame_id", None)
-    runtime.set_state("last_result_text", None)
+    now = time.monotonic()
+    runtime.set_state("analysis_in_flight", False)
+    runtime.set_state("next_analysis_at", now + WINDOW_SECONDS)
 
 
 async def on_frame(runtime, frame):
     if runtime.is_cancelled():
         return
 
-    if runtime.get_state("is_analyzing", False):
+    now = time.monotonic()
+    next_analysis_at = runtime.get_state("next_analysis_at")
+
+    if now < next_analysis_at:
         return
 
-    if runtime.get_state("last_processed_frame_id") == frame.frame_id:
+    if runtime.get_state("analysis_in_flight", False):
         return
 
-    recent_frames = runtime.get_recent_frames(seconds=WINDOW_SECONDS) or [frame]
+    recent_frames = runtime.get_recent_frames(seconds=WINDOW_SECONDS) or []
     ordered_frames = sorted(recent_frames, key=lambda candidate: candidate.timestamp)
-    images = [candidate.image for candidate in ordered_frames if candidate.image is not None]
+    selected_frames = sample_evenly(
+        ordered_frames,
+        max_frames=MAX_SAMPLE_FRAMES,
+    )
+    images = [candidate.image for candidate in selected_frames if candidate.image is not None]
+
+    while next_analysis_at <= now:
+        next_analysis_at += INTERVAL_SECONDS
+    runtime.set_state("next_analysis_at", next_analysis_at)
 
     if not images:
         return
 
-    runtime.set_state("is_analyzing", True)
+    runtime.set_state("analysis_in_flight", True)
     try:
-        text = await analyze_images(images)
-        text = (text or FALLBACK_TEXT).strip() or FALLBACK_TEXT
+        response = await analyze_images(images)
+        text = extract_text(response).strip() or FALLBACK_TEXT
 
         if runtime.is_cancelled():
             return
 
-        if text != runtime.get_state("last_result_text"):
-            await runtime.emit(
-                text,
-                final=True,
-                metadata={
-                    "frame_id": frame.frame_id,
-                    "frame_count": len(images),
-                },
-            )
-            runtime.set_state("last_result_text", text)
-
-        runtime.set_state("last_processed_frame_id", frame.frame_id)
+        await runtime.emit(
+            text,
+            final=True,
+            metadata={
+                "frame_id": frame.frame_id,
+                "frame_count": len(images),
+                "window_seconds": WINDOW_SECONDS,
+            },
+        )
+    except Exception:
+        logger.exception("Temporal analysis failed")
     finally:
-        runtime.set_state("is_analyzing", False)
+        runtime.set_state("analysis_in_flight", False)
 ```
 
 The exact variable names may differ, but preserve these properties:
 
-- one active equivalent analysis at a time;
-- multiple chronological frames in one call when temporal evidence is needed;
-- state reserved before the first `await`;
-- state always released in `finally`;
-- later frames can continue producing later analyses;
-- no detached task unless there is a clear reason;
-- normal final emits without `replace=True` unless progressive output is intentional.
+- one configured time window per analysis;
+- bounded chronological frame sampling;
+- one equivalent analysis in flight;
+- no backlog of missed calls;
+- model completion does not immediately trigger another request;
+- state always clears in `finally`;
+- every successful analysis produces a valid non-empty final result.
 
 Multi-frame means several ordered frames may be passed in one model call. It
 does not mean making one model call for every arriving frame.
@@ -437,6 +468,11 @@ For bounded sampling, prefer representative sampling across the full recent
 interval rather than only the last few frames when the action may have
 occurred earlier.
 
+A new model call must not begin merely because `on_frame()` was called, the
+previous request just finished, or the current frame id differs from the prior
+one. The analysis interval must be controlled by the tool's clock, not by
+model latency.
+
 When deciding between single-frame and multi-frame Streaming:
 
 - Use a changed latest frame when one image is enough and motion history is not required.
@@ -454,6 +490,12 @@ calls for distinct models or subtasks.
 
 Do not confuse motion inside a temporal window, a new scene, and a new
 model-call generation. They are not automatically the same thing.
+
+Do not add motion thresholds, HSV scene histograms, scene generations,
+cooldown states, detached `asyncio.create_task()` calls, or
+`idle -> collecting -> analyzing -> reset` state machines by default. Only add
+event-driven machinery when the request explicitly needs one result per
+discrete event.
 
 This pattern is unsafe:
 
@@ -526,6 +568,44 @@ Before finishing a temporal or multi-frame tool, verify all of the following:
 Each hook independently decides whether to return once or emit results that
 append, replace, remain partial, or finalize. The backend only transports
 accepted results and rejects stale or cancelled work.
+
+## Streaming output contract
+
+For a normal standalone Streaming result, use the repository's known working
+emit contract:
+
+```python
+text = extract_text(response).strip()
+text = text or FALLBACK_TEXT
+
+await runtime.emit(
+    text,
+    final=True,
+    metadata={
+        "frame_id": frame.frame_id,
+        "frame_count": len(images),
+    },
+)
+```
+
+Rules:
+
+- Never emit `None`, an empty string, or whitespace-only text.
+- Always normalize model output with `.strip()` and provide a spoken fallback.
+- For a normal standalone result, use `final=True` without `replace=True`.
+- Use `replace=True` only when replacing a previously emitted partial or provisional result and the repository's consumer supports that flow.
+- Do not return `None` after a model call unless the result was already emitted through the supported event contract.
+- Check cancellation before emitting.
+- If the model call or emit fails, log the exception and recover tool state so future analyses remain possible.
+- Include small diagnostic metadata such as frame count or window range, but do not expose debugging text to the user.
+- Prefer copying the emit structure from a known working repository tool rather than inventing a new event shape.
+
+`runtime.emit()` strips text and turns `None` into `""`. Backend
+`accepted=True` only proves the runtime accepted the event; it does not prove
+the payload was non-empty or suitable for frontend display. The current
+frontend progressive consumer ignores empty text and may treat `replace=True`
+or `final=True` differently depending on the surrounding event flow, so do not
+invent replacement semantics for ordinary final results.
 
 ## Tool quality and accessibility conventions
 
