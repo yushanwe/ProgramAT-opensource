@@ -256,6 +256,12 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
             failures.append(
                 f"{rel_path}: executable tools require on_take_photo() or on_frame()."
             )
+        if "TOOL_POLICY" in constants:
+            failures.append(
+                f"{rel_path}: executable lifecycle tools must not declare TOOL_POLICY. "
+                "Implement model strategy directly in on_take_photo() or on_frame() "
+                "using asyncio.create_task and runtime.emit()."
+            )
         if not isinstance(constants.get("TOOL_NAME"), str):
             failures.append(f"{rel_path}: executable tools require one string TOOL_NAME.")
         if not isinstance(constants.get("TOOL_PROMPT"), str) or not str(
