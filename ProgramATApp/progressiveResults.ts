@@ -66,7 +66,7 @@ export function progressiveResultModelLabel(
 export function formatProgressiveResult(
   event: ProgressiveResultEvent,
 ): string | null {
-  if (event.final || typeof event.text !== 'string' || !event.text.trim()) {
+  if (typeof event.text !== 'string' || !event.text.trim()) {
     return null;
   }
   let text = event.text.trim();

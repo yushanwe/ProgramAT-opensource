@@ -87,6 +87,31 @@ class TestGeneratedToolServerIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["metadata"]["model"], "explicit/test-model")
         self.assertEqual(result["model"], "explicit/test-model")
 
+    async def test_final_only_streaming_emit_is_serialized_with_text(self):
+        websocket = AsyncMock()
+        config = {
+            "tool": {
+                "name": "integration_tool",
+                "code": STREAM_TOOL,
+                "input": {},
+            }
+        }
+        stream_server.active_streaming_tools["client"] = config
+        await stream_server._initialize_executable_streaming_tool(
+            websocket, "client", config
+        )
+
+        accepted = await config["generated_runtime"].emit(
+            "Streaming test result", final=True
+        )
+
+        self.assertTrue(accepted)
+        payloads = [json.loads(call.args[0]) for call in websocket.send.await_args_list]
+        self.assertEqual(payloads[0]["type"], "tool_progress_started")
+        self.assertEqual(payloads[1]["type"], "tool_progress_result")
+        self.assertTrue(payloads[1]["final"])
+        self.assertEqual(payloads[1]["text"], "Streaming test result")
+
     async def test_replaced_stream_rejects_stale_emit(self):
         websocket = AsyncMock()
         config = {

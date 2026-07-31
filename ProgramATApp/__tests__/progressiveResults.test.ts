@@ -65,5 +65,10 @@ describe('progressive result lifecycle', () => {
       text: 'GPT: Third answer',
     })).toBe('GPT: Third answer');
     expect(formatProgressiveResult({final: true, text: ''})).toBeNull();
+    expect(formatProgressiveResult({
+      final: true,
+      model: 'gpt-5',
+      text: 'GPT: Final answer',
+    })).toBe('GPT: Final answer');
   });
 });
