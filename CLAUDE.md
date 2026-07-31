@@ -149,7 +149,17 @@ proven repository pattern over inventing a new scheduler. For Streaming output,
 also inspect where `[GeneratedTool] emit ... accepted=%s` is logged, how
 `backend/stream_server.py` converts generated-tool events into websocket
 messages, and how `ProgramATApp/ToolRunner.tsx` plus
-`ProgramATApp/progressiveResults.ts` accept or ignore those events.
+`ProgramATApp/progressiveResults.ts` accept or ignore those events. Distinguish
+two architectures:
+
+- Backend-coordinated one-shot progressive:
+  the backend sends `tool_progress_started` and `tool_progress_result` events
+  with invocation ids, result indexes, and a final completion marker.
+- Tool-controlled executable Streaming progression:
+  a generated tool calls `runtime.emit(...)`, and ordinary executable
+  Streaming output is transported as normal `tool_stream_result` updates over
+  time. Each emitted update should normally contain usable non-empty spoken
+  text.
 
 The tool may define a small literal frame configuration when the backend needs
 settings before delivering frames. Do not use configuration as a substitute
@@ -195,6 +205,23 @@ not declare `TOOL_POLICY` in any new tool — not even to request parallel progr
 output. `TOOL_POLICY` is a legacy contract for older declarative take-photo tools
 only; the validator rejects it in any tool that also declares executable lifecycle
 hooks (`on_take_photo`, `on_frame`, etc.).
+
+For tool-controlled executable Streaming, progressive means one Streaming
+session may intentionally emit several normal meaningful `tool_stream_result`
+updates over time, such as:
+
+```text
+YOLO: brief result
+Gemini: detailed result
+GPT: detailed result
+```
+
+Do not instruct generated Streaming tools to depend on
+`tool_progress_started`, emit empty final markers, assume a one-shot
+progressive invocation object, or modify `ToolRunner`, `stream_server.py`, or
+shared runtime code merely to support the tool. A generated tool should
+normally solve its behavior inside its own file using the existing runtime
+contract.
 
 ## Entry-point behavior
 
@@ -277,7 +304,7 @@ async def _describe_frame(runtime, frame):
     text = await asyncio.to_thread(call_model, ...)
     if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
         return
-    await runtime.emit(extract_text(text), final=True, replace=True)
+    await runtime.emit(extract_text(text), final=True)
 ```
 
 The following are the most common wrong patterns — each produces the validator error above:
@@ -321,7 +348,7 @@ async def on_frame(runtime, frame):
                 return
             if runtime.get_state("scene_generation") != scene_generation:
                 return
-            await runtime.emit(text, final=True, replace=True)
+            await runtime.emit(text, final=True)
         finally:
             current = dict(runtime.get_state("in_flight", {}))
             if current.get(key) is task:
@@ -640,7 +667,28 @@ accepted results and rejects stale or cancelled work.
 
 ## Streaming output contract
 
-For a normal standalone Streaming result, use the repository's known working
+Two different result transports exist in this repository.
+
+### Backend-coordinated one-shot progressive
+
+Use this only when the backend itself owns a parallel progressive take-photo
+execution and sends:
+
+```text
+tool_progress_started
+tool_progress_result
+```
+
+That path may use invocation ids, result indexes, partial results, and a final
+completion event.
+
+### Tool-controlled executable Streaming progression
+
+Use this when a generated tool owns its own model calls and calls
+`runtime.emit(...)`. Here, progressive means one executable Streaming session
+may produce several normal meaningful `tool_stream_result` updates over time.
+
+For a normal executable Streaming result, use the repository's known working
 emit contract:
 
 ```python
@@ -663,6 +711,10 @@ Rules:
 - Always normalize model output with `.strip()` and provide a spoken fallback.
 - For a normal standalone result, use `final=True` without `replace=True`.
 - Use `replace=True` only when replacing a previously emitted partial or provisional result and the repository's consumer supports that flow.
+- Do not emit empty final markers for executable Streaming.
+- Do not assume executable Streaming uses `tool_progress_started` or a one-shot progressive invocation object.
+- When several stage or model results are intentional, emit each one normally and label it clearly, such as `YOLO: ...`, `Gemini: ...`, or `GPT: ...`.
+- Reset tool-owned progression only on a confirmed new scene or temporal window, not on ordinary camera jitter.
 - Do not return `None` after a model call unless the result was already emitted through the supported event contract.
 - Check cancellation before emitting.
 - If the model call or emit fails, log the exception and recover tool state so future analyses remain possible.
@@ -671,10 +723,11 @@ Rules:
 
 `runtime.emit()` strips text and turns `None` into `""`. Backend
 `accepted=True` only proves the runtime accepted the event; it does not prove
-the payload was non-empty or suitable for frontend display. The current
-frontend progressive consumer ignores empty text and may treat `replace=True`
-or `final=True` differently depending on the surrounding event flow, so do not
-invent replacement semantics for ordinary final results.
+the payload was non-empty or suitable for frontend display. For ordinary
+executable Streaming, accepted emits become normal `tool_stream_result`
+updates; for backend-owned one-shot progressive execution, the backend uses
+`tool_progress_started` and `tool_progress_result`. Do not mix the two
+contracts inside a generated Streaming tool.
 
 ## Tool quality and accessibility conventions
 
