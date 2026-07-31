@@ -7,7 +7,7 @@ import React, { useState, useEffect } from 'react';
 import { View, StyleSheet, Linking, Alert } from 'react-native';
 import { useTheme } from './ThemeContext';
 import IssueSelector from './IssueSelector';
-import TextInput from './TextInput';
+import IssueChat from './IssueChat';
 import Config, { AppMode } from './config';
 import ReviewPane from './ReviewPane';
 
@@ -111,7 +111,7 @@ export default function PRsAndText({
           onBack={handleBackToPRs}
         />
       ) : appMode !== 'review' ? (
-        <TextInput 
+        <IssueChat
           serverFeedback={serverFeedback}
           selectedIssue={selectedIssue}
           onNewIssue={onNewIssue}

@@ -152,6 +152,91 @@ def validate_no_stringified_copilot_results(tool_text: str, rel_path: Path) -> L
     return failures
 
 
+def validate_on_frame_guards_before_await(tool_text: str, rel_path: Path) -> List[str]:
+    """Require on_frame() to claim its in-flight guard before its first await.
+
+    on_frame is re-entered on every delivered frame with no backend-owned
+    throttle (see tools/CLAUDE.md); guarding against duplicate/overlapping
+    work is the tool's own responsibility. A tool that awaits expensive work
+    (an embedding computation, a model call) directly in on_frame's body
+    before recording any runtime.set_state(...) claim lets several
+    overlapping on_frame calls all pass the same stale-state check before
+    any of them commits its claim, so they independently relaunch the same
+    unit of work. This mirrors a real incident: three of four recently
+    generated streaming tools shipped this exact race.
+    """
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+
+    on_frame = next(
+        (
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_frame"
+        ),
+        None,
+    )
+    if on_frame is None:
+        return []
+
+    def is_runtime_set_state(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set_state"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "runtime"
+        )
+
+    def is_runtime_is_cancelled_check(node: ast.AST) -> bool:
+        # `if runtime.is_cancelled(): return` at the top is a cancellation
+        # check, not the work this rule is trying to gate; ignore any
+        # Await nested only inside such a guard's own test expression.
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "is_cancelled"
+        )
+
+    # Walk on_frame's own statements (not nested function/lambda bodies —
+    # a helper wrapped in asyncio.create_task is exactly the sanctioned
+    # pattern and its internal awaits are not on_frame's own suspension
+    # points) in source order, looking for the first bare Await and the
+    # first set_state call among direct descendants of on_frame's body.
+    def walk_own_scope(node: ast.AST):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+                continue  # nested scope; its awaits/claims are its own
+            yield child
+            yield from walk_own_scope(child)
+
+    first_set_state_line: Optional[int] = None
+    first_await_line: Optional[int] = None
+    for node in walk_own_scope(on_frame):
+        if first_set_state_line is None and is_runtime_set_state(node):
+            first_set_state_line = node.lineno
+        if first_await_line is None and isinstance(node, ast.Await):
+            if is_runtime_is_cancelled_check(node.value):
+                continue
+            first_await_line = node.lineno
+        if first_set_state_line is not None and first_await_line is not None:
+            break
+
+    if first_await_line is None:
+        return []  # on_frame never suspends directly; nothing to race.
+    if first_set_state_line is None or first_set_state_line > first_await_line:
+        return [
+            f"{rel_path}:{first_await_line}: on_frame() awaits before recording any "
+            "runtime.set_state(...) claim. Record an in-flight/generation claim with "
+            "runtime.set_state(...) before this await, or move the awaited work into "
+            "a helper wrapped in asyncio.create_task(...) — see CLAUDE.md's "
+            "'Assume on_frame() may run again while earlier async work is still "
+            "running' section."
+        ]
+    return []
+
+
 def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
     """Validate the executable lifecycle contract and legacy take-photo fallback."""
     try:
@@ -202,6 +287,7 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
                 failures.append(
                     f"{rel_path}:{node.lineno}: model calls require an explicit model name."
                 )
+        failures.extend(validate_on_frame_guards_before_await(tool_text, rel_path))
         return failures
 
     if constants.get('EXECUTION_MODE') != 'take_photo':
