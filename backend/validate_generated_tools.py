@@ -230,7 +230,7 @@ def validate_on_frame_guards_before_await(tool_text: str, rel_path: Path) -> Lis
             f"{rel_path}:{first_await_line}: on_frame() awaits before recording any "
             "runtime.set_state(...) claim. Record an in-flight/generation claim with "
             "runtime.set_state(...) before this await, or move the awaited work into "
-            "a helper wrapped in asyncio.create_task(...) — see tools/CLAUDE.md's "
+            "a helper wrapped in asyncio.create_task(...) — see CLAUDE.md's "
             "'Assume on_frame() may run again while earlier async work is still "
             "running' section."
         ]
