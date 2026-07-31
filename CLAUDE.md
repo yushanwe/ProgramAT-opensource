@@ -225,7 +225,37 @@ state claim.
 
 Two patterns satisfy this rule:
 - **`asyncio.create_task` pattern (preferred)**: put all `await` calls inside the nested `run()` async function and launch it with `asyncio.create_task(run())`. `on_frame()`'s own body never suspends — there is no `await` for the validator to find, and `runtime.set_state(...)` is called at the end of `on_frame()`'s body before the function returns.
-- **`set_state`-first pattern**: call `runtime.set_state(...)` at least once in `on_frame()`'s own body before its first `await`.
+- **`set_state`-first pattern**: call `runtime.set_state(...)` at least once in `on_frame()`'s own body before its first `await`. The simplest form is an `analyzing` flag: claim it before awaiting a helper, reset it in `finally`. All awaited work moves into the helper `async def`.
+
+```python
+# set_state-first: analyzing flag delegates all awaited work to a helper
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+    if runtime.get_state("analyzing"):
+        return
+    runtime.set_state("analyzing", True)   # claimed before the first await
+    try:
+        await _describe_frame(runtime, frame)  # all awaits are inside the helper
+    finally:
+        runtime.set_state("analyzing", False)
+
+async def _describe_frame(runtime, frame):
+    # The helper may freely await — it is not on_frame's own body.
+    embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+    generation = int(runtime.get_state("scene_generation", 0))
+    anchor = runtime.get_state("scene_anchor")
+    if anchor is None or not is_same_scene(anchor, embedding):
+        generation += 1
+        runtime.set_state("scene_generation", generation)
+        runtime.set_state("scene_anchor", embedding)
+    if runtime.is_cancelled():
+        return
+    text = await asyncio.to_thread(call_model, ...)
+    if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
+        return
+    await runtime.emit(extract_text(text), final=True, replace=True)
+```
 
 The following are the most common wrong patterns — each produces the validator error above:
 
