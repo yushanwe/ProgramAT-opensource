@@ -149,7 +149,17 @@ proven repository pattern over inventing a new scheduler. For Streaming output,
 also inspect where `[GeneratedTool] emit ... accepted=%s` is logged, how
 `backend/stream_server.py` converts generated-tool events into websocket
 messages, and how `ProgramATApp/ToolRunner.tsx` plus
-`ProgramATApp/progressiveResults.ts` accept or ignore those events.
+`ProgramATApp/progressiveResults.ts` accept or ignore those events. Distinguish
+two architectures:
+
+- Backend-coordinated one-shot progressive:
+  the backend sends `tool_progress_started` and `tool_progress_result` events
+  with invocation ids, result indexes, and a final completion marker.
+- Tool-controlled executable Streaming progression:
+  a generated tool calls `runtime.emit(...)`, and ordinary executable
+  Streaming output is transported as normal `tool_stream_result` updates over
+  time. Each emitted update should normally contain usable non-empty spoken
+  text.
 
 The tool may define a small literal frame configuration when the backend needs
 settings before delivering frames. Do not use configuration as a substitute
@@ -188,6 +198,30 @@ Choose model strategy from the requested output behavior:
 
 Model strategy remains tool-controlled. The backend must not turn a multi-model
 tool into parallel progressive execution.
+
+All three strategies are implemented directly in `on_take_photo` and `on_frame`
+using `asyncio.create_task`, `asyncio.to_thread`, and `await runtime.emit(...)`. Do
+not declare `TOOL_POLICY` in any new tool — not even to request parallel progressive
+output. `TOOL_POLICY` is a legacy contract for older declarative take-photo tools
+only; the validator rejects it in any tool that also declares executable lifecycle
+hooks (`on_take_photo`, `on_frame`, etc.).
+
+For tool-controlled executable Streaming, progressive means one Streaming
+session may intentionally emit several normal meaningful `tool_stream_result`
+updates over time, such as:
+
+```text
+YOLO: brief result
+Gemini: detailed result
+GPT: detailed result
+```
+
+Do not instruct generated Streaming tools to depend on
+`tool_progress_started`, emit empty final markers, assume a one-shot
+progressive invocation object, or modify `ToolRunner`, `stream_server.py`, or
+shared runtime code merely to support the tool. A generated tool should
+normally solve its behavior inside its own file using the existing runtime
+contract.
 
 ## Entry-point behavior
 
@@ -229,12 +263,74 @@ concurrent. A lock or in-flight map only prevents duplicates when equivalent
 work shares the same stable key. A per-frame or constantly changing generation
 key does not deduplicate temporal work.
 
-Use a small runtime-state guard, not backend-owned scheduling. Equivalent work
-must share a stable key. A per-frame or constantly changing generation key is
-not a real lock for temporal work.
+This is enforced, not just advisory: `backend/validate_generated_tools.py`
+statically rejects any `on_frame()` whose first `await` in its own body
+precedes any `runtime.set_state(...)` call, both in CI and at load time
+before the backend `exec()`s the tool. If a generated tool computes something
+cheap (an embedding, a change-detection score) before deciding whether to
+launch expensive work, wrap even that computation in a tracked task and claim
+its slot first, exactly like the awaited model call below — do not call
+`await asyncio.to_thread(...)` directly in `on_frame()`'s body before any
+state claim.
 
-For static or scene-based Streaming, a keyed runtime-task guard can be enough.
-For example:
+Two patterns satisfy this rule:
+- **`asyncio.create_task` pattern (preferred)**: put all `await` calls inside the nested `run()` async function and launch it with `asyncio.create_task(run())`. `on_frame()`'s own body never suspends — there is no `await` for the validator to find, and `runtime.set_state(...)` is called at the end of `on_frame()`'s body before the function returns.
+- **`set_state`-first pattern**: call `runtime.set_state(...)` at least once in `on_frame()`'s own body before its first `await`. The simplest form is an `analyzing` flag: claim it before awaiting a helper, reset it in `finally`. All awaited work moves into the helper `async def`.
+
+```python
+# set_state-first: analyzing flag delegates all awaited work to a helper
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+    if runtime.get_state("analyzing"):
+        return
+    runtime.set_state("analyzing", True)   # claimed before the first await
+    try:
+        await _describe_frame(runtime, frame)  # all awaits are inside the helper
+    finally:
+        runtime.set_state("analyzing", False)
+
+async def _describe_frame(runtime, frame):
+    # The helper may freely await — it is not on_frame's own body.
+    embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+    generation = int(runtime.get_state("scene_generation", 0))
+    anchor = runtime.get_state("scene_anchor")
+    if anchor is None or not is_same_scene(anchor, embedding):
+        generation += 1
+        runtime.set_state("scene_generation", generation)
+        runtime.set_state("scene_anchor", embedding)
+    if runtime.is_cancelled():
+        return
+    text = await asyncio.to_thread(call_model, ...)
+    if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
+        return
+    await runtime.emit(extract_text(text), final=True)
+```
+
+The following are the most common wrong patterns — each produces the validator error above:
+
+```python
+# WRONG — on_frame() awaits with no prior set_state; fails even without in-flight tracking
+async def on_frame(runtime, frame):
+    response = await asyncio.to_thread(call_model, ...)  # validator rejects this
+    await runtime.emit(extract_text(response), final=True)
+
+# WRONG — set_state is read but not written before the await
+async def on_frame(runtime, frame):
+    if runtime.get_state("in_flight"):
+        return
+    response = await asyncio.to_thread(call_model, ...)  # validator rejects this
+    runtime.set_state("in_flight", False)  # too late: comes after the await
+
+# WRONG — even a cheap await (embedding, change-detection score) before set_state is rejected
+async def on_frame(runtime, frame):
+    embedding = await asyncio.to_thread(compute_embedding, frame.image)  # validator rejects this
+    runtime.set_state("last_embedding", embedding)
+```
+
+`await runtime.emit(...)` also counts as an `await` for this rule. Any `await` in `on_frame()`'s direct body — not inside a nested `async def` or lambda — must follow at least one `runtime.set_state(...)` call. Reads (`runtime.get_state(...)`) and `runtime.is_cancelled()` checks do not count.
+
+Use a small runtime-state guard, not backend-owned scheduling. For example:
 
 ```python
 async def on_frame(runtime, frame):
@@ -252,7 +348,7 @@ async def on_frame(runtime, frame):
                 return
             if runtime.get_state("scene_generation") != scene_generation:
                 return
-            await runtime.emit(text, final=True, replace=True)
+            await runtime.emit(text, final=True)
         finally:
             current = dict(runtime.get_state("in_flight", {}))
             if current.get(key) is task:
@@ -571,7 +667,28 @@ accepted results and rejects stale or cancelled work.
 
 ## Streaming output contract
 
-For a normal standalone Streaming result, use the repository's known working
+Two different result transports exist in this repository.
+
+### Backend-coordinated one-shot progressive
+
+Use this only when the backend itself owns a parallel progressive take-photo
+execution and sends:
+
+```text
+tool_progress_started
+tool_progress_result
+```
+
+That path may use invocation ids, result indexes, partial results, and a final
+completion event.
+
+### Tool-controlled executable Streaming progression
+
+Use this when a generated tool owns its own model calls and calls
+`runtime.emit(...)`. Here, progressive means one executable Streaming session
+may produce several normal meaningful `tool_stream_result` updates over time.
+
+For a normal executable Streaming result, use the repository's known working
 emit contract:
 
 ```python
@@ -594,6 +711,10 @@ Rules:
 - Always normalize model output with `.strip()` and provide a spoken fallback.
 - For a normal standalone result, use `final=True` without `replace=True`.
 - Use `replace=True` only when replacing a previously emitted partial or provisional result and the repository's consumer supports that flow.
+- Do not emit empty final markers for executable Streaming.
+- Do not assume executable Streaming uses `tool_progress_started` or a one-shot progressive invocation object.
+- When several stage or model results are intentional, emit each one normally and label it clearly, such as `YOLO: ...`, `Gemini: ...`, or `GPT: ...`.
+- Reset tool-owned progression only on a confirmed new scene or temporal window, not on ordinary camera jitter.
 - Do not return `None` after a model call unless the result was already emitted through the supported event contract.
 - Check cancellation before emitting.
 - If the model call or emit fails, log the exception and recover tool state so future analyses remain possible.
@@ -602,10 +723,11 @@ Rules:
 
 `runtime.emit()` strips text and turns `None` into `""`. Backend
 `accepted=True` only proves the runtime accepted the event; it does not prove
-the payload was non-empty or suitable for frontend display. The current
-frontend progressive consumer ignores empty text and may treat `replace=True`
-or `final=True` differently depending on the surrounding event flow, so do not
-invent replacement semantics for ordinary final results.
+the payload was non-empty or suitable for frontend display. For ordinary
+executable Streaming, accepted emits become normal `tool_stream_result`
+updates; for backend-owned one-shot progressive execution, the backend uses
+`tool_progress_started` and `tool_progress_result`. Do not mix the two
+contracts inside a generated Streaming tool.
 
 ## Tool quality and accessibility conventions
 

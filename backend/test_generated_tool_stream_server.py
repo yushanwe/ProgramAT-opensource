@@ -81,11 +81,11 @@ class TestGeneratedToolServerIntegration(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(config["generated_tasks"]))
 
         payloads = [json.loads(call.args[0]) for call in websocket.send.await_args_list]
-        result = next(payload for payload in payloads if payload["type"] == "tool_progress_result")
-        self.assertEqual(result["text"], "frame 1")
+        result = next(payload for payload in payloads if payload["type"] == "tool_stream_result")
+        self.assertEqual(result["result"], "frame 1")
         self.assertEqual(result["metadata"]["width"], 20)
         self.assertEqual(result["metadata"]["model"], "explicit/test-model")
-        self.assertEqual(result["model"], "explicit/test-model")
+        self.assertEqual(result["execution_id"], 1)
 
     async def test_final_only_streaming_emit_is_serialized_with_text(self):
         websocket = AsyncMock()
@@ -107,10 +107,11 @@ class TestGeneratedToolServerIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(accepted)
         payloads = [json.loads(call.args[0]) for call in websocket.send.await_args_list]
-        self.assertEqual(payloads[0]["type"], "tool_progress_started")
-        self.assertEqual(payloads[1]["type"], "tool_progress_result")
-        self.assertTrue(payloads[1]["final"])
-        self.assertEqual(payloads[1]["text"], "Streaming test result")
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["type"], "tool_stream_result")
+        self.assertTrue(payloads[0]["final"])
+        self.assertEqual(payloads[0]["result"], "Streaming test result")
+        self.assertEqual(payloads[0]["execution_id"], 1)
 
     async def test_replaced_stream_rejects_stale_emit(self):
         websocket = AsyncMock()
