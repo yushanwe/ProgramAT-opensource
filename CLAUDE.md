@@ -189,6 +189,13 @@ Choose model strategy from the requested output behavior:
 Model strategy remains tool-controlled. The backend must not turn a multi-model
 tool into parallel progressive execution.
 
+All three strategies are implemented directly in `on_take_photo` and `on_frame`
+using `asyncio.create_task`, `asyncio.to_thread`, and `await runtime.emit(...)`. Do
+not declare `TOOL_POLICY` in any new tool — not even to request parallel progressive
+output. `TOOL_POLICY` is a legacy contract for older declarative take-photo tools
+only; the validator rejects it in any tool that also declares executable lifecycle
+hooks (`on_take_photo`, `on_frame`, etc.).
+
 ## Entry-point behavior
 
 Take Photo receives one current image. It should use `TOOL_PROMPT`, explicitly
@@ -229,12 +236,74 @@ concurrent. A lock or in-flight map only prevents duplicates when equivalent
 work shares the same stable key. A per-frame or constantly changing generation
 key does not deduplicate temporal work.
 
-Use a small runtime-state guard, not backend-owned scheduling. Equivalent work
-must share a stable key. A per-frame or constantly changing generation key is
-not a real lock for temporal work.
+This is enforced, not just advisory: `backend/validate_generated_tools.py`
+statically rejects any `on_frame()` whose first `await` in its own body
+precedes any `runtime.set_state(...)` call, both in CI and at load time
+before the backend `exec()`s the tool. If a generated tool computes something
+cheap (an embedding, a change-detection score) before deciding whether to
+launch expensive work, wrap even that computation in a tracked task and claim
+its slot first, exactly like the awaited model call below — do not call
+`await asyncio.to_thread(...)` directly in `on_frame()`'s body before any
+state claim.
 
-For static or scene-based Streaming, a keyed runtime-task guard can be enough.
-For example:
+Two patterns satisfy this rule:
+- **`asyncio.create_task` pattern (preferred)**: put all `await` calls inside the nested `run()` async function and launch it with `asyncio.create_task(run())`. `on_frame()`'s own body never suspends — there is no `await` for the validator to find, and `runtime.set_state(...)` is called at the end of `on_frame()`'s body before the function returns.
+- **`set_state`-first pattern**: call `runtime.set_state(...)` at least once in `on_frame()`'s own body before its first `await`. The simplest form is an `analyzing` flag: claim it before awaiting a helper, reset it in `finally`. All awaited work moves into the helper `async def`.
+
+```python
+# set_state-first: analyzing flag delegates all awaited work to a helper
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+    if runtime.get_state("analyzing"):
+        return
+    runtime.set_state("analyzing", True)   # claimed before the first await
+    try:
+        await _describe_frame(runtime, frame)  # all awaits are inside the helper
+    finally:
+        runtime.set_state("analyzing", False)
+
+async def _describe_frame(runtime, frame):
+    # The helper may freely await — it is not on_frame's own body.
+    embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+    generation = int(runtime.get_state("scene_generation", 0))
+    anchor = runtime.get_state("scene_anchor")
+    if anchor is None or not is_same_scene(anchor, embedding):
+        generation += 1
+        runtime.set_state("scene_generation", generation)
+        runtime.set_state("scene_anchor", embedding)
+    if runtime.is_cancelled():
+        return
+    text = await asyncio.to_thread(call_model, ...)
+    if runtime.is_cancelled() or runtime.get_state("scene_generation") != generation:
+        return
+    await runtime.emit(extract_text(text), final=True, replace=True)
+```
+
+The following are the most common wrong patterns — each produces the validator error above:
+
+```python
+# WRONG — on_frame() awaits with no prior set_state; fails even without in-flight tracking
+async def on_frame(runtime, frame):
+    response = await asyncio.to_thread(call_model, ...)  # validator rejects this
+    await runtime.emit(extract_text(response), final=True)
+
+# WRONG — set_state is read but not written before the await
+async def on_frame(runtime, frame):
+    if runtime.get_state("in_flight"):
+        return
+    response = await asyncio.to_thread(call_model, ...)  # validator rejects this
+    runtime.set_state("in_flight", False)  # too late: comes after the await
+
+# WRONG — even a cheap await (embedding, change-detection score) before set_state is rejected
+async def on_frame(runtime, frame):
+    embedding = await asyncio.to_thread(compute_embedding, frame.image)  # validator rejects this
+    runtime.set_state("last_embedding", embedding)
+```
+
+`await runtime.emit(...)` also counts as an `await` for this rule. Any `await` in `on_frame()`'s direct body — not inside a nested `async def` or lambda — must follow at least one `runtime.set_state(...)` call. Reads (`runtime.get_state(...)`) and `runtime.is_cancelled()` checks do not count.
+
+Use a small runtime-state guard, not backend-owned scheduling. For example:
 
 ```python
 async def on_frame(runtime, frame):

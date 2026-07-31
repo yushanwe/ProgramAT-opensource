@@ -211,6 +211,71 @@ async def on_stream_stop(runtime):
             [],
         )
 
+    def test_on_frame_rejects_await_before_in_flight_claim(self):
+        # Mirrors a real incident: on_frame awaited an embedding computation
+        # directly, before recording any state, so overlapping frames could
+        # all pass the same "scene changed" check and relaunch duplicate
+        # model calls before any of them committed a claim.
+        tool = '''
+import asyncio
+from litellm_utils import call_model, extract_text
+
+TOOL_NAME = "scene_watcher"
+TOOL_PROMPT = "Describe the scene."
+
+async def on_stream_start(runtime, input_data):
+    runtime.set_state("scene_generation", 0)
+
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+    embedding = await asyncio.to_thread(lambda: frame.image)
+    generation = int(runtime.get_state("scene_generation", 0))
+    runtime.set_state("scene_generation", generation + 1)
+
+async def on_stream_stop(runtime):
+    runtime.clear_state()
+'''
+        failures = validate_generated_tools.validate_take_photo_tool(
+            tool, "", Path("tools/scene_watcher.py")
+        )
+        self.assertTrue(
+            any("awaits before recording any runtime.set_state" in f for f in failures),
+            failures,
+        )
+
+    def test_on_frame_allows_claim_before_await(self):
+        tool = '''
+import asyncio
+from litellm_utils import call_model, extract_text
+
+TOOL_NAME = "scene_watcher"
+TOOL_PROMPT = "Describe the scene."
+
+async def on_stream_start(runtime, input_data):
+    runtime.set_state("analyzing", False)
+
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+    if runtime.get_state("analyzing"):
+        return
+    runtime.set_state("analyzing", True)
+    try:
+        await asyncio.to_thread(lambda: frame.image)
+    finally:
+        runtime.set_state("analyzing", False)
+
+async def on_stream_stop(runtime):
+    runtime.clear_state()
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_take_photo_tool(
+                tool, "", Path("tools/scene_watcher.py")
+            ),
+            [],
+        )
+
     def test_lifecycle_tool_requires_one_shared_prompt(self):
         tool = '''
 TOOL_NAME = "gesture_identifier"
