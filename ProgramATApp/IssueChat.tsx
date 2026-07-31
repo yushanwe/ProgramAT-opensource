@@ -34,6 +34,7 @@ import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
+import TextToSpeechService from './TextToSpeechService';
 
 interface IssueChatProps {
   serverFeedback?: string;
@@ -113,16 +114,20 @@ export default function IssueChat({
     if (!last || last.id === lastAnnouncedIdRef.current) return;
     if (last.kind === 'assistant-question') {
       lastAnnouncedIdRef.current = last.id;
+      TextToSpeechService.speakWithInterrupt(last.question);
       AccessibilityInfo.announceForAccessibility(last.question);
     } else if (last.kind === 'assistant-choice-prompt') {
       lastAnnouncedIdRef.current = last.id;
+      TextToSpeechService.speakWithInterrupt(last.text);
       AccessibilityInfo.announceForAccessibility(last.text);
     } else if (last.kind === 'assistant-created') {
       lastAnnouncedIdRef.current = last.id;
       const note = last.videoSummarySkipped ? ' Video summarization was skipped.' : '';
+      TextToSpeechService.speakWithInterrupt(`Issue ${last.issueNumber} created.${note}`);
       AccessibilityInfo.announceForAccessibility(`Issue ${last.issueNumber} created.${note}`);
     } else if (last.kind === 'assistant-error') {
       lastAnnouncedIdRef.current = last.id;
+      TextToSpeechService.speakWithInterrupt(last.text);
       AccessibilityInfo.announceForAccessibility(last.text);
     }
   }, [items]);
