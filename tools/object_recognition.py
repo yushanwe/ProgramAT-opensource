@@ -63,8 +63,8 @@ TOOL_RUNTIME_INPUT = {
     "label": "Object to find",
     "placeholder": "Enter an object, such as a water cup",
     "prompt_instruction": (
-        "The user is specifically looking for: {value}. Focus only on whether this target is "
-        "visible, and if it is, say clearly where it is. If it is not visible, say that directly."
+        "The user is specifically looking for: {value}. Focus only on locating that target and "
+        "report whether and where it is visible."
     ),
 }
 
