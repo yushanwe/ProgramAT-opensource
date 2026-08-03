@@ -764,15 +764,15 @@ export default function IssueChat({
         style={styles.messagesContainer}
         contentContainerStyle={styles.messagesContent}
         keyboardShouldPersistTaps="handled"
-        accessible={true}
-        accessibilityLabel="Conversation messages"
         accessibilityLiveRegion="polite">
         {items.map(renderItem)}
         {isSending && (
           <View
             style={[styles.messageContainer, styles.assistantAlign, styles.thinkingMessage, { backgroundColor: theme.card, borderColor: theme.border }]}
-            accessible={false}>
-            <Text style={[styles.thinkingText, { color: theme.textSecondary }]}>
+            accessible={true}
+            accessibilityLiveRegion="polite"
+            accessibilityLabel={progressText ?? 'Thinking…'}>
+            <Text style={[styles.thinkingText, { color: theme.textSecondary }]} accessible={false}>
               {progressText ?? 'Thinking…'}
             </Text>
           </View>
