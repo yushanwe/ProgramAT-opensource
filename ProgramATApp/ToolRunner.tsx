@@ -16,6 +16,7 @@ import {
   Platform,
   AccessibilityInfo,
   findNodeHandle,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -105,6 +106,7 @@ export default function ToolRunner({
   const [isProcessingFollowup, setIsProcessingFollowup] = useState(false);
   const [runtimeInputDraft, setRuntimeInputDraft] = useState('');
   const [committedRuntimeInput, setCommittedRuntimeInput] = useState('');
+  const lowerScrollRef = useRef<ScrollView | null>(null);
   
   // Keep isStreamingRef in sync with isStreaming state
   useEffect(() => {
@@ -1266,6 +1268,12 @@ export default function ToolRunner({
     }
   };
 
+  const scrollLowerSectionToEnd = () => {
+    requestAnimationFrame(() => {
+      lowerScrollRef.current?.scrollToEnd({ animated: true });
+    });
+  };
+
   // Cleanup streaming on unmount or tool change
   useEffect(() => {
     return () => {
@@ -1307,7 +1315,10 @@ export default function ToolRunner({
 
         {/* Tool Controls - Fixed bottom section */}
         {selectedTool.path !== 'camera' && (
-          <View style={styles.controlsSection}>
+          <KeyboardAvoidingView
+            style={styles.controlsSection}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
             {/* Fixed controls - always visible */}
             <View style={styles.fixedControls}>
               {/* Tool name */}
@@ -1445,92 +1456,93 @@ export default function ToolRunner({
                   ) : null}
                 </View>
               )}
-
-              {/* Output section - visible but compact with accessibility live region */}
-              {toolOutput && (
-                <View 
-                  style={styles.outputSection}
-                  accessible={true}
-                  accessibilityLiveRegion="polite"
-                  accessibilityRole="text"
-                  accessibilityLabel={`Tool output: ${toolOutput}`}
-                  accessibilityHint="Long press to copy text">
-                  <Text 
-                    style={styles.outputText} 
-                    numberOfLines={2}
-                    selectable={true}
-                    accessible={false}>
-                    {toolOutput}
-                  </Text>
-                </View>
-              )}
-
-              {selectedTool.runtime_input && (
-                <View style={styles.runtimeInputSection}>
-                  <Text
-                    style={styles.runtimeInputLabel}
-                    accessible={true}
-                    accessibilityRole="text"
-                    accessibilityLabel={selectedTool.runtime_input.label}>
-                    {selectedTool.runtime_input.label}
-                  </Text>
-                  <TextInput
-                    style={styles.runtimeInputField}
-                    value={runtimeInputDraft}
-                    onChangeText={setRuntimeInputDraft}
-                    placeholder={selectedTool.runtime_input.placeholder}
-                    placeholderTextColor="#8a8a8a"
-                    returnKeyType="done"
-                    onSubmitEditing={commitRuntimeInput}
-                    accessible={true}
-                    accessibilityLabel={selectedTool.runtime_input.label}
-                    accessibilityHint="Enter a temporary target for future tool runs. Double tap Enter to commit it."
-                  />
-                  <View style={styles.runtimeInputButtons}>
-                    <TouchableOpacity
-                      style={[styles.runtimeInputButton, styles.runtimeCommitButton]}
-                      onPress={commitRuntimeInput}
-                      accessible={true}
-                      accessibilityRole="button"
-                      accessibilityLabel="Enter target"
-                      accessibilityHint="Commits the current text for subsequent Take Photo and Start Streaming requests">
-                      <Text style={styles.runtimeInputButtonText}>Enter</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.runtimeInputButton, styles.runtimeClearButton]}
-                      onPress={clearRuntimeInput}
-                      accessible={true}
-                      accessibilityRole="button"
-                      accessibilityLabel="Clear target"
-                      accessibilityHint="Removes both the typed and active target and restores the tool default behavior">
-                      <Text style={styles.runtimeInputButtonText}>Clear</Text>
-                    </TouchableOpacity>
-                  </View>
-                  <Text
-                    style={styles.runtimeInputStatus}
-                    accessible={true}
-                    accessibilityRole="text"
-                    accessibilityLabel={
-                      committedRuntimeInput
-                        ? `Active target: ${committedRuntimeInput}`
-                        : 'No active target'
-                    }>
-                    {committedRuntimeInput
-                      ? `Active target: ${committedRuntimeInput}`
-                      : 'Active target: none'}
-                  </Text>
-                </View>
-              )}
             </View>
 
-            {/* Scrollable details - takes remaining space */}
+            {/* Scrollable lower content */}
             <ScrollView 
-              style={styles.detailsScroll}
-              contentContainerStyle={styles.detailsContent}
+              ref={lowerScrollRef}
+              style={styles.lowerScrollArea}
+              contentContainerStyle={styles.lowerScrollContent}
               keyboardShouldPersistTaps="handled"
               showsVerticalScrollIndicator={true}>
               <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
                 <View>
+                  {/* Output section - reachable in lower scrolling region */}
+                  {toolOutput && (
+                    <View 
+                      style={styles.outputSection}
+                      accessible={true}
+                      accessibilityLiveRegion="polite"
+                      accessibilityRole="text"
+                      accessibilityLabel={`Tool output: ${toolOutput}`}
+                      accessibilityHint="Long press to copy text">
+                      <Text 
+                        style={styles.outputText}
+                        selectable={true}
+                        accessible={false}>
+                        {toolOutput}
+                      </Text>
+                    </View>
+                  )}
+
+                  {selectedTool.runtime_input && (
+                    <View style={styles.runtimeInputSection}>
+                      <Text
+                        style={styles.runtimeInputLabel}
+                        accessible={true}
+                        accessibilityRole="text"
+                        accessibilityLabel={selectedTool.runtime_input.label}>
+                        {selectedTool.runtime_input.label}
+                      </Text>
+                      <TextInput
+                        style={styles.runtimeInputField}
+                        value={runtimeInputDraft}
+                        onChangeText={setRuntimeInputDraft}
+                        placeholder={selectedTool.runtime_input.placeholder}
+                        placeholderTextColor="#8a8a8a"
+                        returnKeyType="done"
+                        onSubmitEditing={commitRuntimeInput}
+                        onFocus={scrollLowerSectionToEnd}
+                        accessible={true}
+                        accessibilityLabel={selectedTool.runtime_input.label}
+                        accessibilityHint="Enter a temporary target for future tool runs. Double tap Enter to commit it."
+                      />
+                      <View style={styles.runtimeInputButtons}>
+                        <TouchableOpacity
+                          style={[styles.runtimeInputButton, styles.runtimeCommitButton]}
+                          onPress={commitRuntimeInput}
+                          accessible={true}
+                          accessibilityRole="button"
+                          accessibilityLabel="Enter target"
+                          accessibilityHint="Commits the current text for subsequent Take Photo and Start Streaming requests">
+                          <Text style={styles.runtimeInputButtonText}>Enter</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[styles.runtimeInputButton, styles.runtimeClearButton]}
+                          onPress={clearRuntimeInput}
+                          accessible={true}
+                          accessibilityRole="button"
+                          accessibilityLabel="Clear target"
+                          accessibilityHint="Removes both the typed and active target and restores the tool default behavior">
+                          <Text style={styles.runtimeInputButtonText}>Clear</Text>
+                        </TouchableOpacity>
+                      </View>
+                      <Text
+                        style={styles.runtimeInputStatus}
+                        accessible={true}
+                        accessibilityRole="text"
+                        accessibilityLabel={
+                          committedRuntimeInput
+                            ? `Active target: ${committedRuntimeInput}`
+                            : 'No active target'
+                        }>
+                        {committedRuntimeInput
+                          ? `Active target: ${committedRuntimeInput}`
+                          : 'Active target: none'}
+                      </Text>
+                    </View>
+                  )}
+
                   {selectedTool.description && (
                     <View style={styles.detailSection}>
                       <Text style={styles.detailTitle}>Description</Text>
@@ -1598,7 +1610,7 @@ export default function ToolRunner({
                 </View>
               </TouchableWithoutFeedback>
             </ScrollView>
-          </View>
+          </KeyboardAvoidingView>
         )}
       </View>
     );
@@ -1621,11 +1633,6 @@ export default function ToolRunner({
         </View>
       )}
       
-      {selectedTool && (
-        <View style={styles.header}>
-          <Text style={styles.headerText}>Running: {selectedTool.name}</Text>
-        </View>
-      )}
       <View style={styles.content}>
         {renderTool()}
       </View>
@@ -1656,18 +1663,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#2563eb',
     fontWeight: '600',
-  },
-  header: {
-    backgroundColor: '#2196F3',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1976D2',
-  },
-  headerText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#fff',
   },
   content: {
     flex: 1,
@@ -1702,13 +1697,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
   },
   controlsSection: {
+    flexShrink: 1,
     backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#e0e0e0',
-    maxHeight: '30%', // Controls limited to 30% max
+    maxHeight: '42%',
   },
   fixedControls: {
-    // Controls that are always visible (buttons, output)
     backgroundColor: '#fff',
   },
   toolHeader: {
@@ -1748,7 +1743,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f5',
     borderTopWidth: 1,
     borderTopColor: '#e0e0e0',
-    maxHeight: 60,
   },
   outputText: {
     fontSize: 13,
@@ -1807,12 +1801,12 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#555',
   },
-  detailsScroll: {
-    maxHeight: 200, // Constrain height to force scrolling
+  lowerScrollArea: {
+    flex: 1,
     backgroundColor: '#fafafa',
   },
-  detailsContent: {
-    paddingBottom: 20, // Ensure content can scroll fully
+  lowerScrollContent: {
+    paddingBottom: Platform.OS === 'ios' ? 28 : 20,
   },
   detailSection: {
     backgroundColor: '#fff',
