@@ -150,6 +150,7 @@ Keep these restrictions in one place and follow them strictly:
 - Do not access API keys or environment variables directly. The validator rejects environment access, and shared helpers already own credential resolution.
 - Do not call provider SDKs directly or construct arbitrary network requests. Use the approved shared model helpers instead, or local processing that passes validation.
 - Do not choose arbitrary models. Select only from the model pool listed in this file and the repository-backed helpers or profiles that implement it.
+- Unless the request clearly calls for another listed model, default to Gemini for VLM work at first. If YOLO alone is not sufficient to solve the task end to end, do not use YOLO as the only model; use Gemini by default unless the user explicitly asks the tool to be stronger or faster. If there are model changes requested afterwards, you can change the model selection or strategy selection.
 - Do not use subprocesses, multiprocessing, raw filesystem reads or writes, unsafe dynamic imports, or unsupported networking imports. These patterns are validator failures and can break sandbox assumptions.
 - Do not import implementation code from another tool module. Shared behavior belongs in approved shared helpers, not cross-tool coupling.
 - Do not make a generated tool depend on another generated tool module. Each tool must remain self-contained at the tool level even while reusing approved shared helpers.
