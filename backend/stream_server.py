@@ -2241,8 +2241,7 @@ def _take_photo_tool_prompt(tool_name: str, tool_code: str) -> str:
 _RUNTIME_INPUT_MAX_LENGTH = 200
 
 
-def _tool_runtime_input_definition(tool_code: str) -> Optional[Dict[str, str]]:
-    raw = _literal_tool_metadata(tool_code, 'TOOL_RUNTIME_INPUT')
+def _sanitize_runtime_input_definition(raw: Any) -> Optional[Dict[str, str]]:
     if not isinstance(raw, dict):
         return None
     required_fields = (
@@ -2263,6 +2262,16 @@ def _tool_runtime_input_definition(tool_code: str) -> Optional[Dict[str, str]]:
     if '{value}' not in normalized['prompt_instruction']:
         return None
     return normalized
+
+
+def _tool_runtime_input_definition(tool_code: str) -> Optional[Dict[str, str]]:
+    for metadata_name in ('TOOL_RUNTIME_INPUT', 'runtime_input', 'RUNTIME_INPUT'):
+        normalized = _sanitize_runtime_input_definition(
+            _literal_tool_metadata(tool_code, metadata_name)
+        )
+        if normalized:
+            return normalized
+    return None
 
 
 def _sanitize_runtime_inputs(
@@ -2340,11 +2349,39 @@ def _log_runtime_input_tool_metadata(source: str, tool_record: Dict[str, Any]) -
         or 'unknown'
     )
     enabled = isinstance(tool_record.get('runtime_input'), dict)
+    metadata = tool_record.get('runtime_input') if enabled else 'none'
     logger.info(
         "[Runtime Input] source=%s tool=%s enabled=%s",
         source,
         tool_id,
         str(enabled).lower(),
+    )
+    logger.info(
+        "[Runtime Input Metadata] tool=%s metadata=%s",
+        tool_id,
+        json.dumps(metadata, ensure_ascii=False) if enabled else 'none',
+    )
+
+
+def _log_runtime_input_tool_source(
+    tool_record: Dict[str, Any],
+    source_mode: str,
+    repo_name: str,
+    branch_name: str = '',
+    pr_number: Optional[int] = None,
+    commit_sha: str = '',
+) -> None:
+    tool_id = str(tool_record.get('path') or tool_record.get('name') or 'unknown')
+    declared = isinstance(tool_record.get('runtime_input'), dict)
+    logger.info(
+        "[Runtime Input Source] tool=%s source=%s repo=%s branch=%s pr=%s sha=%s declared=%s",
+        tool_id,
+        source_mode,
+        repo_name or 'unknown',
+        branch_name or '',
+        '' if pr_number is None else str(pr_number),
+        commit_sha or '',
+        str(declared).lower(),
     )
 
 
@@ -4034,6 +4071,19 @@ def get_local_tools_for_pr_merge() -> list:
     """Get local tools that can be used for PR merging"""
     local_tools = []
     local_tools_dir = Path(__file__).parent.parent / 'tools'
+    source_repo = GITHUB_REPO
+    branch_name = ''
+    commit_sha = ''
+    try:
+        head_ref = (Path(__file__).parent.parent / '.git' / 'HEAD').read_text(encoding='utf-8').strip()
+        if head_ref.startswith('ref: '):
+            ref_path = head_ref.split(' ', 1)[1].strip()
+            branch_name = Path(ref_path).name
+            commit_sha = (Path(__file__).parent.parent / '.git' / ref_path).read_text(encoding='utf-8').strip()
+        else:
+            commit_sha = head_ref
+    except Exception:
+        logger.debug("Could not determine local git source info", exc_info=True)
     
     if not local_tools_dir.exists():
         return []
@@ -4081,6 +4131,14 @@ def get_local_tools_for_pr_merge() -> list:
                 'language': 'python',
                 'source': 'local'
             })
+            _log_runtime_input_tool_source(
+                tool_record,
+                'local',
+                source_repo,
+                branch_name,
+                None,
+                commit_sha,
+            )
             _log_runtime_input_tool_metadata('local_pr_merge', tool_record)
             local_tools.append(tool_record)
             
@@ -4190,6 +4248,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
     commit = repo.get_commit(pr.head.sha)
     tree = commit.commit.tree
     logger.info(f"Successfully fetched tree for PR #{pr.number}, tree SHA: {tree.sha}")
+    repo_name = getattr(repo, 'full_name', GITHUB_REPO)
     
     # Recursively traverse the tree to find files in tools/ directory
     def find_tool_files(tree_obj, current_path=""):
@@ -4296,6 +4355,14 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
                 'system_instruction': pr_system_instruction,
                 'query_interval': pr_query_interval,
             })
+            _log_runtime_input_tool_source(
+                tool_record,
+                'github_pr',
+                repo_name,
+                pr.head.ref,
+                pr.number,
+                pr.head.sha,
+            )
             _log_runtime_input_tool_metadata('github_pr', tool_record)
             tools.append(tool_record)
             logger.info(f"Added PR tool: {tool_name} from {file_info['path']} (PR #{pr.number})")
@@ -4394,6 +4461,7 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
     try:
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO)
+        repo_name = getattr(repo, 'full_name', GITHUB_REPO)
         
         logger.info(f"Fetching production tools from branch: {branch_name}")
         
@@ -4493,6 +4561,14 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
                     'is_production': True,
                     'source': 'github_branch',
                 })
+                _log_runtime_input_tool_source(
+                    tool_record,
+                    'github_branch',
+                    repo_name,
+                    branch_name,
+                    None,
+                    commit_sha,
+                )
                 _log_runtime_input_tool_metadata('github_branch', tool_record)
                 tools.append(tool_record)
                 logger.info(f"Added production tool: {tool_name} from {file_info['path']} (branch {branch_name})")

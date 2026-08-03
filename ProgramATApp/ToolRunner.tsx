@@ -116,6 +116,20 @@ export default function ToolRunner({
     setCommittedRuntimeInput('');
   }, [selectedTool?.name, selectedTool?.path]);
 
+  useEffect(() => {
+    if (!selectedTool) {
+      return;
+    }
+    const visible = Boolean(selectedTool.runtime_input);
+    console.log(
+      `[Runtime Input Render] tool=${selectedTool.path || selectedTool.name} schema=${
+        selectedTool.runtime_input
+          ? JSON.stringify(selectedTool.runtime_input)
+          : 'none'
+      } visible=${visible ? 'true' : 'false'}`,
+    );
+  }, [selectedTool?.name, selectedTool?.path, selectedTool?.runtime_input]);
+
   // Voice event listeners for follow-up speech-to-text
   useEffect(() => {
     Voice.onSpeechPartialResults = (e: SpeechResultsEvent) => {

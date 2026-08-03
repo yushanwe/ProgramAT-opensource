@@ -85,6 +85,7 @@ describe('ToolRunner runtime input rendering', () => {
     const inputs = tree!.root.findAll(
       node => node.props?.placeholder === 'Enter an object, such as a water cup',
     );
+    expect(tree!.root.findAllByType('CameraView').length).toBeGreaterThan(0);
     expect(inputs.length).toBeGreaterThan(0);
     expect(tree!.root.findAllByProps({children: 'Enter'}).length).toBeGreaterThan(0);
     expect(tree!.root.findAllByProps({children: 'Clear'}).length).toBeGreaterThan(0);
@@ -111,6 +112,7 @@ describe('ToolRunner runtime input rendering', () => {
     const inputs = tree!.root.findAll(
       node => node.props?.placeholder === 'Enter an object, such as a water cup',
     );
+    expect(tree!.root.findAllByType('CameraView').length).toBeGreaterThan(0);
     expect(inputs).toHaveLength(0);
     expect(tree!.root.findAllByProps({children: 'Active target: none'})).toHaveLength(0);
     await ReactTestRenderer.act(() => {
