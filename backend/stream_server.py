@@ -70,6 +70,7 @@ from tool_policy_runtime import (
     TOOL_EXECUTION_IMAGES,
     execute_resolved_tool_policy,
     system_llm_call,
+    transcript_llm_call,
 )
 from litellm_utils import extract_text
 from model_execution import execute_tool_policy
@@ -5162,7 +5163,7 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
     try:
         issue_prompt = _build_issue_extraction_prompt(transcript, existing_data)
         logger.info("Issue extraction transcript=%s", transcript)
-        issue_response = system_llm_call(
+        issue_response = transcript_llm_call(
             messages=[{'role': 'user', 'content': issue_prompt}],
             metadata={'response_format': {'type': 'json_object'}},
         )

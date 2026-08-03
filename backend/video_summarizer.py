@@ -35,7 +35,7 @@ async def _with_retry(func, *args, **kwargs):
             await asyncio.sleep(delay)
 
 
-MODEL = 'gemini-3-flash-preview'
+MODEL = 'gemini-3.1-flash-lite-preview'
 PROMPT = (
     "This video should provide an example of how a hypothetical tool for visual assistance should work"
     "Summarize what is happening in this video, including any relevant audio context. "
