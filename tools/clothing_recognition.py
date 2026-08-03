@@ -113,7 +113,6 @@ def build_clothing_prompt(detail_level: str = 'standard') -> str:
 
 def analyze_clothing(
     image: np.ndarray,
-    api_key: Optional[str] = None,
     detail_level: str = 'standard',
 ) -> Dict[str, Any]:
     """
@@ -121,7 +120,6 @@ def analyze_clothing(
     
     Args:
         image: OpenCV image (numpy array in BGR format)
-        api_key: Gemini API key (uses env var if not provided)
         detail_level: 'brief', 'standard', or 'detailed'
     
     Returns:
@@ -149,8 +147,6 @@ def analyze_clothing(
             'tool_name': TOOL_NAME,
             'route_text': 'identify the most prominent clothing item and describe visual features concisely',
         }
-        if api_key:
-            metadata['api_key'] = api_key
 
         result = copilot_llm_call(
             capability=TASK_CATEGORY,
@@ -229,7 +225,6 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Dict[str, Any]
         image: Camera frame as numpy array (BGR format from OpenCV)
         input_data: Optional configuration dictionary:
             - 'detail_level': 'brief', 'standard', or 'detailed' (default: 'standard')
-            - 'api_key': Optional API key override
     
     Returns:
         Dictionary with analysis results and audio configuration:
@@ -272,11 +267,9 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Dict[str, Any]
         input_data = {}
     
     detail_level = input_data.get('detail_level', 'standard')
-    api_key = input_data.get('api_key')
     # Analyze clothing
     result = analyze_clothing(
         image=image,
-        api_key=api_key,
         detail_level=detail_level,
     )
     
