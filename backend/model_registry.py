@@ -52,14 +52,14 @@ MODEL_REGISTRY = {
     "gpt-4o-mini": {
         "provider_model": "openai/gpt-4o-mini",
         "executor": "model",
-        "supported_input_types": ["text"],
+        "supported_input_types": ["text"],  # text-only: do NOT use for visual tool calls
         "supported_capabilities": ["text_evaluation", "result_aggregation", "lightweight_reasoning"],
         "relative_latency": "low",
         "relative_accuracy": "medium",
         "cost": "low",
         "strengths": "Fast text evaluation and lightweight result aggregation.",
-        "limitations": "Not the default vision model.",
-        "recommended_use_cases": ["Evaluating or aggregating candidate results."],
+        "limitations": "Text-only — no image support. Not for use in visual assistive tools.",
+        "recommended_use_cases": ["Evaluating or aggregating candidate results (text only)."],
     },
 }
 
