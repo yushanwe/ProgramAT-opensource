@@ -411,6 +411,14 @@ TOOL_PROMPT = "Inspect chronological hand motion and identify the signed phrase.
         )
         self.assertTrue(any("card-specific prompt" in failure for failure in failures))
 
+    def test_checked_in_tools_pass_static_guardrails(self):
+        tool_paths = [
+            path
+            for path in validate_generated_tools.TOOLS_DIR.glob("*.py")
+            if path.name not in validate_generated_tools.ALLOWED_SHARED_TOOL_FILES
+        ]
+        self.assertEqual(validate_generated_tools.validate_files(tool_paths), [])
+
 
 if __name__ == "__main__":
     unittest.main()
