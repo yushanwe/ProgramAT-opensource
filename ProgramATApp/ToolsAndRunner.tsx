@@ -9,6 +9,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from './ThemeContext';
 import ToolSelector from './ToolSelector';
 import ToolRunner from './ToolRunner';
+import { RuntimeInputDefinition } from './runtimeInput';
 
 interface Tool {
   name: string;
@@ -24,6 +25,7 @@ interface Tool {
   system_instruction?: string;
   query_interval?: number;
   source?: string;
+  runtime_input?: RuntimeInputDefinition;
 }
 
 interface ToolsAndRunnerProps {
