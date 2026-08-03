@@ -90,10 +90,12 @@ export default function ToolsAndRunner({
         freshTool.gpt_query !== selectedTool.gpt_query ||
         freshTool.code !== selectedTool.code ||
         freshTool.system_instruction !== selectedTool.system_instruction ||
-        freshTool.query_interval !== selectedTool.query_interval
+        freshTool.query_interval !== selectedTool.query_interval ||
+        JSON.stringify(freshTool.runtime_input || null) !==
+          JSON.stringify(selectedTool.runtime_input || null)
       ) {
         // Update the selected tool with fresh data (e.g. updated gpt_query from code)
-        console.log('[ToolsAndRunner] Updating selected tool with fresh data (gpt_query or code changed)');
+        console.log('[ToolsAndRunner] Updating selected tool with fresh data (gpt_query, code, or runtime_input changed)');
         const updated = { ...selectedTool, ...freshTool };
         setSelectedTool(updated);
         AsyncStorage.setItem('selectedTool', JSON.stringify(updated)).catch(error => {
@@ -104,6 +106,9 @@ export default function ToolsAndRunner({
   }, [issueTools]);
 
   const handleToolSelect = (tool: Tool) => {
+    console.log(
+      `[Runtime Input] tool=${tool.path || tool.name} enabled=${tool.runtime_input ? 'true' : 'false'}`,
+    );
     setSelectedTool(tool);
     setViewMode('tool-runner'); // Navigate to runner after selecting tool
     // Persist the selected tool

@@ -2333,6 +2333,21 @@ def _inject_runtime_input_metadata(tool_record: Dict[str, Any]) -> Dict[str, Any
     return enriched
 
 
+def _log_runtime_input_tool_metadata(source: str, tool_record: Dict[str, Any]) -> None:
+    tool_id = str(
+        tool_record.get('path')
+        or tool_record.get('name')
+        or 'unknown'
+    )
+    enabled = isinstance(tool_record.get('runtime_input'), dict)
+    logger.info(
+        "[Runtime Input] source=%s tool=%s enabled=%s",
+        source,
+        tool_id,
+        str(enabled).lower(),
+    )
+
+
 def _with_runtime_inputs(input_data: Any, runtime_inputs: Dict[str, str]) -> Any:
     if not runtime_inputs:
         return input_data
@@ -4058,7 +4073,7 @@ def get_local_tools_for_pr_merge() -> list:
                         description = description[:200] + "..."
             
             tool_name = py_file.stem
-            local_tools.append({
+            tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': f'tools/{py_file.name}',
                 'description': description,
@@ -4066,6 +4081,8 @@ def get_local_tools_for_pr_merge() -> list:
                 'language': 'python',
                 'source': 'local'
             })
+            _log_runtime_input_tool_metadata('local_pr_merge', tool_record)
+            local_tools.append(tool_record)
             
         except Exception as e:
             logger.warning(f"Failed to read local tool {py_file}: {e}")
@@ -4264,7 +4281,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
             }
             language = language_map.get(file_ext, file_ext)
             
-            tools.append({
+            tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': file_info['path'],
                 'description': description,
@@ -4279,6 +4296,8 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
                 'system_instruction': pr_system_instruction,
                 'query_interval': pr_query_interval,
             })
+            _log_runtime_input_tool_metadata('github_pr', tool_record)
+            tools.append(tool_record)
             logger.info(f"Added PR tool: {tool_name} from {file_info['path']} (PR #{pr.number})")
         except Exception as e:
             logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -4464,7 +4483,7 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
                 }
                 language = language_map.get(file_ext, file_ext)
                 
-                tools.append({
+                tool_record = _inject_runtime_input_metadata({
                     'name': tool_name,
                     'path': file_info['path'],
                     'description': description,
@@ -4474,6 +4493,8 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
                     'is_production': True,
                     'source': 'github_branch',
                 })
+                _log_runtime_input_tool_metadata('github_branch', tool_record)
+                tools.append(tool_record)
                 logger.info(f"Added production tool: {tool_name} from {file_info['path']} (branch {branch_name})")
             except Exception as e:
                 logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -7348,6 +7369,8 @@ async def handle_client(websocket):
                         # Fetch PR title and tools separately to ensure we always have the title
                         pr_title = fetch_pr_title(pr_number)
                         tools = fetch_pr_tools(pr_number)
+                        for tool in tools:
+                            _log_runtime_input_tool_metadata('pr_response', tool)
                         await websocket.send(json.dumps({
                             'type': 'pr_tools',
                             'pr_number': pr_number,
@@ -7409,6 +7432,8 @@ async def handle_client(websocket):
                 if msg_type == 'request_production_tools':
                     branch = data.get('branch', 'main')
                     tools = fetch_branch_tools(branch)
+                    for tool in tools:
+                        _log_runtime_input_tool_metadata('production_response', tool)
                     await websocket.send(json.dumps({
                         'type': 'production_tools',
                         'branch': branch,
@@ -7802,6 +7827,8 @@ async def handle_client(websocket):
                             # Fetch tools associated with this issue
                             logger.info(f"Fetching tools for issue #{issue_number}...")
                             issue_tools = fetch_issue_tools(issue_number)
+                            for tool in issue_tools:
+                                _log_runtime_input_tool_metadata('issue_update_response', tool)
                             
                             # Send confirmation
                             confirm_data = {
