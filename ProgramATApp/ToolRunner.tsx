@@ -35,6 +35,11 @@ import {
   progressiveInvocationIsRunning,
   progressiveResultModel,
 } from './progressiveResults';
+import {
+  buildRuntimeInputsPayload,
+  normalizeRuntimeInputValue,
+  RuntimeInputDefinition,
+} from './runtimeInput';
 
 // Configuration for text similarity filtering
 const SIMILARITY_THRESHOLDS = {
@@ -58,6 +63,7 @@ interface Tool {
   system_instruction?: string;
   query_interval?: number;
   source?: string;
+  runtime_input?: RuntimeInputDefinition;
 }
 
 interface ToolRunnerProps {
@@ -97,11 +103,18 @@ export default function ToolRunner({
   const [isListeningFollowup, setIsListeningFollowup] = useState(false);
   const [followupTranscript, setFollowupTranscript] = useState('');
   const [isProcessingFollowup, setIsProcessingFollowup] = useState(false);
+  const [runtimeInputDraft, setRuntimeInputDraft] = useState('');
+  const [committedRuntimeInput, setCommittedRuntimeInput] = useState('');
   
   // Keep isStreamingRef in sync with isStreaming state
   useEffect(() => {
     isStreamingRef.current = isStreaming;
   }, [isStreaming]);
+
+  useEffect(() => {
+    setRuntimeInputDraft('');
+    setCommittedRuntimeInput('');
+  }, [selectedTool?.name, selectedTool?.path]);
 
   // Voice event listeners for follow-up speech-to-text
   useEffect(() => {
@@ -1055,6 +1068,10 @@ export default function ToolRunner({
     }
 
     // Send tool execution request to backend with captured frame
+    const runtimeInputs = buildRuntimeInputsPayload(
+      selectedTool.runtime_input,
+      committedRuntimeInput,
+    );
     const message = {
       type: 'run_tool',
       tool_name: selectedTool.name,
@@ -1070,6 +1087,7 @@ export default function ToolRunner({
         height: frameData.height,
       },
       conversation_id: conversationId, // Include conversation ID if in conversation mode
+      runtime_inputs: runtimeInputs,
       timestamp: Date.now(),
     };
 
@@ -1115,6 +1133,10 @@ export default function ToolRunner({
     BeepService.stopLoadingSound();
     setToolOutput('Starting stream...');
     
+    const runtimeInputs = buildRuntimeInputsPayload(
+      selectedTool.runtime_input,
+      committedRuntimeInput,
+    );
     const message: any = {
       type: 'start_streaming_tool',
       tool_name: selectedTool.name,
@@ -1124,6 +1146,7 @@ export default function ToolRunner({
       tool_source: selectedTool.source,
       input: '',
       task: selectedTool.description || selectedTool.name,
+      runtime_inputs: runtimeInputs,
       throttle_ms: 1000, // Process 1 frame per second
     };
 
@@ -1204,6 +1227,28 @@ export default function ToolRunner({
       console.log('[ToolRunner] Sent streaming stop request');
     } else {
       console.error('[ToolRunner] WebSocket not open when stopping stream');
+    }
+  };
+
+  const commitRuntimeInput = () => {
+    const normalized = normalizeRuntimeInputValue(runtimeInputDraft);
+    setRuntimeInputDraft(normalized);
+    setCommittedRuntimeInput(normalized);
+    if (selectedTool?.runtime_input?.label) {
+      const announcement = normalized
+        ? `${selectedTool.runtime_input.label} set to ${normalized}`
+        : `${selectedTool.runtime_input.label} cleared`;
+      AccessibilityInfo.announceForAccessibility(announcement);
+    }
+  };
+
+  const clearRuntimeInput = () => {
+    setRuntimeInputDraft('');
+    setCommittedRuntimeInput('');
+    if (selectedTool?.runtime_input?.label) {
+      AccessibilityInfo.announceForAccessibility(
+        `${selectedTool.runtime_input.label} cleared`,
+      );
     }
   };
 
@@ -1402,6 +1447,63 @@ export default function ToolRunner({
                     selectable={true}
                     accessible={false}>
                     {toolOutput}
+                  </Text>
+                </View>
+              )}
+
+              {selectedTool.runtime_input && (
+                <View style={styles.runtimeInputSection}>
+                  <Text
+                    style={styles.runtimeInputLabel}
+                    accessible={true}
+                    accessibilityRole="text"
+                    accessibilityLabel={selectedTool.runtime_input.label}>
+                    {selectedTool.runtime_input.label}
+                  </Text>
+                  <TextInput
+                    style={styles.runtimeInputField}
+                    value={runtimeInputDraft}
+                    onChangeText={setRuntimeInputDraft}
+                    placeholder={selectedTool.runtime_input.placeholder}
+                    placeholderTextColor="#8a8a8a"
+                    returnKeyType="done"
+                    onSubmitEditing={commitRuntimeInput}
+                    accessible={true}
+                    accessibilityLabel={selectedTool.runtime_input.label}
+                    accessibilityHint="Enter a temporary target for future tool runs. Double tap Enter to commit it."
+                  />
+                  <View style={styles.runtimeInputButtons}>
+                    <TouchableOpacity
+                      style={[styles.runtimeInputButton, styles.runtimeCommitButton]}
+                      onPress={commitRuntimeInput}
+                      accessible={true}
+                      accessibilityRole="button"
+                      accessibilityLabel="Enter target"
+                      accessibilityHint="Commits the current text for subsequent Take Photo and Start Streaming requests">
+                      <Text style={styles.runtimeInputButtonText}>Enter</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.runtimeInputButton, styles.runtimeClearButton]}
+                      onPress={clearRuntimeInput}
+                      accessible={true}
+                      accessibilityRole="button"
+                      accessibilityLabel="Clear target"
+                      accessibilityHint="Removes both the typed and active target and restores the tool default behavior">
+                      <Text style={styles.runtimeInputButtonText}>Clear</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <Text
+                    style={styles.runtimeInputStatus}
+                    accessible={true}
+                    accessibilityRole="text"
+                    accessibilityLabel={
+                      committedRuntimeInput
+                        ? `Active target: ${committedRuntimeInput}`
+                        : 'No active target'
+                    }>
+                    {committedRuntimeInput
+                      ? `Active target: ${committedRuntimeInput}`
+                      : 'Active target: none'}
                   </Text>
                 </View>
               )}
@@ -1638,6 +1740,58 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#333',
     lineHeight: 18,
+  },
+  runtimeInputSection: {
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 10,
+    backgroundColor: '#fff',
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+  },
+  runtimeInputLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 6,
+  },
+  runtimeInputField: {
+    borderWidth: 1,
+    borderColor: '#d0d0d0',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: Platform.OS === 'ios' ? 10 : 8,
+    fontSize: 14,
+    color: '#222',
+    backgroundColor: '#fafafa',
+  },
+  runtimeInputButtons: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  runtimeInputButton: {
+    flex: 1,
+    borderRadius: 6,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  runtimeCommitButton: {
+    backgroundColor: '#2563eb',
+  },
+  runtimeClearButton: {
+    backgroundColor: '#6b7280',
+  },
+  runtimeInputButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  runtimeInputStatus: {
+    marginTop: 8,
+    fontSize: 12,
+    color: '#555',
   },
   detailsScroll: {
     maxHeight: 200, // Constrain height to force scrolling

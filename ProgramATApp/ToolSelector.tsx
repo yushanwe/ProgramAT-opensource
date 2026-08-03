@@ -18,6 +18,7 @@ import Config from './config';
 import WebSocketService from './WebSocketService';
 import BeepService from './BeepService';
 import { useTheme } from './ThemeContext';
+import { RuntimeInputDefinition } from './runtimeInput';
 
 interface Tool {
   name: string;
@@ -33,6 +34,7 @@ interface Tool {
   system_instruction?: string;
   query_interval?: number;
   source?: string;
+  runtime_input?: RuntimeInputDefinition;
 }
 
 interface ToolSelectorProps {

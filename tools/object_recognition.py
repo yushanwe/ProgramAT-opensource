@@ -58,6 +58,15 @@ TOOL_PROMPT = (
     "direction when helpful. Do not locate objects only by color or nearby people. If no objects "
     "can be identified clearly, say so."
 )
+TOOL_RUNTIME_INPUT = {
+    "key": "target_object",
+    "label": "Object to find",
+    "placeholder": "Enter an object, such as a water cup",
+    "prompt_instruction": (
+        "The user is specifically looking for: {value}. Focus only on whether this target is "
+        "visible, and if it is, say clearly where it is. If it is not visible, say that directly."
+    ),
+}
 
 # Detection constants
 DEFAULT_CONFIDENCE = 0.5
