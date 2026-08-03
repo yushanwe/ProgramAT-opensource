@@ -1693,15 +1693,17 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   cameraSection: {
-    flex: 1, // Camera takes ALL available space
+    width: '100%',
+    aspectRatio: 4 / 3,
+    flexShrink: 0,
     backgroundColor: '#000',
   },
   controlsSection: {
-    flexShrink: 1,
+    flex: 1,
+    minHeight: 0,
     backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#e0e0e0',
-    maxHeight: '42%',
   },
   fixedControls: {
     backgroundColor: '#fff',
@@ -1743,6 +1745,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f5',
     borderTopWidth: 1,
     borderTopColor: '#e0e0e0',
+    maxHeight: 60,
   },
   outputText: {
     fontSize: 13,
@@ -1806,6 +1809,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#fafafa',
   },
   lowerScrollContent: {
+    flexGrow: 1,
     paddingBottom: Platform.OS === 'ios' ? 28 : 20,
   },
   detailSection: {
