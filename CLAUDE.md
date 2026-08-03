@@ -71,6 +71,15 @@ TOOL_NAME = "concise_snake_case_name"  # required
 TOOL_PROMPT = (
     "One concise task-specific instruction shared across Take Photo and Streaming."
 )  # required
+TOOL_RUNTIME_INPUT = {  # optional
+    "key": "target_object",
+    "label": "Object to find",
+    "placeholder": "Enter an object, such as a water cup",
+    "prompt_instruction": (
+        "The user is specifically looking for: {value}. Focus only on this "
+        "target and do not report unrelated results."
+    ),
+}
 
 DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite-preview"  # optional
 FALLBACK_TEXT = "I am not sure from this view."  # optional but recommended
@@ -118,6 +127,8 @@ async def on_stream_stop(runtime):  # optional
 ```
 
 Required definitions for lifecycle tools are `TOOL_NAME`, `TOOL_PROMPT`, and at least one supported entry point: `on_take_photo()` or `on_frame()`. `on_stream_start()` and `on_stream_stop()` are optional but recommended when streaming needs state or cleanup. Local helper functions are optional and should stay narrow and tool-specific.
+
+When a tool needs one optional runtime text field in the mobile UI, declare it as one literal `TOOL_RUNTIME_INPUT` dictionary with exactly the keys `key`, `label`, `placeholder`, and `prompt_instruction`. The backend will substitute only the `{value}` placeholder in `prompt_instruction` at execution time. Do not invent alternate field names or dynamic templates.
 
 Do not introduce deprecated or non-default interfaces in new tools such as `TOOL_POLICY`, `execute_tool_policy()`, `EXECUTION_MODE`, mode-specific prompt constants, or runtime-owned hosted-video configuration unless you are deliberately maintaining an existing legacy tool that already uses that format.
 

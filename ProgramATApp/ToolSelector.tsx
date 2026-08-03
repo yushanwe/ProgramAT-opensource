@@ -79,6 +79,11 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     if (issueTools.length > 0) {
       console.log('[ToolSelector] Received tools:', issueTools.length);
       console.log('[ToolSelector] Tool names:', issueTools.map(t => t.name));
+      issueTools.forEach(tool => {
+        console.log(
+          `[Runtime Input] tool=${tool.path || tool.name} enabled=${tool.runtime_input ? 'true' : 'false'}`,
+        );
+      });
       
       // Update the tools
       setTools(issueTools);
