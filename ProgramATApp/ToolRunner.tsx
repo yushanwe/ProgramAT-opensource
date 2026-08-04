@@ -17,6 +17,8 @@ import {
   AccessibilityInfo,
   findNodeHandle,
   KeyboardAvoidingView,
+  TextInput as RNTextInput,
+  useWindowDimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -82,6 +84,7 @@ export default function ToolRunner({
   onNavigateToChat,
   isActive = true,
 }: ToolRunnerProps) {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const [toolOutput, setToolOutput] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -107,6 +110,10 @@ export default function ToolRunner({
   const [runtimeInputDraft, setRuntimeInputDraft] = useState('');
   const [committedRuntimeInput, setCommittedRuntimeInput] = useState('');
   const lowerScrollRef = useRef<ScrollView | null>(null);
+  const runtimeInputRef = useRef<RNTextInput | null>(null);
+  const lowerScrollOffsetRef = useRef(0);
+  const preKeyboardScrollOffsetRef = useRef(0);
+  const runtimeInputFocusedRef = useRef(false);
   
   // Keep isStreamingRef in sync with isStreaming state
   useEffect(() => {
@@ -1268,11 +1275,42 @@ export default function ToolRunner({
     }
   };
 
-  const scrollLowerSectionToEnd = () => {
+  const scrollRuntimeInputIntoView = () => {
+    const scrollResponder = lowerScrollRef.current?.getScrollResponder?.();
+    const node = runtimeInputRef.current ? findNodeHandle(runtimeInputRef.current) : null;
+    if (scrollResponder && node) {
+      scrollResponder.scrollResponderScrollNativeHandleToKeyboard(node, 16, true);
+      return;
+    }
     requestAnimationFrame(() => {
       lowerScrollRef.current?.scrollToEnd({ animated: true });
     });
   };
+
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const showSub = Keyboard.addListener(showEvent, () => {
+      if (runtimeInputFocusedRef.current) {
+        scrollRuntimeInputIntoView();
+      }
+    });
+    const hideSub = Keyboard.addListener(hideEvent, () => {
+      if (runtimeInputFocusedRef.current) {
+        runtimeInputFocusedRef.current = false;
+      }
+      lowerScrollRef.current?.scrollTo({
+        y: preKeyboardScrollOffsetRef.current,
+        animated: true,
+      });
+    });
+
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
 
   // Cleanup streaming on unmount or tool change
   useEffect(() => {
@@ -1290,6 +1328,11 @@ export default function ToolRunner({
       stopStreamingTool();
     }
   }, [isActive]);
+
+  const cameraSectionHeight = Math.min(
+    Math.max(windowWidth * 1.18, 360),
+    windowHeight * 0.58,
+  );
   
   const renderTool = () => {
     if (!selectedTool) {
@@ -1309,7 +1352,7 @@ export default function ToolRunner({
     return (
       <View style={styles.toolContainer}>
         {/* Camera View - Takes up most of screen */}
-        <View style={styles.cameraSection}>
+        <View style={[styles.cameraSection, { height: cameraSectionHeight }]}>
           <CameraView ref={cameraViewRef} />
         </View>
 
@@ -1318,7 +1361,8 @@ export default function ToolRunner({
           <KeyboardAvoidingView
             style={styles.controlsSection}
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
+            keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}
+            accessible={false}>
             {/* Fixed controls - always visible */}
             <View style={styles.fixedControls}>
               {/* Tool name */}
@@ -1464,22 +1508,28 @@ export default function ToolRunner({
               style={styles.lowerScrollArea}
               contentContainerStyle={styles.lowerScrollContent}
               keyboardShouldPersistTaps="handled"
+              keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+              accessible={false}
+              onScroll={event => {
+                lowerScrollOffsetRef.current = event.nativeEvent.contentOffset.y;
+              }}
+              scrollEventThrottle={16}
               showsVerticalScrollIndicator={true}>
-              <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+              <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
                 <View>
                   {/* Output section - reachable in lower scrolling region */}
                   {toolOutput && (
                     <View 
                       style={styles.outputSection}
-                      accessible={true}
-                      accessibilityLiveRegion="polite"
-                      accessibilityRole="text"
-                      accessibilityLabel={`Tool output: ${toolOutput}`}
-                      accessibilityHint="Long press to copy text">
+                      accessible={false}>
                       <Text 
                         style={styles.outputText}
                         selectable={true}
-                        accessible={false}>
+                        accessible={true}
+                        accessibilityRole="text"
+                        accessibilityLiveRegion="polite"
+                        accessibilityLabel={`Tool output: ${toolOutput}`}
+                        accessibilityHint="Long press to copy text">
                         {toolOutput}
                       </Text>
                     </View>
@@ -1495,6 +1545,7 @@ export default function ToolRunner({
                         {selectedTool.runtime_input.label}
                       </Text>
                       <TextInput
+                        ref={runtimeInputRef}
                         style={styles.runtimeInputField}
                         value={runtimeInputDraft}
                         onChangeText={setRuntimeInputDraft}
@@ -1502,10 +1553,17 @@ export default function ToolRunner({
                         placeholderTextColor="#8a8a8a"
                         returnKeyType="done"
                         onSubmitEditing={commitRuntimeInput}
-                        onFocus={scrollLowerSectionToEnd}
+                        onFocus={() => {
+                          preKeyboardScrollOffsetRef.current = lowerScrollOffsetRef.current;
+                          runtimeInputFocusedRef.current = true;
+                          scrollRuntimeInputIntoView();
+                        }}
+                        onBlur={() => {
+                          runtimeInputFocusedRef.current = false;
+                        }}
                         accessible={true}
                         accessibilityLabel={selectedTool.runtime_input.label}
-                        accessibilityHint="Enter a temporary target for future tool runs. Double tap Enter to commit it."
+                        accessibilityHint="Enter an optional value to customize this tool."
                       />
                       <View style={styles.runtimeInputButtons}>
                         <TouchableOpacity
@@ -1513,7 +1571,7 @@ export default function ToolRunner({
                           onPress={commitRuntimeInput}
                           accessible={true}
                           accessibilityRole="button"
-                          accessibilityLabel="Enter target"
+                          accessibilityLabel="Enter"
                           accessibilityHint="Commits the current text for subsequent Take Photo and Start Streaming requests">
                           <Text style={styles.runtimeInputButtonText}>Enter</Text>
                         </TouchableOpacity>
@@ -1522,7 +1580,7 @@ export default function ToolRunner({
                           onPress={clearRuntimeInput}
                           accessible={true}
                           accessibilityRole="button"
-                          accessibilityLabel="Clear target"
+                          accessibilityLabel="Clear"
                           accessibilityHint="Removes both the typed and active target and restores the tool default behavior">
                           <Text style={styles.runtimeInputButtonText}>Clear</Text>
                         </TouchableOpacity>
@@ -1694,7 +1752,6 @@ const styles = StyleSheet.create({
   },
   cameraSection: {
     width: '100%',
-    aspectRatio: 4 / 3,
     flexShrink: 0,
     backgroundColor: '#000',
   },
