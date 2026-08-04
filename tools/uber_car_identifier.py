@@ -68,7 +68,12 @@ async def on_take_photo(runtime, image, input_data):
 
 async def on_stream_start(runtime, input_data):
     """Initialize streaming session state."""
-    del input_data
+    # Extract and store search_criteria from input_data
+    search_criteria = None
+    if input_data and isinstance(input_data, dict):
+        search_criteria = input_data.get("search_criteria")
+
+    runtime.set_state("search_criteria", search_criteria)
     runtime.set_state("in_flight", False)
 
 
