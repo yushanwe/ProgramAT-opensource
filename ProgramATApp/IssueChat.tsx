@@ -140,8 +140,9 @@ export default function IssueChat({
       BeepService.playBeep(880, 120);
     } else if (last.kind === 'assistant-choice-prompt') {
       lastAnnouncedIdRef.current = last.id;
-      // Announce via accessibility only — no TTS to avoid talking over VoiceOver.
-      AccessibilityInfo.announceForAccessibility(last.text);
+      // No announcement here — the combined understanding + choice announcement
+      // was already made in handleCreationResponse before this item was appended,
+      // so announcing again would interrupt it. VoiceOver reads the buttons on nav.
     } else if (last.kind === 'assistant-created') {
       lastAnnouncedIdRef.current = last.id;
       const note = last.videoSummarySkipped ? ' Video summarization was skipped.' : '';
@@ -340,9 +341,12 @@ export default function IssueChat({
       setAwaiting('choice');
       if (result.summary) {
         setUnderstandingSummary(result.summary);
-        // Short announcement: label + first sentence (or integration note if present).
+        // Combined single announcement: understanding update + what to do next.
+        // Must be one call — a second announceForAccessibility in the items useEffect
+        // would interrupt this one before it finishes.
+        const note = buildUnderstandingAnnouncement(result.summary, result.integration_note);
         AccessibilityInfo.announceForAccessibility(
-          buildUnderstandingAnnouncement(result.summary, result.integration_note)
+          note + ' You can keep brainstorming or start building.'
         );
       }
       if (result.integration_note) setLastIntegrated(result.integration_note);
