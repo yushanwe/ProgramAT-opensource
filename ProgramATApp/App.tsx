@@ -81,6 +81,7 @@ function AppContent() {
   const [prList, setPRList] = useState<any[]>([]);
   const [spokenFeedback, setSpokenFeedback] = useState<string>('');
   const [prTools, setPRTools] = useState<Tool[]>([]); // Tools for selected PR
+  const [toolRunnerVisible, setToolRunnerVisible] = useState(false);
   
   // Copilot session data
   const [copilotSessions, setCopilotSessions] = useState<any[]>([]);
@@ -368,6 +369,21 @@ function AppContent() {
           </Text>
         </View>
       )}
+
+      {selectedPR && !toolRunnerVisible && (
+        <View
+          style={[styles.issueModeBar, { backgroundColor: theme.primary + '18', borderBottomColor: theme.border }]}
+          accessible={false}>
+          <Text
+            style={[styles.issueModeText, { color: theme.text }]}
+            accessible={true}
+            accessibilityRole="text">
+            {selectedPR.number === 0
+              ? 'Mode: Production tools'
+              : `Mode: Updating PR #${selectedPR.number}`}
+          </Text>
+        </View>
+      )}
       
       {/* Tab Navigator */}
       <TabNavigator 
@@ -381,6 +397,7 @@ function AppContent() {
         copilotSummaries={copilotSummaries}
         copilotLogs={copilotLogs}
         onClearCopilotData={clearCopilotData}
+        onToolRunnerVisibilityChange={setToolRunnerVisible}
       />
     </View>
   );
@@ -397,6 +414,16 @@ const styles = StyleSheet.create({
   },
   setupBannerText: {
     fontSize: 13,
+    textAlign: 'center',
+  },
+  issueModeBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+  },
+  issueModeText: {
+    fontSize: 14,
+    fontWeight: '600',
     textAlign: 'center',
   },
 });

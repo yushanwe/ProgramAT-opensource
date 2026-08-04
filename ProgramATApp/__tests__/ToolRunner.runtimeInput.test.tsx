@@ -78,6 +78,8 @@ describe('ToolRunner runtime input rendering', () => {
               prompt_instruction: 'Focus on {value}.',
             },
           }}
+          showBackButton={true}
+          onBack={jest.fn()}
         />,
       );
     });
@@ -99,6 +101,17 @@ describe('ToolRunner runtime input rendering', () => {
       tree!.root.findAll(node => node.props?.accessibilityLabel === 'Clear').length,
     ).toBeGreaterThan(0);
     expect(tree!.root.findAllByProps({children: 'Active target: none'}).length).toBeGreaterThan(0);
+    expect(
+      tree!.root.findAll(node => node.props?.children === '← Back to Tools').length,
+    ).toBeGreaterThan(0);
+    const headerTitles = tree!.root.findAll(
+      node =>
+        node.props?.accessibilityLabel === 'Tool: object_recognition' &&
+        node.props?.ellipsizeMode === 'tail',
+    );
+    expect(headerTitles.length).toBeGreaterThan(0);
+    expect(headerTitles[0].props.numberOfLines).toBe(1);
+    expect(headerTitles[0].props.ellipsizeMode).toBe('tail');
     await ReactTestRenderer.act(() => {
       tree!.unmount();
     });
@@ -129,6 +142,9 @@ describe('ToolRunner runtime input rendering', () => {
     expect(lowerScrollWrappers[0].props.accessible).toBe(false);
     expect(inputs).toHaveLength(0);
     expect(tree!.root.findAllByProps({children: 'Active target: none'})).toHaveLength(0);
+    expect(
+      tree!.root.findAll(node => node.props?.children === 'scene_description').length,
+    ).toBe(0);
     await ReactTestRenderer.act(() => {
       tree!.unmount();
     });

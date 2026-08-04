@@ -109,6 +109,7 @@ export default function ToolRunner({
   const [isProcessingFollowup, setIsProcessingFollowup] = useState(false);
   const [runtimeInputDraft, setRuntimeInputDraft] = useState('');
   const [committedRuntimeInput, setCommittedRuntimeInput] = useState('');
+  const [isRuntimeInputFocused, setIsRuntimeInputFocused] = useState(false);
   const lowerScrollRef = useRef<ScrollView | null>(null);
   const runtimeInputRef = useRef<RNTextInput | null>(null);
   const lowerScrollOffsetRef = useRef(0);
@@ -123,6 +124,7 @@ export default function ToolRunner({
   useEffect(() => {
     setRuntimeInputDraft('');
     setCommittedRuntimeInput('');
+    setIsRuntimeInputFocused(false);
   }, [selectedTool?.name, selectedTool?.path]);
 
   useEffect(() => {
@@ -1300,6 +1302,7 @@ export default function ToolRunner({
       if (runtimeInputFocusedRef.current) {
         runtimeInputFocusedRef.current = false;
       }
+      setIsRuntimeInputFocused(false);
       lowerScrollRef.current?.scrollTo({
         y: preKeyboardScrollOffsetRef.current,
         animated: true,
@@ -1350,7 +1353,12 @@ export default function ToolRunner({
     // All tools get the camera view - they're all camera-based
     // Tools loaded from GitHub PRs will process the camera images
     return (
-      <View style={styles.toolContainer}>
+      <KeyboardAvoidingView
+        style={styles.toolContainer}
+        behavior={Platform.OS === 'ios' ? 'position' : 'height'}
+        enabled={Boolean(selectedTool.runtime_input && isRuntimeInputFocused)}
+        keyboardVerticalOffset={0}
+        accessible={false}>
         {/* Camera View - Takes up most of screen */}
         <View style={[styles.cameraSection, { height: cameraSectionHeight }]}>
           <CameraView ref={cameraViewRef} />
@@ -1358,26 +1366,11 @@ export default function ToolRunner({
 
         {/* Tool Controls - Fixed bottom section */}
         {selectedTool.path !== 'camera' && (
-          <KeyboardAvoidingView
+          <View
             style={styles.controlsSection}
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}
             accessible={false}>
             {/* Fixed controls - always visible */}
             <View style={styles.fixedControls}>
-              {/* Tool name */}
-              <View style={styles.toolHeader}>
-                <Text 
-                  ref={toolNameRef}
-                  style={styles.toolNameCompact} 
-                  numberOfLines={1}
-                  accessible={true}
-                  accessibilityRole="header"
-                  accessibilityLabel={`Tool: ${selectedTool.name}`}>
-                  {selectedTool.name}
-                </Text>
-              </View>
-
               {/* Main action buttons - Full width, readable */}
               <View style={styles.buttonRow}>
                 <TouchableOpacity
@@ -1556,10 +1549,12 @@ export default function ToolRunner({
                         onFocus={() => {
                           preKeyboardScrollOffsetRef.current = lowerScrollOffsetRef.current;
                           runtimeInputFocusedRef.current = true;
+                          setIsRuntimeInputFocused(true);
                           scrollRuntimeInputIntoView();
                         }}
                         onBlur={() => {
                           runtimeInputFocusedRef.current = false;
+                          setIsRuntimeInputFocused(false);
                         }}
                         accessible={true}
                         accessibilityLabel={selectedTool.runtime_input.label}
@@ -1668,9 +1663,9 @@ export default function ToolRunner({
                 </View>
               </TouchableWithoutFeedback>
             </ScrollView>
-          </KeyboardAvoidingView>
+          </View>
         )}
-      </View>
+      </KeyboardAvoidingView>
     );
   };
 
@@ -1688,6 +1683,18 @@ export default function ToolRunner({
             accessibilityHint="Double tap to return to tool selection">
             <Text style={styles.backButtonText}>← Back to Tools</Text>
           </TouchableOpacity>
+          {selectedTool && (
+            <Text
+              ref={toolNameRef}
+              style={styles.toolHeaderTitle}
+              numberOfLines={1}
+              ellipsizeMode="tail"
+              accessible={true}
+              accessibilityRole="header"
+              accessibilityLabel={`Tool: ${selectedTool.name}`}>
+              {selectedTool.name}
+            </Text>
+          )}
         </View>
       )}
       
@@ -1704,6 +1711,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f5',
   },
   backButtonContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
     paddingHorizontal: 16,
     paddingVertical: 8,
     backgroundColor: '#fff',
@@ -1721,6 +1731,12 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#2563eb',
     fontWeight: '600',
+  },
+  toolHeaderTitle: {
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#333',
   },
   content: {
     flex: 1,
@@ -1764,18 +1780,6 @@ const styles = StyleSheet.create({
   },
   fixedControls: {
     backgroundColor: '#fff',
-  },
-  toolHeader: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: '#f9f9f9',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e0e0e0',
-  },
-  toolNameCompact: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#333',
   },
   buttonRow: {
     flexDirection: 'row',
