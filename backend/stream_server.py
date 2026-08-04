@@ -72,7 +72,7 @@ from tool_policy_runtime import (
     system_llm_call,
     transcript_llm_call,
 )
-from litellm_utils import extract_text
+from litellm_utils import extract_text, call_model
 from model_execution import execute_tool_policy
 from module_manager import get_module_manager
 import copilot_db
@@ -5471,6 +5471,114 @@ async def generate_ideation_question(parsed_data: dict, video_summary: str, brai
     return "Is there anything specific about how the tool should behave in difficult conditions, like low lighting or a cluttered background?"
 
 
+async def generate_ranked_question_queue(
+    parsed_data: dict,
+    video_summary: str,
+    brainstorm_history: list = None,
+    existing_queue: list = None,
+    max_queue_size: int = 8,
+) -> list:
+    """
+    Generate 3 new brainstorming questions using Gemini, merge them with any
+    existing unasked questions from a previous batch, re-rank the combined list
+    by relevance given the full Q&A history, and return it ordered
+    most-to-least relevant.
+
+    Args:
+        parsed_data: The parsed issue data.
+        video_summary: Optional video summary string.
+        brainstorm_history: Previous Q&A pairs, newest last.
+        existing_queue: Unasked questions carried over from earlier batches.
+        max_queue_size: Cap on total queue length returned (default 8).
+
+    Returns a list of question strings, most relevant first.
+    Falls back to built-in defaults on any error or unparseable response.
+    """
+    title = parsed_data.get('title', '')
+    description = parsed_data.get('description', '')
+    solution = parsed_data.get('solution', '')
+    example_usage = parsed_data.get('example_usage', '')
+
+    video_section = ''
+    if video_summary:
+        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
+
+    history_section = ''
+    if brainstorm_history:
+        pairs = []
+        for qa in brainstorm_history:
+            q = qa.get('question', '').strip()
+            a = qa.get('answer', '').strip()
+            if q and a:
+                pairs.append(f"Q: {q}\nA: {a}")
+        if pairs:
+            history_section = "\n\nQ&A so far:\n" + "\n\n".join(pairs)
+
+    existing_section = ''
+    if existing_queue:
+        existing_section = (
+            "\n\nThese questions were prepared earlier and not yet asked:\n"
+            + "\n".join(f"- {q}" for q in existing_queue)
+        )
+
+    prompt = (
+        "You are helping a blind or low-vision user design a camera-based assistive tool. "
+        "Here is everything known so far about the tool they want:\n\n"
+        f"Title: {title}\n"
+        f"Description: {description}\n"
+        f"Proposed solution: {solution}\n"
+        f"Example usage: {example_usage}"
+        f"{video_section}"
+        f"{history_section}"
+        f"{existing_section}"
+        "\n\nYour task:\n"
+        "1. Generate exactly 3 new clarifying questions focused on gaps, edge cases, "
+        "environmental conditions, or failure behaviors. "
+        "Do not ask about anything already answered above.\n"
+        "2. Combine these 3 new questions with any existing unasked questions listed above.\n"
+        "3. Rank ALL questions (new + existing) from MOST to LEAST relevant, "
+        "considering what gaps remain most important given what is already known.\n"
+        f"4. Return the final ranked list as a plain numbered list (at most {max_queue_size} questions), "
+        "one question per line, most relevant first. No explanations, no headings.\n\n"
+        "Format exactly:\n"
+        "1. [question]\n"
+        "2. [question]\n"
+        "..."
+    )
+
+    fallback = [
+        "Is there anything specific about how the tool should behave in difficult conditions, "
+        "like low lighting or a cluttered background?",
+        "How precise does the spoken result need to be — does approximate information help, "
+        "or does it need to be exact?",
+        "Are there particular situations where you would want the tool to stay silent "
+        "rather than speak?",
+    ]
+
+    try:
+        response = await asyncio.to_thread(
+            call_model,
+            'gemini/gemini-3.1-flash-lite',
+            [{'role': 'user', 'content': prompt}],
+        )
+        text = extract_text(response).strip()
+        questions = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Strip leading numbering: "1. ", "1) ", "1- ", etc.
+            cleaned = re.sub(r'^\d+[\.\)\-]\s*', '', line).strip()
+            if cleaned and len(cleaned) > 10:
+                questions.append(cleaned)
+        if questions:
+            return questions[:max_queue_size]
+    except Exception:
+        logger.warning("generate_ranked_question_queue failed", exc_info=True)
+
+    return fallback[:max_queue_size]
+
+
 def _truncate_at_sentence_boundary(text: str, max_chars: int = 600) -> str:
     """Cap a generated summary so a runaway response can't permanently
     crowd out the pinned card the client displays it in. Prefers cutting at
@@ -5578,8 +5686,9 @@ async def generate_understanding_summary(
 
     try:
         response = await asyncio.to_thread(
-            system_llm_call,
-            messages=[{'role': 'user', 'content': prompt}],
+            call_model,
+            'gemini/gemini-3.1-flash-lite',
+            [{'role': 'user', 'content': prompt}],
         )
         text = extract_text(response).strip()
 
@@ -6340,18 +6449,20 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
             )
 
         if brainstormingEnabled and not choice:
-            # Generate ideation question and return it for the client to present.
+            # Generate a ranked queue of 3 brainstorming questions and present the most relevant one.
             await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Summarizing what I understood…'})
             try:
                 results = await asyncio.gather(
-                    generate_ideation_question(parsed_data, video_summary),
+                    generate_ranked_question_queue(parsed_data, video_summary, [], []),
                     generate_understanding_summary(parsed_data, video_summary),
                 )
-                question = results[0]
+                question_queue = results[0]
                 summary, integration_note = results[1]
+                question = question_queue[0] if question_queue else "Is there anything specific about how the tool should behave in difficult conditions?"
             except Exception:
-                logger.warning("generate_ideation_question failed in HTTP path", exc_info=True)
+                logger.warning("generate_ranked_question_queue failed in HTTP path", exc_info=True)
                 question = "Is there anything specific about how the tool should behave in difficult conditions?"
+                question_queue = []
                 summary = ''
                 integration_note = ''
 
@@ -6360,11 +6471,12 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 'parsed_data': parsed_data,
                 'video_summary': video_summary,
                 'brainstorm_history': [],  # Will accumulate Q&A pairs
+                'question_queue': question_queue[1:],  # Remaining ranked questions
                 'last_question': question,  # Track the question we just asked
                 'last_summary': summary,  # Track the understanding summary we just showed
                 'created_at': datetime.now(),
             }
-            logger.info("Sending ideation question via HTTP (token=%s)", new_token)
+            logger.info("Sending ideation question via HTTP (token=%s, queue_remaining=%d)", new_token, len(question_queue[1:]))
             return web.json_response({'status': 'ideation', 'question': question, 'token': new_token, 'summary': summary, 'integration_note': integration_note})
         elif not brainstormingEnabled:
             logger.info("Brainstorming disabled; proceeding directly to issue creation")
@@ -6457,19 +6569,23 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     video_summary = entry['video_summary']
     await _broadcast_ws({'type': 'progress', 'message': 'Summarizing and generating the next question…'})
 
+    existing_queue = entry.get('question_queue', [])
     latest_qa = brainstorm_history[-1] if brainstorm_history else None
     try:
         results = await asyncio.gather(
-            generate_ideation_question(parsed_data, video_summary, brainstorm_history),
+            generate_ranked_question_queue(parsed_data, video_summary, brainstorm_history, existing_queue),
             generate_understanding_summary(parsed_data, video_summary, brainstorm_history, latest_qa=latest_qa),
         )
-        next_question = results[0]
+        next_question_queue = results[0]
         summary, integration_note = results[1]
+        next_question = next_question_queue[0] if next_question_queue else "What other features or behaviors would be helpful for this tool?"
+        entry['question_queue'] = next_question_queue[1:]
     except Exception:
-        logger.warning("generate_ideation_question failed in /brainstorm-next-question", exc_info=True)
+        logger.warning("generate_ranked_question_queue failed in /brainstorm-next-question", exc_info=True)
         next_question = "What other features or behaviors would be helpful for this tool?"
         summary = ''
         integration_note = ''
+        entry['question_queue'] = []
 
     if not summary:
         summary = entry.get('last_summary', '')
@@ -6478,7 +6594,7 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     entry['last_question'] = next_question
     entry['last_summary'] = summary
 
-    logger.info("Sending next brainstorming question (token=%s, history size=%d)", token, len(brainstorm_history))
+    logger.info("Sending next brainstorming question (token=%s, history size=%d, queue_remaining=%d)", token, len(brainstorm_history), len(entry['question_queue']))
     return web.json_response({
         'status': 'ideation',
         'question': next_question,
