@@ -145,6 +145,13 @@ export default function IssueChat({
     }
   }, [awaiting]);
 
+  // Announce progress text updates to VoiceOver as they arrive.
+  useEffect(() => {
+    if (progressText) {
+      AccessibilityInfo.announceForAccessibility(progressText);
+    }
+  }, [progressText]);
+
   // Listen for WS 'progress' broadcasts fired by the backend while an HTTP
   // request from this screen is in flight (e.g. "Summarizing video…"). This
   // is the only channel carrying them; _broadcast_ws has no per-request id,
