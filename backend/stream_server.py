@@ -5534,6 +5534,7 @@ async def generate_ranked_question_queue(
         "\n\nYour task:\n"
         "1. Generate exactly 3 new clarifying questions focused on gaps, edge cases, "
         "environmental conditions, or failure behaviors. "
+        "Do not ask about tool UI, display, interface, or presentation — those are handled by the app, not the tool. "
         "Do not ask about anything already answered above.\n"
         "2. Combine these 3 new questions with any existing unasked questions listed above.\n"
         "3. Rank ALL questions (new + existing) from MOST to LEAST relevant, "
