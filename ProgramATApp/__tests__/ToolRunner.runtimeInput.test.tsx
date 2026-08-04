@@ -89,10 +89,11 @@ describe('ToolRunner runtime input rendering', () => {
     );
     expect(tree!.root.findAllByType('CameraView').length).toBeGreaterThan(0);
     const lowerScrollWrappers = tree!.root.findAll(
-      node => node.props?.keyboardShouldPersistTaps === 'handled',
+      node => node.props?.keyboardShouldPersistTaps === 'always',
     );
     expect(lowerScrollWrappers.length).toBeGreaterThan(0);
     expect(lowerScrollWrappers[0].props.accessible).toBe(false);
+    expect(lowerScrollWrappers[0].props.keyboardDismissMode).toBe('none');
     expect(inputs.length).toBeGreaterThan(0);
     expect(
       tree!.root.findAll(node => node.props?.accessibilityLabel === 'Enter').length,
@@ -136,10 +137,11 @@ describe('ToolRunner runtime input rendering', () => {
     );
     expect(tree!.root.findAllByType('CameraView').length).toBeGreaterThan(0);
     const lowerScrollWrappers = tree!.root.findAll(
-      node => node.props?.keyboardShouldPersistTaps === 'handled',
+      node => node.props?.keyboardShouldPersistTaps === 'always',
     );
     expect(lowerScrollWrappers.length).toBeGreaterThan(0);
     expect(lowerScrollWrappers[0].props.accessible).toBe(false);
+    expect(lowerScrollWrappers[0].props.keyboardDismissMode).toBe('none');
     expect(inputs).toHaveLength(0);
     expect(tree!.root.findAllByProps({children: 'Active target: none'})).toHaveLength(0);
     expect(
