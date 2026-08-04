@@ -26,7 +26,7 @@ MODEL_REGISTRY = {
         "recommended_use_cases": ["Simple visual tasks with low accuracy requirements."],
     },
     "gemini-3.1-flash-lite": {
-        "provider_model": "gemini/gemini-3.1-flash-lite-preview",
+        "provider_model": "gemini/gemini-3.1-flash-lite",
         "executor": "model",
         "supported_input_types": ["text", "image", "multiple_images"],
         "supported_capabilities": ["visual_qa", "ocr", "reasoning", "image_description"],

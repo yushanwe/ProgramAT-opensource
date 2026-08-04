@@ -32,7 +32,7 @@ from scripts.test_nvidia_hosted_video import played_card_prompt  # noqa: E402
 
 CLIP_PATH = BACKEND_DIR / "debug" / "last_hosted_clip.mp4"
 REPORT_PATH = BACKEND_DIR / "debug" / "gemini_input_latency_comparison.json"
-MODEL = "gemini-3.1-flash-lite-preview"
+MODEL = "gemini-3.1-flash-lite"
 RUNS = 3
 
 RESPONSE_SCHEMA = {
