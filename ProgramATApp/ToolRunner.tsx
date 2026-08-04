@@ -547,20 +547,14 @@ export default function ToolRunner({
       console.log('[ToolRunner] Skipping announcement (text too similar, similarity:', similarity.toFixed(3), ')');
     }
   };
-  const toolNameRef = useRef<Text>(null);
   const cameraViewRef = useRef<CameraViewHandle>(null);
 
-  // Set accessibility focus to tool name when component mounts or tool changes
+  // Announce the selected tool name when entering the runner.
   useEffect(() => {
     if (!selectedTool) return;
     
     const timeout = setTimeout(() => {
-      if (toolNameRef.current) {
-        const reactTag = findNodeHandle(toolNameRef.current);
-        if (reactTag) {
-          AccessibilityInfo.setAccessibilityFocus(reactTag);
-        }
-      }
+      AccessibilityInfo.announceForAccessibility(`Tool: ${selectedTool.name}`);
     }, 100);
     
     return () => clearTimeout(timeout);
@@ -1614,7 +1608,6 @@ export default function ToolRunner({
           </TouchableOpacity>
           {selectedTool && (
             <Text
-              ref={toolNameRef}
               style={styles.toolHeaderTitle}
               numberOfLines={1}
               ellipsizeMode="tail"

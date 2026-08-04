@@ -23,7 +23,6 @@ import {
   KeyboardAvoidingView,
   ActivityIndicator,
   AccessibilityInfo,
-  findNodeHandle,
   Modal,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -76,7 +75,6 @@ export default function IssueChat({
   const inFlightRef = useRef(false);
   const scrollViewRef = useRef<ScrollView>(null);
   const composeInputRef = useRef<RNTextInput>(null);
-  const headerRef = useRef<Text>(null);
   const lastAnnouncedIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -84,18 +82,15 @@ export default function IssueChat({
     isBasicModeEnabled().then(setBasicMode).catch(() => setBasicMode(false));
   }, []);
 
-  // Focus the header on mount, matching ToolSelector's screen-entry pattern.
+  // Announce the screen title on mount, matching ToolSelector's entry pattern.
   useEffect(() => {
     const timeout = setTimeout(() => {
-      if (headerRef.current) {
-        const reactTag = findNodeHandle(headerRef.current);
-        if (reactTag) {
-          AccessibilityInfo.setAccessibilityFocus(reactTag);
-        }
-      }
+      AccessibilityInfo.announceForAccessibility(
+        isCreateMode ? 'Create issue' : `Updating issue ${selectedIssue?.number}`,
+      );
     }, 100);
     return () => clearTimeout(timeout);
-  }, []);
+  }, [isCreateMode, selectedIssue?.number]);
 
   // Auto-scroll to the newest message.
   useEffect(() => {
@@ -747,7 +742,6 @@ export default function IssueChat({
             </Text>
           </View>
           <Text
-            ref={headerRef}
             style={[styles.headerText, { color: theme.text }]}
             accessible={true}
             accessibilityRole="header"
