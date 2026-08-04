@@ -12,6 +12,7 @@ import Foundation
 import React
 import ReplayKit
 import Photos
+import AVFoundation
 
 @objc(ScreenRecordingModule)
 class ScreenRecordingModule: NSObject {
@@ -144,5 +145,55 @@ class ScreenRecordingModule: NSObject {
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
         resolve(self.isRecording)
+    }
+
+    @objc
+    func fetchMostRecentVideoPath(
+        _ resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+
+        PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+
+            guard status == .authorized || status == .limited else {
+                reject(
+                    "photos_read_permission_denied",
+                    "Photos access was denied.",
+                    nil
+                )
+                return
+            }
+
+            let options = PHFetchOptions()
+            options.predicate = NSPredicate(format: "mediaType = %d", PHAssetMediaType.video.rawValue)
+            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            options.fetchLimit = 1
+
+            guard let asset = PHAsset.fetchAssets(with: options).firstObject else {
+                reject(
+                    "no_recent_video",
+                    "No recent video was found in the photo library.",
+                    nil
+                )
+                return
+            }
+
+            PHImageManager.default().requestAVAsset(
+                forVideo: asset,
+                options: nil
+            ) { avAsset, _, _ in
+
+                guard let urlAsset = avAsset as? AVURLAsset else {
+                    reject(
+                        "no_recent_video",
+                        "Could not resolve a file path for the most recent video.",
+                        nil
+                    )
+                    return
+                }
+
+                resolve(urlAsset.url.absoluteString)
+            }
+        }
     }
 }

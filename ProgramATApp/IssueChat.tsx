@@ -25,6 +25,7 @@ import {
   AccessibilityInfo,
   findNodeHandle,
   Modal,
+  NativeModules,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { launchImageLibrary } from 'react-native-image-picker';
@@ -46,6 +47,12 @@ interface IssueChatProps {
 }
 
 type Awaiting = 'answer' | 'choice' | null;
+
+const { ScreenRecordingModule } = NativeModules as {
+  ScreenRecordingModule?: {
+    fetchMostRecentVideoPath?: () => Promise<string>;
+  };
+};
 
 /**
  * Build the short VoiceOver announcement for the "What I understand" card.
@@ -233,6 +240,25 @@ export default function IssueChat({
       }
     } finally {
       setIsPickingFromLibrary(false);
+    }
+  };
+
+  const handleAttachRecentSession = async () => {
+    try {
+      const path = await ScreenRecordingModule?.fetchMostRecentVideoPath?.();
+      if (path) {
+        setStagedVideoUri(path);
+      }
+    } catch (error: any) {
+      console.error('[IssueChat] Failed to attach recent session:', error);
+      const code = error?.code;
+      const message =
+        code === 'no_recent_video'
+          ? 'No recent recording was found.'
+          : code === 'photos_read_permission_denied'
+          ? 'Photos access was denied. Could not attach a recent recording.'
+          : 'Could not attach a recent recording.';
+      AccessibilityInfo.announceForAccessibility(message);
     }
   };
 
@@ -958,6 +984,15 @@ export default function IssueChat({
                 accessibilityRole="button"
                 accessibilityLabel="Choose a video from your photo library">
                 <Text style={styles.attachButtonText}>📁</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
+                onPress={handleAttachRecentSession}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel="Attach most recent recording"
+                accessibilityHint="Attaches the most recent video from your camera roll">
+                <Text style={styles.attachButtonText}>🎬</Text>
               </TouchableOpacity>
             </View>
           )}

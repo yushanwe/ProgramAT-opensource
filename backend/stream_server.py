@@ -79,7 +79,7 @@ import copilot_db
 from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
 from webrtc_handler import webrtc_offer_handler, cleanup_webrtc_peers
-from video_summarizer import infer_images_with_gemini, summarize_video
+from video_summarizer import infer_images_with_gemini, summarize_video, ITERATION_PROMPT
 from nvidia_hosted_client import (
     NvidiaHostedClient,
     NvidiaHostedError,
@@ -6663,7 +6663,7 @@ async def handle_update_submit(request: web.Request) -> web.Response:
             with os.fdopen(tmp_fd, 'wb') as fh:
                 fh.write(video_bytes)
             logger.info("Saved update video to %s (%d bytes)", tmp_path, len(video_bytes))
-            video_summary = await summarize_video(tmp_path)
+            video_summary = await summarize_video(tmp_path, prompt=ITERATION_PROMPT)
         except Exception:
             logger.error("Video summarization failed in /submit-update", exc_info=True)
         finally:
