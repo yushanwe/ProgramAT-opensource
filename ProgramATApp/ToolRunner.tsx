@@ -1330,7 +1330,7 @@ export default function ToolRunner({
   }, [isActive]);
 
   const cameraSectionHeight = Math.min(
-    Math.max(windowWidth * 1.18, 360),
+    windowWidth,
     windowHeight * 0.58,
   );
   
