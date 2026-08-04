@@ -31,7 +31,5 @@ assignees: ''
 
 ## Implementation guidance
 
-Implement the requested behavior in one Python file in `tools/`. Use the
-repository-root `CLAUDE.md` as the generated-tool instruction source of truth.
-Modify only the requested tool file unless the public runtime is genuinely
-insufficient.
+Implement the requested behavior in one Python file in `tools/`. Use the repository-root `CLAUDE.md` as the generated-tool instruction source of truth.
+Modify only the requested tool file unless the public runtime is genuinely insufficient.

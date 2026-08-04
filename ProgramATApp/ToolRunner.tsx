@@ -1080,6 +1080,9 @@ export default function ToolRunner({
       selectedTool.runtime_input,
       committedRuntimeInput,
     );
+    console.log(
+      `[Runtime Input Trace] stage=frontend_take_photo tool=${selectedTool.name} keys=${JSON.stringify(Object.keys(runtimeInputs))} value_present=${runtimeInputs ? 'true' : 'false'}`,
+    );
     const message = {
       type: 'run_tool',
       tool_name: selectedTool.name,
@@ -1144,6 +1147,9 @@ export default function ToolRunner({
     const runtimeInputs = buildRuntimeInputsPayload(
       selectedTool.runtime_input,
       committedRuntimeInput,
+    );
+    console.log(
+      `[Runtime Input Trace] stage=frontend_stream_start tool=${selectedTool.name} keys=${JSON.stringify(Object.keys(runtimeInputs))} value_present=${runtimeInputs ? 'true' : 'false'}`,
     );
     const message: any = {
       type: 'start_streaming_tool',

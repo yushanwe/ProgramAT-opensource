@@ -838,8 +838,18 @@ async def _initialize_executable_streaming_tool(
         "generated_tasks": set(),
         "generated_frame_sequence": 0,
     })
+    input_data = _with_runtime_inputs(
+        _generated_input_data(tool.get("input")),
+        tool.get("runtime_inputs", {}) or {},
+    )
+    logger.info(
+        "[Runtime Input Trace] stage=on_stream_start tool=%s keys=%s value_present=%s",
+        tool["name"],
+        sorted((input_data or {}).keys()) if isinstance(input_data, dict) else [],
+        str(bool(tool.get("runtime_inputs"))).lower(),
+    )
     await invoke_tool_hook(
-        namespace, "on_stream_start", runtime, _generated_input_data(tool.get("input"))
+        namespace, "on_stream_start", runtime, input_data
     )
 
 
@@ -911,6 +921,17 @@ async def _run_executable_take_photo(
     runtime._frames.add(_tool_frame(1, image, image_base64))
     namespace = _validated_generated_namespace(tool_name, tool_code)
     try:
+        logger.info(
+            "[Runtime Input Trace] stage=on_take_photo tool=%s keys=%s value_present=%s",
+            tool_name,
+            sorted(input_data.keys()) if isinstance(input_data, dict) else [],
+            str(
+                bool(
+                    isinstance(input_data, dict)
+                    and input_data.get("runtime_inputs")
+                )
+            ).lower(),
+        )
         result = await invoke_tool_hook(
             namespace, "on_take_photo", runtime, image, input_data
         )
@@ -2324,10 +2345,17 @@ def _tool_runtime_input_metadata(tool_code: str) -> Optional[Dict[str, str]]:
 def _parse_runtime_inputs_from_request(
     data: Dict[str, Any], tool_code: str
 ) -> Dict[str, str]:
-    return _sanitize_runtime_inputs(
+    parsed = _sanitize_runtime_inputs(
         data.get('runtime_inputs'),
         _tool_runtime_input_definition(tool_code),
     )
+    logger.info(
+        "[Runtime Input Trace] stage=backend_parse tool=%s keys=%s value_present=%s",
+        data.get('tool_name', 'unknown'),
+        sorted(parsed.keys()),
+        str(bool(parsed)).lower(),
+    )
+    return parsed
 
 
 def _inject_runtime_input_metadata(tool_record: Dict[str, Any]) -> Dict[str, Any]:
@@ -2390,12 +2418,24 @@ def _with_runtime_inputs(input_data: Any, runtime_inputs: Dict[str, str]) -> Any
         return input_data
     if isinstance(input_data, dict):
         merged = dict(input_data)
+        merged.update(runtime_inputs)
         merged['runtime_inputs'] = dict(runtime_inputs)
+        logger.info(
+            "[Runtime Input Trace] stage=generated_handler_merge shape=dict keys=%s runtime_keys=%s",
+            sorted(merged.keys()),
+            sorted(runtime_inputs.keys()),
+        )
         return merged
-    return {
+    merged = {
         'value': input_data,
+        **dict(runtime_inputs),
         'runtime_inputs': dict(runtime_inputs),
     }
+    logger.info(
+        "[Runtime Input Trace] stage=generated_handler_merge shape=wrapped runtime_keys=%s",
+        sorted(runtime_inputs.keys()),
+    )
+    return merged
 
 
 def _run_take_photo_vlm(

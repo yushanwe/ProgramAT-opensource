@@ -17,7 +17,7 @@ TOOL_NAME = "integration_tool"
 TOOL_PROMPT = "Report the requested visual information concisely."
 
 async def on_stream_start(runtime, input_data):
-    runtime.set_state("started", True)
+    runtime.set_state("started", input_data)
 
 async def on_frame(runtime, frame):
     await runtime.emit(
@@ -72,7 +72,7 @@ class TestGeneratedToolServerIntegration(unittest.IsolatedAsyncioTestCase):
         await stream_server._initialize_executable_streaming_tool(
             websocket, "client", config
         )
-        self.assertTrue(config["generated_runtime"].get_state("started"))
+        self.assertEqual(config["generated_runtime"].get_state("started"), {"value": 1})
 
         image = np.zeros((12, 20, 3), dtype=np.uint8)
         await stream_server._dispatch_executable_tool_frame(
@@ -175,6 +175,61 @@ class TestGeneratedToolServerIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "selected:explicit:9")
         self.assertEqual(emitted, 0)
         websocket.send.assert_not_awaited()
+
+    async def test_active_take_photo_path_flattens_runtime_inputs(self):
+        tool = '''
+TOOL_NAME = "runtime_take_tool"
+TOOL_PROMPT = "Report the requested visual information concisely."
+
+async def on_take_photo(runtime, image, input_data):
+    return {
+        "expected": input_data.get("expected_car"),
+        "nested": input_data.get("runtime_inputs", {}).get("expected_car"),
+    }
+'''
+        websocket = AsyncMock()
+        image = np.zeros((5, 9, 3), dtype=np.uint8)
+
+        result, emitted = await stream_server._run_executable_take_photo(
+            websocket,
+            "client",
+            "runtime_take_tool",
+            tool,
+            image,
+            "",
+            {"value": "explicit", "runtime_inputs": {"expected_car": "black Honda"}, "expected_car": "black Honda"},
+        )
+
+        self.assertEqual(
+            result,
+            {"expected": "black Honda", "nested": "black Honda"},
+        )
+        self.assertEqual(emitted, 0)
+
+    async def test_active_streaming_path_flattens_runtime_inputs_for_start_hook(self):
+        websocket = AsyncMock()
+        config = {
+            "tool": {
+                "name": "integration_tool",
+                "code": STREAM_TOOL,
+                "input": {"value": 1},
+                "runtime_inputs": {"expected_car": "black Honda"},
+            }
+        }
+        stream_server.active_streaming_tools["client"] = config
+
+        await stream_server._initialize_executable_streaming_tool(
+            websocket, "client", config
+        )
+
+        self.assertEqual(
+            config["generated_runtime"].get_state("started"),
+            {
+                "value": 1,
+                "expected_car": "black Honda",
+                "runtime_inputs": {"expected_car": "black Honda"},
+            },
+        )
 
     async def test_backend_does_not_replace_explicit_model(self):
         websocket = AsyncMock()
