@@ -5485,21 +5485,30 @@ def _truncate_at_sentence_boundary(text: str, max_chars: int = 600) -> str:
     return window.rstrip() + '…'
 
 
-async def generate_understanding_summary(parsed_data: dict, video_summary: str, brainstorm_context: list = None) -> str:
+async def generate_understanding_summary(
+    parsed_data: dict,
+    video_summary: str,
+    brainstorm_context: list = None,
+    latest_qa: dict = None,
+) -> tuple:
     """
     Ask the system LLM for a brief, conversational restatement of what the
     user is asking for so far — the kind of "so you want a tool that..."
     paraphrase a person gives before asking a follow-up question. This is
     purely informational (shown in a pinned UI card), so on any failure we
-    return '' rather than a canned fallback: an uninformative placeholder
+    return ('', '') rather than a canned fallback: an uninformative placeholder
     would be read aloud on every update and misrepresent what was understood.
 
     Args:
         parsed_data: The parsed issue data
         video_summary: Optional video summary
         brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
+        latest_qa: Optional {"question": str, "answer": str} for the most recent exchange;
+                   when provided, the LLM also generates a one-sentence integration note.
 
-    Returns a plain 1-3 sentence string, or '' on any error/empty result.
+    Returns (summary, integration_note) where summary is a plain 1-3 sentence string
+    and integration_note is a single sentence describing what was just learned
+    (or '' when there is no recent exchange).
     """
     title = parsed_data.get('title', '')
     description = parsed_data.get('description', '')
@@ -5521,38 +5530,83 @@ async def generate_understanding_summary(parsed_data: dict, video_summary: str, 
         if brainstorm_pairs:
             brainstorm_section = "\n\nAdditional details the user gave in follow-up rounds:\n" + "\n\n".join(brainstorm_pairs)
 
-    prompt = (
-        "You are helping a blind or low-vision user design a camera-based assistive tool. "
-        "Below is everything they have told you so far about the tool they want. "
-        "Write a brief, natural restatement of what you understand they are asking for — "
-        "what the tool does and roughly how it works. "
-        "Write 1 to 3 sentences of plain conversational language, addressed to the user, "
-        "the way you would briefly restate someone's request back to them before asking a "
-        "follow-up question. Start with something like \"Got it —\" or \"So you want\". "
-        "Fold in every detail they have given, including their follow-up answers. "
-        "Do NOT ask a question. Do NOT add suggestions, caveats, or ideas of your own. "
-        "Do NOT use bullet points, headings, or field labels. "
-        "Return only the restatement, nothing else.\n\n"
-        f"Tool title: {title}\n"
-        f"Description: {description}\n"
-        f"Desired spoken answer: {example_usage}\n"
-        f"Constraints and extra context: {additional}"
-        f"{video_section}"
-        f"{brainstorm_section}"
-    )
+    if latest_qa:
+        lq = latest_qa.get('question', '').strip()
+        la = latest_qa.get('answer', '').strip()
+        latest_section = f"\n\nMost recent exchange (just now):\nYou asked: {lq}\nThey answered: {la}"
+        prompt = (
+            "You are helping a blind or low-vision user design a camera-based assistive tool. "
+            "Below is everything they have told you so far about the tool they want. "
+            "Return exactly two labeled lines in this format:\n"
+            "SUMMARY: <your full restatement here>\n"
+            "NOTE: <one sentence here>\n\n"
+            "SUMMARY must be 1-3 sentences of plain conversational language starting with "
+            "\"Got it —\" or \"So you want\", restating the FULL understanding so far. "
+            "Fold in every detail they have given.\n"
+            "NOTE must be a single sentence starting with \"Added:\" that describes the "
+            "specific detail just incorporated from their most recent answer — not the "
+            "answer verbatim, but what you now understand because of it.\n"
+            "Do NOT ask a question. Do NOT add suggestions. Plain language only. No bullet points.\n\n"
+            f"Tool title: {title}\n"
+            f"Description: {description}\n"
+            f"Desired spoken answer: {example_usage}\n"
+            f"Constraints and extra context: {additional}"
+            f"{video_section}"
+            f"{brainstorm_section}"
+            f"{latest_section}"
+        )
+    else:
+        prompt = (
+            "You are helping a blind or low-vision user design a camera-based assistive tool. "
+            "Below is everything they have told you so far about the tool they want. "
+            "Write a brief, natural restatement of what you understand they are asking for — "
+            "what the tool does and roughly how it works. "
+            "Write 1 to 3 sentences of plain conversational language, addressed to the user, "
+            "the way you would briefly restate someone's request back to them before asking a "
+            "follow-up question. Start with something like \"Got it —\" or \"So you want\". "
+            "Fold in every detail they have given, including their follow-up answers. "
+            "Do NOT ask a question. Do NOT add suggestions, caveats, or ideas of your own. "
+            "Do NOT use bullet points, headings, or field labels. "
+            "Return only the restatement, nothing else.\n\n"
+            f"Tool title: {title}\n"
+            f"Description: {description}\n"
+            f"Desired spoken answer: {example_usage}\n"
+            f"Constraints and extra context: {additional}"
+            f"{video_section}"
+            f"{brainstorm_section}"
+        )
 
     try:
         response = await asyncio.to_thread(
             system_llm_call,
             messages=[{'role': 'user', 'content': prompt}],
         )
-        summary = ' '.join(extract_text(response).strip().split())
-        if summary:
-            return _truncate_at_sentence_boundary(summary)
+        text = extract_text(response).strip()
+
+        if latest_qa:
+            note = ''
+            if '\nNOTE:' in text:
+                summary_raw, note_raw = text.split('\nNOTE:', 1)
+                summary_raw = summary_raw.strip()
+                if summary_raw.upper().startswith('SUMMARY:'):
+                    summary_raw = summary_raw[len('SUMMARY:'):].strip()
+                note = ' '.join(note_raw.strip().split())
+            else:
+                summary_raw = text
+                if summary_raw.upper().startswith('SUMMARY:'):
+                    summary_raw = summary_raw[len('SUMMARY:'):].strip()
+            summary = ' '.join(summary_raw.split())
+            if summary:
+                summary = _truncate_at_sentence_boundary(summary)
+            return (summary, note)
+        else:
+            summary = ' '.join(text.split())
+            if summary:
+                return (_truncate_at_sentence_boundary(summary), '')
     except Exception:
         logger.warning("generate_understanding_summary failed", exc_info=True)
 
-    return ''
+    return ('', '')
 
 
 def _log_to_all_sessions(level: str, message: str):
@@ -6222,8 +6276,10 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
             # User chose to keep brainstorming; return choice
             logger.info("Sending user choice: keep brainstorming (token=%s)", token)
             await _broadcast_ws({'type': 'progress', 'message': 'Summarizing what I understood…'})
-            summary = await generate_understanding_summary(
-                entry['parsed_data'], entry['video_summary'], brainstorm_history
+            latest_qa = brainstorm_history[-1] if brainstorm_history else None
+            summary, integration_note = await generate_understanding_summary(
+                entry['parsed_data'], entry['video_summary'], brainstorm_history,
+                latest_qa=latest_qa,
             )
             if not summary:
                 summary = entry.get('last_summary', '')
@@ -6233,6 +6289,7 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 'token': token,
                 'brainstorm_history': brainstorm_history,
                 'summary': summary,
+                'integration_note': integration_note,
             })
         # Fall through to template fill + issue creation below using this parsed_data.
     else:
@@ -6286,14 +6343,17 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
             # Generate ideation question and return it for the client to present.
             await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Summarizing what I understood…'})
             try:
-                question, summary = await asyncio.gather(
+                results = await asyncio.gather(
                     generate_ideation_question(parsed_data, video_summary),
                     generate_understanding_summary(parsed_data, video_summary),
                 )
+                question = results[0]
+                summary, integration_note = results[1]
             except Exception:
                 logger.warning("generate_ideation_question failed in HTTP path", exc_info=True)
                 question = "Is there anything specific about how the tool should behave in difficult conditions?"
                 summary = ''
+                integration_note = ''
 
             new_token = secrets.token_urlsafe(12)
             pending_ideation_http[new_token] = {
@@ -6305,7 +6365,7 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 'created_at': datetime.now(),
             }
             logger.info("Sending ideation question via HTTP (token=%s)", new_token)
-            return web.json_response({'status': 'ideation', 'question': question, 'token': new_token, 'summary': summary})
+            return web.json_response({'status': 'ideation', 'question': question, 'token': new_token, 'summary': summary, 'integration_note': integration_note})
         elif not brainstormingEnabled:
             logger.info("Brainstorming disabled; proceeding directly to issue creation")
 
@@ -6397,15 +6457,19 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     video_summary = entry['video_summary']
     await _broadcast_ws({'type': 'progress', 'message': 'Summarizing and generating the next question…'})
 
+    latest_qa = brainstorm_history[-1] if brainstorm_history else None
     try:
-        next_question, summary = await asyncio.gather(
+        results = await asyncio.gather(
             generate_ideation_question(parsed_data, video_summary, brainstorm_history),
-            generate_understanding_summary(parsed_data, video_summary, brainstorm_history),
+            generate_understanding_summary(parsed_data, video_summary, brainstorm_history, latest_qa=latest_qa),
         )
+        next_question = results[0]
+        summary, integration_note = results[1]
     except Exception:
         logger.warning("generate_ideation_question failed in /brainstorm-next-question", exc_info=True)
         next_question = "What other features or behaviors would be helpful for this tool?"
         summary = ''
+        integration_note = ''
 
     if not summary:
         summary = entry.get('last_summary', '')
@@ -6421,6 +6485,7 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
         'token': token,
         'brainstorm_history': brainstorm_history,
         'summary': summary,
+        'integration_note': integration_note,
     })
 
 

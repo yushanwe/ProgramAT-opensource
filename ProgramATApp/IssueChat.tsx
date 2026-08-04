@@ -65,6 +65,7 @@ export default function IssueChat({
   const [activeToken, setActiveToken] = useState<string | null>(null);
   const [awaiting, setAwaiting] = useState<Awaiting>(null);
   const [understandingSummary, setUnderstandingSummary] = useState<string | null>(null);
+  const [lastIntegrated, setLastIntegrated] = useState<string | null>(null);
   const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
 
   const [brainstormingEnabled, setBrainstormingEnabled] = useState(true);
@@ -184,6 +185,7 @@ export default function IssueChat({
     setActiveToken(null);
     setAwaiting(null);
     setUnderstandingSummary(null);
+    setLastIntegrated(null);
     setIsSummaryModalOpen(false);
     brainstormHistoryRef.current = [];
   };
@@ -288,6 +290,7 @@ export default function IssueChat({
       setActiveToken(result.token);
       setAwaiting('answer');
       if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
       append({
         kind: 'assistant-question',
         id: nextId('assistant-question'),
@@ -302,6 +305,7 @@ export default function IssueChat({
       setActiveToken(result.token);
       setAwaiting('choice');
       if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
       brainstormHistoryRef.current = result.brainstorm_history || [];
       append({
         kind: 'assistant-choice-prompt',
@@ -338,7 +342,10 @@ export default function IssueChat({
       if (result.status === 'ideation') {
         brainstormHistoryRef.current = result.brainstorm_history || [];
         setAwaiting('answer');
-        if (result.summary) setUnderstandingSummary(result.summary);
+        if (result.summary) {
+          setUnderstandingSummary(result.summary);
+          if (result.integration_note) setLastIntegrated(result.integration_note);
+        }
         append({
           kind: 'assistant-question',
           id: nextId('assistant-question'),
@@ -787,7 +794,7 @@ export default function IssueChat({
           accessible={true}
           accessibilityRole="button"
           accessibilityLiveRegion="polite"
-          accessibilityLabel={`What I understand: ${understandingSummary}`}
+          accessibilityLabel={`What I understand. ${lastIntegrated ? `Just integrated: ${lastIntegrated}. ` : ''}${understandingSummary}`}
           accessibilityHint="Double tap to view the full text">
           <View style={styles.summaryCardHeader}>
             <Text style={[styles.summaryCardLabel, { color: theme.textSecondary }]} accessible={false}>
@@ -797,6 +804,15 @@ export default function IssueChat({
               View full ›
             </Text>
           </View>
+          {lastIntegrated && (
+            <Text
+              style={[styles.summaryCardLatest, { color: theme.textSecondary }]}
+              accessible={false}
+              numberOfLines={1}
+              ellipsizeMode="tail">
+              Just integrated: {lastIntegrated}
+            </Text>
+          )}
           <Text
             style={[styles.summaryCardText, { color: theme.text }]}
             accessible={false}
@@ -831,6 +847,15 @@ export default function IssueChat({
               </TouchableOpacity>
             </View>
             <ScrollView style={styles.summaryModalScroll} contentContainerStyle={styles.summaryModalScrollContent}>
+              {lastIntegrated && (
+                <Text
+                  style={[styles.summaryModalLatest, { color: theme.textSecondary }]}
+                  accessible={true}
+                  accessibilityRole="text"
+                  accessibilityLabel={`Just integrated: ${lastIntegrated}`}>
+                  Just integrated: {lastIntegrated}
+                </Text>
+              )}
               <Text
                 style={[styles.summaryModalText, { color: theme.text }]}
                 selectable={true}
@@ -1126,9 +1151,19 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
+  summaryCardLatest: {
+    fontSize: 13,
+    fontStyle: 'italic',
+    marginBottom: 4,
+  },
   summaryCardText: {
     fontSize: 15,
     lineHeight: 20,
+  },
+  summaryModalLatest: {
+    fontSize: 14,
+    fontStyle: 'italic',
+    marginBottom: 12,
   },
   summaryModalOverlay: {
     flex: 1,
