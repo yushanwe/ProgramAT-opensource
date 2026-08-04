@@ -1336,6 +1336,8 @@ export default function ToolRunner({
     windowWidth,
     windowHeight * 0.58,
   );
+  const shouldAvoidKeyboard =
+    Boolean(selectedTool?.runtime_input) && isRuntimeInputFocused;
   
   const renderTool = () => {
     if (!selectedTool) {
@@ -1352,13 +1354,22 @@ export default function ToolRunner({
 
     // All tools get the camera view - they're all camera-based
     // Tools loaded from GitHub PRs will process the camera images
+    const ToolLayoutWrapper = shouldAvoidKeyboard ? KeyboardAvoidingView : View;
+    const toolLayoutWrapperProps = shouldAvoidKeyboard
+      ? {
+          behavior: Platform.OS === 'ios' ? 'position' : 'height',
+          enabled: true,
+          keyboardVerticalOffset: 0,
+          accessible: false,
+        }
+      : {
+          accessible: false,
+        };
+
     return (
-      <KeyboardAvoidingView
+      <ToolLayoutWrapper
         style={styles.toolContainer}
-        behavior={Platform.OS === 'ios' ? 'position' : 'height'}
-        enabled={Boolean(selectedTool.runtime_input && isRuntimeInputFocused)}
-        keyboardVerticalOffset={0}
-        accessible={false}>
+        {...toolLayoutWrapperProps}>
         {/* Camera View - Takes up most of screen */}
         <View style={[styles.cameraSection, { height: cameraSectionHeight }]}>
           <CameraView ref={cameraViewRef} />
@@ -1665,7 +1676,7 @@ export default function ToolRunner({
             </ScrollView>
           </View>
         )}
-      </KeyboardAvoidingView>
+      </ToolLayoutWrapper>
     );
   };
 
