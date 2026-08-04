@@ -35,6 +35,7 @@ import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
 import TextToSpeechService from './TextToSpeechService';
+import BeepService from './BeepService';
 
 interface IssueChatProps {
   serverFeedback?: string;
@@ -115,11 +116,13 @@ export default function IssueChat({
     if (!last || last.id === lastAnnouncedIdRef.current) return;
     if (last.kind === 'assistant-question') {
       lastAnnouncedIdRef.current = last.id;
-      TextToSpeechService.speakWithInterrupt(last.question);
-      AccessibilityInfo.announceForAccessibility(last.question);
+      // Ping earcon signals a new question is available. The understanding summary
+      // is announced in the handlers below where the fresh text is available.
+      // VoiceOver reads the question when the user navigates to it — no TTS overlap.
+      BeepService.playBeep(880, 120);
     } else if (last.kind === 'assistant-choice-prompt') {
       lastAnnouncedIdRef.current = last.id;
-      TextToSpeechService.speakWithInterrupt(last.text);
+      // Announce via accessibility only — no TTS to avoid talking over VoiceOver.
       AccessibilityInfo.announceForAccessibility(last.text);
     } else if (last.kind === 'assistant-created') {
       lastAnnouncedIdRef.current = last.id;
@@ -289,7 +292,12 @@ export default function IssueChat({
     if (result.status === 'ideation' && brainstormingActive) {
       setActiveToken(result.token);
       setAwaiting('answer');
-      if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.summary) {
+        setUnderstandingSummary(result.summary);
+        // Announce the updated understanding card — the earcon fires when the
+        // question item is appended below, so the user hears both together.
+        AccessibilityInfo.announceForAccessibility(result.summary);
+      }
       if (result.integration_note) setLastIntegrated(result.integration_note);
       append({
         kind: 'assistant-question',
@@ -304,7 +312,11 @@ export default function IssueChat({
     if (result.status === 'brainstorm_choice' && brainstormingActive) {
       setActiveToken(result.token);
       setAwaiting('choice');
-      if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.summary) {
+        setUnderstandingSummary(result.summary);
+        // Announce the updated understanding card before the choice prompt text.
+        AccessibilityInfo.announceForAccessibility(result.summary);
+      }
       if (result.integration_note) setLastIntegrated(result.integration_note);
       brainstormHistoryRef.current = result.brainstorm_history || [];
       append({
@@ -344,6 +356,8 @@ export default function IssueChat({
         setAwaiting('answer');
         if (result.summary) {
           setUnderstandingSummary(result.summary);
+          // Announce the updated understanding card; earcon fires when question item appends.
+          AccessibilityInfo.announceForAccessibility(result.summary);
           if (result.integration_note) setLastIntegrated(result.integration_note);
         }
         append({
