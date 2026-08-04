@@ -134,15 +134,15 @@ export default function IssueChat({
     if (!last || last.id === lastAnnouncedIdRef.current) return;
     if (last.kind === 'assistant-question') {
       lastAnnouncedIdRef.current = last.id;
-      // Ping earcon signals a new question is available. The understanding summary
-      // is announced in the handlers below where the fresh text is available.
-      // VoiceOver reads the question when the user navigates to it — no TTS overlap.
+      // Announce the question and play an earcon. All question announcements
+      // are handled here regardless of how the question arrived.
+      AccessibilityInfo.announceForAccessibility(last.question);
       BeepService.playBeep(880, 120);
     } else if (last.kind === 'assistant-choice-prompt') {
       lastAnnouncedIdRef.current = last.id;
-      // No announcement here — the combined understanding + choice announcement
-      // was already made in handleCreationResponse before this item was appended,
-      // so announcing again would interrupt it. VoiceOver reads the buttons on nav.
+      // Announce the choice prompt. Summary card is silently updated and
+      // readable by VoiceOver navigation — no competing announcement needed.
+      AccessibilityInfo.announceForAccessibility(last.text);
     } else if (last.kind === 'assistant-created') {
       lastAnnouncedIdRef.current = last.id;
       const note = last.videoSummarySkipped ? ' Video summarization was skipped.' : '';
@@ -318,13 +318,7 @@ export default function IssueChat({
     if (result.status === 'ideation' && brainstormingActive) {
       setActiveToken(result.token);
       setAwaiting('answer');
-      if (result.summary) {
-        setUnderstandingSummary(result.summary);
-        // Short announcement: label + first sentence (or integration note if present).
-        AccessibilityInfo.announceForAccessibility(
-          buildUnderstandingAnnouncement(result.summary, result.integration_note)
-        );
-      }
+      if (result.summary) setUnderstandingSummary(result.summary);
       if (result.integration_note) setLastIntegrated(result.integration_note);
       append({
         kind: 'assistant-question',
@@ -339,16 +333,7 @@ export default function IssueChat({
     if (result.status === 'brainstorm_choice' && brainstormingActive) {
       setActiveToken(result.token);
       setAwaiting('choice');
-      if (result.summary) {
-        setUnderstandingSummary(result.summary);
-        // Combined single announcement: understanding update + what to do next.
-        // Must be one call — a second announceForAccessibility in the items useEffect
-        // would interrupt this one before it finishes.
-        const note = buildUnderstandingAnnouncement(result.summary, result.integration_note);
-        AccessibilityInfo.announceForAccessibility(
-          note + ' You can keep brainstorming or start building.'
-        );
-      }
+      if (result.summary) setUnderstandingSummary(result.summary);
       if (result.integration_note) setLastIntegrated(result.integration_note);
       brainstormHistoryRef.current = result.brainstorm_history || [];
       append({
@@ -386,14 +371,8 @@ export default function IssueChat({
       if (result.status === 'ideation') {
         brainstormHistoryRef.current = result.brainstorm_history || [];
         setAwaiting('answer');
-        if (result.summary) {
-          setUnderstandingSummary(result.summary);
-          // Short announcement: label + first sentence (or integration note if present).
-          AccessibilityInfo.announceForAccessibility(
-            buildUnderstandingAnnouncement(result.summary, result.integration_note)
-          );
-          if (result.integration_note) setLastIntegrated(result.integration_note);
-        }
+        if (result.summary) setUnderstandingSummary(result.summary);
+        if (result.integration_note) setLastIntegrated(result.integration_note);
         append({
           kind: 'assistant-question',
           id: nextId('assistant-question'),
@@ -844,7 +823,6 @@ export default function IssueChat({
           activeOpacity={0.7}
           accessible={true}
           accessibilityRole="button"
-          accessibilityLiveRegion="polite"
           accessibilityLabel={`What I understand. ${lastIntegrated ? `Just integrated: ${lastIntegrated}. ` : ''}${understandingSummary}`}
           accessibilityHint="Double tap to view the full text">
           <View style={styles.summaryCardHeader}>
