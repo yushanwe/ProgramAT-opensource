@@ -53,7 +53,7 @@ class ScreenRecordingModule: NSObject {
         try? FileManager.default.removeItem(at: url)
         self.outputURL = url
 
-        RPScreenRecorder.shared().startRecording(withMicrophoneEnabled: false) { error in
+        RPScreenRecorder.shared().startRecording(withMicrophoneEnabled: true) { error in
 
             if let error = error {
                 let nsError = error as NSError
@@ -61,7 +61,7 @@ class ScreenRecordingModule: NSObject {
                    nsError.code == RPRecordingErrorCode.userDeclined.rawValue {
                     reject(
                         "recording_permission_denied",
-                        "Screen recording permission was declined.",
+                        "Screen recording or microphone permission was declined.",
                         error
                     )
                 } else {

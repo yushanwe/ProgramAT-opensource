@@ -1054,7 +1054,7 @@ export default function ToolRunner({
       }
       const message =
         code === 'recording_permission_denied'
-          ? 'Screen recording permission was denied. This session will not be recorded.'
+          ? 'Screen recording or microphone permission was denied. This session will not be recorded.'
           : code === 'recorder_unavailable'
           ? 'Screen recording is not available on this device.'
           : 'Could not start screen recording.';
