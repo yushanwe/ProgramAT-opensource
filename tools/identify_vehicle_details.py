@@ -18,17 +18,36 @@ TOOL_PROMPT = (
     "a white Toyota, possibly a Camry, license plate ABC123, though the plate is partially "
     "obscured.'"
 )
+TOOL_RUNTIME_INPUT = {
+    "key": "expected_vehicle",
+    "label": "Vehicle you're looking for",
+    "placeholder": "Example: black BMW",
+    "prompt_instruction": (
+        "The user is looking for a specific vehicle: {value}. First, identify the visible "
+        "vehicle's make, model, color, and license plate. Then assess how likely it is to "
+        "match what the user is looking for. If it appears to be a strong match, say 'This "
+        "looks like your vehicle' followed by the details. If it's a possible match but you're "
+        "uncertain, say 'This might be your vehicle' and explain which details match and which "
+        "you're unsure about. If it clearly does not match, say 'This does not appear to be "
+        "your vehicle' and briefly explain why, then provide the actual vehicle details you see."
+    ),
+}
 
 DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite"
 FALLBACK_TEXT = "I cannot identify a vehicle clearly from this view."
 
 
-async def analyze_image(image):
+async def analyze_image(image, input_data):
     """Analyze image for vehicle details using vision model."""
+    prompt = TOOL_PROMPT
+    if input_data and input_data.get("expected_vehicle"):
+        expected = input_data["expected_vehicle"]
+        prompt = TOOL_RUNTIME_INPUT["prompt_instruction"].format(value=expected)
+
     response = await asyncio.to_thread(
         call_model,
         DEFAULT_MODEL,
-        [{"role": "user", "content": TOOL_PROMPT}],
+        [{"role": "user", "content": prompt}],
         [image],
         {"timeout": 60, "num_retries": 0},
     )
@@ -38,16 +57,16 @@ async def analyze_image(image):
 
 async def on_take_photo(runtime, image, input_data):
     """Single photo analysis for vehicle identification."""
-    del runtime, input_data
+    del runtime
     if image is None:
         return FALLBACK_TEXT
-    return await analyze_image(image)
+    return await analyze_image(image, input_data)
 
 
 async def on_stream_start(runtime, input_data):
     """Initialize streaming state."""
-    del input_data
     runtime.set_state("in_flight", False)
+    runtime.set_state("input_data", input_data)
 
 
 async def on_frame(runtime, frame):
@@ -58,7 +77,8 @@ async def on_frame(runtime, frame):
         return
     runtime.set_state("in_flight", True)
     try:
-        text = await analyze_image(frame.image)
+        input_data = runtime.get_state("input_data")
+        text = await analyze_image(frame.image, input_data)
         if not runtime.is_cancelled():
             await runtime.emit(text, final=True)
     finally:
