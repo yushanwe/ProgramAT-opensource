@@ -596,12 +596,14 @@ export default function IssueChat({
         return (
           <View
             key={item.id}
-            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
-            accessible={true}
-            accessibilityLabel={`Assistant said: ${item.question}`}
-            accessibilityRole="text"
-            accessibilityHint="Long press to copy text">
-            <Text style={[styles.messageText, { color: theme.text }]} selectable={true} accessible={false}>
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text
+              style={[styles.messageText, { color: theme.text }]}
+              selectable={true}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={`Assistant said: ${item.question}`}
+              accessibilityHint="Long press to copy text">
               {item.question}
             </Text>
             <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
@@ -613,11 +615,12 @@ export default function IssueChat({
         return (
           <View
             key={item.id}
-            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
-            accessible={true}
-            accessibilityLabel={`Assistant said: ${item.text}`}
-            accessibilityRole="text">
-            <Text style={[styles.messageText, { color: theme.text }]} accessible={false}>
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text
+              style={[styles.messageText, { color: theme.text }]}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={`Assistant said: ${item.text}`}>
               {item.text}
             </Text>
             {!item.resolved && (
