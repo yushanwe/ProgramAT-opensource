@@ -36,6 +36,7 @@ import {
   progressiveInvocationIsRunning,
   progressiveResultModel,
 } from './progressiveResults';
+import { isRecordSessionArmed } from './Settings';
 
 // Configuration for text similarity filtering
 const SIMILARITY_THRESHOLDS = {
@@ -92,7 +93,7 @@ export default function ToolRunner({
   const [, setIsStreamProcessing] = useState(false);
   const isStreamingRef = useRef(false); // Ref to avoid stale closures in cleanup effects
   const wasStreamingRef = useRef(false); // Tracks isStreaming transitions for screen-recording stop
-  const [recordSessionArmed, setRecordSessionArmed] = useState(false); // "Record this usage session" toggle
+  const [recordSessionArmed, setRecordSessionArmed] = useState(false); // "Record this usage session" — set in Settings
   const [isRecordingScreen, setIsRecordingScreen] = useState(false);
   const isRecordingScreenRef = useRef(false);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Take Photo's 30s auto-stop
@@ -118,6 +119,15 @@ export default function ToolRunner({
   useEffect(() => {
     isStreamingRef.current = isStreaming;
   }, [isStreaming]);
+
+  // Load the "Record this usage session" setting from Settings. Re-checked
+  // whenever this tab becomes active so a change made in Settings while this
+  // screen was backgrounded takes effect without an app restart.
+  useEffect(() => {
+    if (isActive) {
+      isRecordSessionArmed().then(setRecordSessionArmed).catch(() => setRecordSessionArmed(false));
+    }
+  }, [isActive]);
 
   // Keep isRecordingScreenRef in sync with isRecordingScreen state
   useEffect(() => {
@@ -1407,36 +1417,6 @@ export default function ToolRunner({
               {/* Main action buttons - Full width, readable */}
               <View style={styles.buttonRow}>
                 <TouchableOpacity
-                  style={[
-                    styles.button,
-                    recordSessionArmed ? styles.recordArmedButton : styles.recordButton,
-                    isRecordingScreen && styles.buttonDisabled,
-                  ]}
-                  onPress={() => {
-                    const next = !recordSessionArmed;
-                    setRecordSessionArmed(next);
-                    AccessibilityInfo.announceForAccessibility(
-                      next
-                        ? 'Recording armed. This usage session will be recorded.'
-                        : 'Recording disarmed.'
-                    );
-                  }}
-                  disabled={isRecordingScreen}
-                  accessible={true}
-                  accessibilityLabel={recordSessionArmed ? 'Recording armed' : 'Record this usage session'}
-                  accessibilityHint={
-                    recordSessionArmed
-                      ? 'Double tap to disarm. A screen recording will not be made for the next run.'
-                      : 'Double tap to arm. A screen recording will be made when you start streaming or take a photo.'
-                  }
-                  accessibilityRole="button"
-                  accessibilityState={{ disabled: isRecordingScreen, selected: recordSessionArmed }}>
-                  <Text style={styles.buttonText}>
-                    {recordSessionArmed ? '● Recording Armed' : 'Record This Session'}
-                  </Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
                   style={[styles.button, isStreaming ? styles.stopButton : styles.streamButton, (!isStreaming && isRunning) && styles.buttonDisabled]}
                   onPress={isStreaming ? stopStreamingTool : startStreamingTool}
                   disabled={!isStreaming && isRunning}
@@ -1871,12 +1851,6 @@ const styles = StyleSheet.create({
   },
   oneShotButton: {
     backgroundColor: '#2196F3',
-  },
-  recordButton: {
-    backgroundColor: '#757575',
-  },
-  recordArmedButton: {
-    backgroundColor: '#E91E63',
   },
   streamButton: {
     backgroundColor: '#4CAF50',

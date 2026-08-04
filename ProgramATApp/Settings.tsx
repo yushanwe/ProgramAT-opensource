@@ -28,6 +28,7 @@ import VideoSummaryTestScreen from './VideoSummaryTestScreen';
 const SERVER_URL_KEY = '@server_url';
 const BRAINSTORMING_ENABLED_KEY = '@brainstorming_enabled';
 const BASIC_MODE_ENABLED_KEY = '@basic_mode_enabled';
+const RECORD_SESSION_ARMED_KEY = '@record_session_armed';
 
 export function isBrainstormingEnabled(): Promise<boolean> {
   return (async () => {
@@ -44,6 +45,17 @@ export function isBasicModeEnabled(): Promise<boolean> {
   return (async () => {
     try {
       const saved = await AsyncStorage.getItem(BASIC_MODE_ENABLED_KEY);
+      return saved === 'true';
+    } catch {
+      return false;
+    }
+  })();
+}
+
+export function isRecordSessionArmed(): Promise<boolean> {
+  return (async () => {
+    try {
+      const saved = await AsyncStorage.getItem(RECORD_SESSION_ARMED_KEY);
       return saved === 'true';
     } catch {
       return false;
@@ -77,6 +89,10 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
   // Basic mode: hides video-attach and brainstorming features for a simplified experience
   const [basicModeEnabled, setBasicModeEnabled] = useState(false);
 
+  // Record this usage session: arms screen recording for the next Start
+  // Streaming / Take Photo run in the Tools screen.
+  const [recordSessionArmed, setRecordSessionArmed] = useState(false);
+
   // Meta / Ray-Ban (DAT) native iOS bridge. Only one-time device registration
   // is exposed here; the live camera pipeline is driven from the Tools screen.
   const { MetaWearablesModule } = NativeModules as {
@@ -91,6 +107,7 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     loadSavedServerUrl();
     loadBrainstormingSetting();
     loadBasicModeSetting();
+    loadRecordSessionArmedSetting();
     const checkConnection = setInterval(() => {
       setIsConnected(WebSocketService.isConnected());
       setCurrentServerUrl(WebSocketService.getServerUrl());
@@ -147,6 +164,22 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
   const handleBasicModeToggle = async (value: boolean) => {
     setBasicModeEnabled(value);
     await AsyncStorage.setItem(BASIC_MODE_ENABLED_KEY, value ? 'true' : 'false');
+  };
+
+  const loadRecordSessionArmedSetting = async () => {
+    try {
+      const saved = await AsyncStorage.getItem(RECORD_SESSION_ARMED_KEY);
+      if (saved !== null) {
+        setRecordSessionArmed(saved === 'true');
+      }
+    } catch (error) {
+      console.error('[Settings] Error loading record session setting:', error);
+    }
+  };
+
+  const handleRecordSessionToggle = async (value: boolean) => {
+    setRecordSessionArmed(value);
+    await AsyncStorage.setItem(RECORD_SESSION_ARMED_KEY, value ? 'true' : 'false');
   };
 
   const handleSaveServerUrl = async () => {
@@ -383,6 +416,34 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
                   ? 'Brainstorming is controlled by Basic mode and cannot be changed here'
                   : 'Double tap to toggle brainstorming questions'}
                 accessibilityState={{ disabled: basicModeEnabled }}
+              />
+            </View>
+          </View>
+        </View>
+
+        {/* Session Recording Section */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Session Recording</Text>
+
+          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <View style={styles.settingRow}>
+              <View style={styles.settingInfo}>
+                <Text style={[styles.settingLabel, { color: theme.text }]}>Record This Usage Session</Text>
+                <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
+                  {recordSessionArmed
+                    ? 'Armed — tool runs will record your screen'
+                    : 'Off — tool runs will not be recorded'}
+                </Text>
+              </View>
+              <Switch
+                value={recordSessionArmed}
+                onValueChange={handleRecordSessionToggle}
+                trackColor={{ false: theme.border, true: theme.primary }}
+                thumbColor={recordSessionArmed ? '#ffffff' : '#f4f3f4'}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Record this usage session toggle"
+                accessibilityHint="Double tap to arm or disarm screen recording for the next Start Streaming or Take Photo run in Tools"
               />
             </View>
           </View>
@@ -772,6 +833,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   settingInfo: {
+    flex: 1,
+    marginRight: 12,
     marginBottom: 12,
   },
   settingLabel: {
