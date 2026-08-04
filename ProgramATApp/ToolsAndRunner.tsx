@@ -34,6 +34,7 @@ interface ToolsAndRunnerProps {
   isActive?: boolean; // Whether this tab is currently active
   selectedIssue?: {number: number; title: string} | null;
   onNavigateToChat?: (conversationId?: string) => void; // Callback to navigate to chat tab with optional conversation ID
+  onRunnerVisibilityChange?: (visible: boolean) => void;
 }
 
 type ViewMode = 'tool-selector' | 'tool-runner';
@@ -43,7 +44,8 @@ export default function ToolsAndRunner({
   productionMode = false,
   isActive = true,
   selectedIssue = null,
-  onNavigateToChat
+  onNavigateToChat,
+  onRunnerVisibilityChange,
 }: ToolsAndRunnerProps) {
   const { theme } = useTheme();
   const [viewMode, setViewMode] = useState<ViewMode>('tool-selector');
@@ -72,6 +74,10 @@ export default function ToolsAndRunner({
       setViewMode('tool-selector');
     }
   }, [isActive]);
+
+  useEffect(() => {
+    onRunnerVisibilityChange?.(viewMode === 'tool-runner');
+  }, [onRunnerVisibilityChange, viewMode]);
 
   // Validate that selected tool still exists when issueTools changes
   // and update its fields (e.g. gpt_query) from the fresh data
