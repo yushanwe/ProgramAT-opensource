@@ -47,6 +47,24 @@ interface IssueChatProps {
 
 type Awaiting = 'answer' | 'choice' | null;
 
+/**
+ * Build the short VoiceOver announcement for the "What I understand" card.
+ * On first arrival (no integration note) we extract just the first sentence.
+ * On updates we use the integration note — it is already a single sentence
+ * describing only what changed.
+ * Always prefixed with the card label so the user knows what they're hearing.
+ */
+function buildUnderstandingAnnouncement(summary: string, integrationNote?: string | null): string {
+  const label = 'What I understand: ';
+  if (integrationNote) {
+    return label + integrationNote;
+  }
+  // Extract first sentence only.
+  const match = summary.match(/^[^.!?]+[.!?]/);
+  const firstSentence = match ? match[0] : summary;
+  return label + firstSentence;
+}
+
 export default function IssueChat({
   selectedIssue,
   onBack,
@@ -301,9 +319,10 @@ export default function IssueChat({
       setAwaiting('answer');
       if (result.summary) {
         setUnderstandingSummary(result.summary);
-        // Announce the updated understanding card — the earcon fires when the
-        // question item is appended below, so the user hears both together.
-        AccessibilityInfo.announceForAccessibility(result.summary);
+        // Short announcement: label + first sentence (or integration note if present).
+        AccessibilityInfo.announceForAccessibility(
+          buildUnderstandingAnnouncement(result.summary, result.integration_note)
+        );
       }
       if (result.integration_note) setLastIntegrated(result.integration_note);
       append({
@@ -321,8 +340,10 @@ export default function IssueChat({
       setAwaiting('choice');
       if (result.summary) {
         setUnderstandingSummary(result.summary);
-        // Announce the updated understanding card before the choice prompt text.
-        AccessibilityInfo.announceForAccessibility(result.summary);
+        // Short announcement: label + first sentence (or integration note if present).
+        AccessibilityInfo.announceForAccessibility(
+          buildUnderstandingAnnouncement(result.summary, result.integration_note)
+        );
       }
       if (result.integration_note) setLastIntegrated(result.integration_note);
       brainstormHistoryRef.current = result.brainstorm_history || [];
@@ -363,8 +384,10 @@ export default function IssueChat({
         setAwaiting('answer');
         if (result.summary) {
           setUnderstandingSummary(result.summary);
-          // Announce the updated understanding card; earcon fires when question item appends.
-          AccessibilityInfo.announceForAccessibility(result.summary);
+          // Short announcement: label + first sentence (or integration note if present).
+          AccessibilityInfo.announceForAccessibility(
+            buildUnderstandingAnnouncement(result.summary, result.integration_note)
+          );
           if (result.integration_note) setLastIntegrated(result.integration_note);
         }
         append({
