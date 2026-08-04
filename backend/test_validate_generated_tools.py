@@ -183,7 +183,7 @@ TOOL_PROMPT = "Find the nearest visible exit and give concise accessible guidanc
 async def analyze(image):
     response = await asyncio.to_thread(
         call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
+        "gemini/gemini-3.1-flash-lite",
         [{"role": "user", "content": TOOL_PROMPT}],
         [image],
     )

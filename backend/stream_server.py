@@ -956,7 +956,7 @@ NVIDIA_VIDEO_MODEL = os.getenv('NVIDIA_VIDEO_MODEL', NVIDIA_HOSTED_MODEL).strip(
 NVIDIA_VIDEO_INPUT_MODE = os.getenv('NVIDIA_VIDEO_INPUT_MODE', 'base64').strip().lower()
 VIDEO_VLM_PROVIDER = os.getenv('VIDEO_VLM_PROVIDER', 'nvidia').strip().lower()
 VIDEO_GEMINI_MODEL = os.getenv(
-    'VIDEO_GEMINI_MODEL', 'gemini-3.1-flash-lite-preview'
+    'VIDEO_GEMINI_MODEL', 'gemini-3.1-flash-lite'
 ).strip().removeprefix('gemini/')
 HOSTED_VIDEO_WINDOW_SECONDS = float(os.getenv('HOSTED_VIDEO_WINDOW_SECONDS', '6'))
 HOSTED_VIDEO_INTERVAL_SECONDS = float(os.getenv('HOSTED_VIDEO_INTERVAL_SECONDS', '3'))

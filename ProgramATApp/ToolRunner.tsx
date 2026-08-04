@@ -12,7 +12,6 @@ import {
   TextInput,
   ScrollView,
   Keyboard,
-  TouchableWithoutFeedback,
   Platform,
   AccessibilityInfo,
   findNodeHandle,
@@ -1354,22 +1353,13 @@ export default function ToolRunner({
 
     // All tools get the camera view - they're all camera-based
     // Tools loaded from GitHub PRs will process the camera images
-    const ToolLayoutWrapper = shouldAvoidKeyboard ? KeyboardAvoidingView : View;
-    const toolLayoutWrapperProps = shouldAvoidKeyboard
-      ? {
-          behavior: Platform.OS === 'ios' ? 'position' : 'height',
-          enabled: true,
-          keyboardVerticalOffset: 0,
-          accessible: false,
-        }
-      : {
-          accessible: false,
-        };
-
     return (
-      <ToolLayoutWrapper
+      <KeyboardAvoidingView
         style={styles.toolContainer}
-        {...toolLayoutWrapperProps}>
+        behavior={shouldAvoidKeyboard ? (Platform.OS === 'ios' ? 'position' : 'height') : undefined}
+        enabled={shouldAvoidKeyboard}
+        keyboardVerticalOffset={0}
+        accessible={false}>
         {/* Camera View - Takes up most of screen */}
         <View style={[styles.cameraSection, { height: cameraSectionHeight }]}>
           <CameraView ref={cameraViewRef} />
@@ -1519,164 +1509,162 @@ export default function ToolRunner({
               }}
               scrollEventThrottle={16}
               showsVerticalScrollIndicator={true}>
-              <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-                <View>
-                  {/* Output section - reachable in lower scrolling region */}
-                  {toolOutput && (
-                    <View 
-                      style={styles.outputSection}
-                      accessible={false}>
-                      <Text 
-                        style={styles.outputText}
-                        selectable={true}
-                        accessible={true}
-                        accessibilityRole="text"
-                        accessibilityLiveRegion="polite"
-                        accessibilityLabel={`Tool output: ${toolOutput}`}
-                        accessibilityHint="Long press to copy text">
-                        {toolOutput}
-                      </Text>
-                    </View>
-                  )}
+              <View>
+                {/* Output section - reachable in lower scrolling region */}
+                {toolOutput && (
+                  <View 
+                    style={styles.outputSection}
+                    accessible={false}>
+                    <Text 
+                      style={styles.outputText}
+                      selectable={true}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLiveRegion="polite"
+                      accessibilityLabel={`Tool output: ${toolOutput}`}
+                      accessibilityHint="Long press to copy text">
+                      {toolOutput}
+                    </Text>
+                  </View>
+                )}
 
-                  {selectedTool.runtime_input && (
-                    <View style={styles.runtimeInputSection}>
-                      <Text
-                        style={styles.runtimeInputLabel}
+                {selectedTool.runtime_input && (
+                  <View style={styles.runtimeInputSection}>
+                    <Text
+                      style={styles.runtimeInputLabel}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLabel={selectedTool.runtime_input.label}>
+                      {selectedTool.runtime_input.label}
+                    </Text>
+                    <TextInput
+                      ref={runtimeInputRef}
+                      style={styles.runtimeInputField}
+                      value={runtimeInputDraft}
+                      onChangeText={setRuntimeInputDraft}
+                      placeholder={selectedTool.runtime_input.placeholder}
+                      placeholderTextColor="#8a8a8a"
+                      returnKeyType="done"
+                      onSubmitEditing={commitRuntimeInput}
+                      onFocus={() => {
+                        preKeyboardScrollOffsetRef.current = lowerScrollOffsetRef.current;
+                        runtimeInputFocusedRef.current = true;
+                        setIsRuntimeInputFocused(true);
+                        scrollRuntimeInputIntoView();
+                      }}
+                      onBlur={() => {
+                        runtimeInputFocusedRef.current = false;
+                        setIsRuntimeInputFocused(false);
+                      }}
+                      accessible={true}
+                      accessibilityLabel={selectedTool.runtime_input.label}
+                      accessibilityHint="Enter an optional value to customize this tool."
+                    />
+                    <View style={styles.runtimeInputButtons}>
+                      <TouchableOpacity
+                        style={[styles.runtimeInputButton, styles.runtimeCommitButton]}
+                        onPress={commitRuntimeInput}
                         accessible={true}
-                        accessibilityRole="text"
-                        accessibilityLabel={selectedTool.runtime_input.label}>
-                        {selectedTool.runtime_input.label}
-                      </Text>
-                      <TextInput
-                        ref={runtimeInputRef}
-                        style={styles.runtimeInputField}
-                        value={runtimeInputDraft}
-                        onChangeText={setRuntimeInputDraft}
-                        placeholder={selectedTool.runtime_input.placeholder}
-                        placeholderTextColor="#8a8a8a"
-                        returnKeyType="done"
-                        onSubmitEditing={commitRuntimeInput}
-                        onFocus={() => {
-                          preKeyboardScrollOffsetRef.current = lowerScrollOffsetRef.current;
-                          runtimeInputFocusedRef.current = true;
-                          setIsRuntimeInputFocused(true);
-                          scrollRuntimeInputIntoView();
-                        }}
-                        onBlur={() => {
-                          runtimeInputFocusedRef.current = false;
-                          setIsRuntimeInputFocused(false);
-                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel="Enter"
+                        accessibilityHint="Commits the current text for subsequent Take Photo and Start Streaming requests">
+                        <Text style={styles.runtimeInputButtonText}>Enter</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.runtimeInputButton, styles.runtimeClearButton]}
+                        onPress={clearRuntimeInput}
                         accessible={true}
-                        accessibilityLabel={selectedTool.runtime_input.label}
-                        accessibilityHint="Enter an optional value to customize this tool."
-                      />
-                      <View style={styles.runtimeInputButtons}>
-                        <TouchableOpacity
-                          style={[styles.runtimeInputButton, styles.runtimeCommitButton]}
-                          onPress={commitRuntimeInput}
-                          accessible={true}
-                          accessibilityRole="button"
-                          accessibilityLabel="Enter"
-                          accessibilityHint="Commits the current text for subsequent Take Photo and Start Streaming requests">
-                          <Text style={styles.runtimeInputButtonText}>Enter</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                          style={[styles.runtimeInputButton, styles.runtimeClearButton]}
-                          onPress={clearRuntimeInput}
-                          accessible={true}
-                          accessibilityRole="button"
-                          accessibilityLabel="Clear"
-                          accessibilityHint="Removes both the typed and active target and restores the tool default behavior">
-                          <Text style={styles.runtimeInputButtonText}>Clear</Text>
-                        </TouchableOpacity>
-                      </View>
-                      <Text
-                        style={styles.runtimeInputStatus}
-                        accessible={true}
-                        accessibilityRole="text"
-                        accessibilityLabel={
-                          committedRuntimeInput
-                            ? `Active target: ${committedRuntimeInput}`
-                            : 'No active target'
-                        }>
-                        {committedRuntimeInput
+                        accessibilityRole="button"
+                        accessibilityLabel="Clear"
+                        accessibilityHint="Removes both the typed and active target and restores the tool default behavior">
+                        <Text style={styles.runtimeInputButtonText}>Clear</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <Text
+                      style={styles.runtimeInputStatus}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLabel={
+                        committedRuntimeInput
                           ? `Active target: ${committedRuntimeInput}`
-                          : 'Active target: none'}
-                      </Text>
-                    </View>
-                  )}
+                          : 'No active target'
+                      }>
+                      {committedRuntimeInput
+                        ? `Active target: ${committedRuntimeInput}`
+                        : 'Active target: none'}
+                    </Text>
+                  </View>
+                )}
 
-                  {selectedTool.description && (
-                    <View style={styles.detailSection}>
-                      <Text style={styles.detailTitle}>Description</Text>
+                {selectedTool.description && (
+                  <View style={styles.detailSection}>
+                    <Text style={styles.detailTitle}>Description</Text>
+                    <Text 
+                      style={styles.toolDescription}
+                      selectable={true}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLabel={`Description: ${selectedTool.description}`}
+                      accessibilityHint="Long press to copy text">
+                      {selectedTool.description}
+                    </Text>
+                  </View>
+                )}
+                
+                {(selectedTool.branch_name || selectedTool.language || selectedTool.pr_title) && (
+                  <View style={styles.detailSection}>
+                    <Text style={styles.detailTitle}>Details</Text>
+                    {selectedTool.pr_title && (
                       <Text 
-                        style={styles.toolDescription}
+                        style={styles.toolMeta}
+                        selectable={true}
+                        accessible={true}
+                        accessibilityRole="text">
+                        PR: {selectedTool.pr_title}
+                      </Text>
+                    )}
+                    {selectedTool.branch_name && (
+                      <Text 
+                        style={styles.toolMeta}
+                        selectable={true}
+                        accessible={true}
+                        accessibilityRole="text">
+                        Branch: {selectedTool.branch_name}
+                      </Text>
+                    )}
+                    {selectedTool.language && (
+                      <Text 
+                        style={styles.toolMeta}
+                        selectable={true}
+                        accessible={true}
+                        accessibilityRole="text">
+                        Language: {selectedTool.language}
+                      </Text>
+                    )}
+                  </View>
+                )}
+
+                {selectedTool.source_code && (
+                  <View style={styles.detailSection}>
+                    <Text style={styles.detailTitle}>Source Code</Text>
+                    <View style={styles.codeScroll}>
+                      <Text 
+                        style={styles.codeText}
                         selectable={true}
                         accessible={true}
                         accessibilityRole="text"
-                        accessibilityLabel={`Description: ${selectedTool.description}`}
-                        accessibilityHint="Long press to copy text">
-                        {selectedTool.description}
+                        accessibilityLabel="Source code"
+                        accessibilityHint="Long press to copy code">
+                        {selectedTool.source_code}
                       </Text>
                     </View>
-                  )}
-                  
-                  {(selectedTool.branch_name || selectedTool.language || selectedTool.pr_title) && (
-                    <View style={styles.detailSection}>
-                      <Text style={styles.detailTitle}>Details</Text>
-                      {selectedTool.pr_title && (
-                        <Text 
-                          style={styles.toolMeta}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text">
-                          PR: {selectedTool.pr_title}
-                        </Text>
-                      )}
-                      {selectedTool.branch_name && (
-                        <Text 
-                          style={styles.toolMeta}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text">
-                          Branch: {selectedTool.branch_name}
-                        </Text>
-                      )}
-                      {selectedTool.language && (
-                        <Text 
-                          style={styles.toolMeta}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text">
-                          Language: {selectedTool.language}
-                        </Text>
-                      )}
-                    </View>
-                  )}
-
-                  {selectedTool.source_code && (
-                    <View style={styles.detailSection}>
-                      <Text style={styles.detailTitle}>Source Code</Text>
-                      <View style={styles.codeScroll}>
-                        <Text 
-                          style={styles.codeText}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text"
-                          accessibilityLabel="Source code"
-                          accessibilityHint="Long press to copy code">
-                          {selectedTool.source_code}
-                        </Text>
-                      </View>
-                    </View>
-                  )}
-                </View>
-              </TouchableWithoutFeedback>
+                  </View>
+                )}
+              </View>
             </ScrollView>
           </View>
         )}
-      </ToolLayoutWrapper>
+      </KeyboardAvoidingView>
     );
   };
 

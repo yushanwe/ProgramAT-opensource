@@ -529,7 +529,7 @@ class TestHostedStreamingIntegration(unittest.IsolatedAsyncioTestCase):
             session.update({
                 "provider": "gemini",
                 "model": None,
-                "model_id": "gemini-3.1-flash-lite-preview",
+                "model_id": "gemini-3.1-flash-lite",
                 "output_config": {"schema": "played_card_event", "confidence_threshold": 0.8},
             })
             stream_server.active_hosted_nvidia_sessions["client"] = session
@@ -562,7 +562,7 @@ class TestHostedStreamingIntegration(unittest.IsolatedAsyncioTestCase):
         session.update({
             "provider": "gemini",
             "model": None,
-            "model_id": "gemini-3.1-flash-lite-preview",
+            "model_id": "gemini-3.1-flash-lite",
             "tool_name": "recent_sign_language",
             "prompt": "Identify the signed phrase from chronological hand motion. Return plain text.",
             "output_config": {},
@@ -597,7 +597,7 @@ class TestHostedStreamingIntegration(unittest.IsolatedAsyncioTestCase):
         session = self._session()
         session.update({
             "provider": "gemini", "model": None,
-            "model_id": "gemini-3.1-flash-lite-preview",
+            "model_id": "gemini-3.1-flash-lite",
             "tool_name": "recent_sign_language", "output_config": {},
         })
         stream_server.active_hosted_nvidia_sessions["client"] = session

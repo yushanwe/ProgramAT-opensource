@@ -10,7 +10,7 @@ The verified configuration is:
 ```env
 STREAMING_EXECUTION_POLICY=hosted_video_only
 VIDEO_VLM_PROVIDER=gemini
-VIDEO_GEMINI_MODEL=gemini-3.1-flash-lite-preview
+VIDEO_GEMINI_MODEL=gemini-3.1-flash-lite
 NVIDIA_VIDEO_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_VIDEO_API_KEY=<secret>
 NVIDIA_VIDEO_MODEL=nvidia/nemotron-nano-12b-v2-vl

@@ -152,7 +152,7 @@ class TestExecutableEmptySeatTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "Two empty seats.")
         self.assertEqual(
-            call.call_args.args[0], "gemini/gemini-3.1-flash-lite-preview"
+            call.call_args.args[0], "gemini/gemini-3.1-flash-lite"
         )
 
     async def test_tool_owned_similarity_suppresses_same_scene(self):
@@ -214,7 +214,7 @@ def similarity(a, b):
     return float(np.dot(a, b))
 async def on_take_photo(runtime, image, input_data):
     response = await asyncio.to_thread(
-        call_model, "gemini/gemini-3.1-flash-lite-preview",
+        call_model, "gemini/gemini-3.1-flash-lite",
         [{"role": "user", "content": TOOL_PROMPT}], [image]
     )
     return extract_text(response)

@@ -26,7 +26,7 @@ TOOL_PROMPT = (
 SCENE_SIMILARITY_THRESHOLD = 0.985
 PROGRESSIVE_MODELS = (
     ("moondream/moondream3-preview", "litellm"),
-    ("gemini/gemini-3.1-flash-lite-preview", "litellm"),
+    ("gemini/gemini-3.1-flash-lite", "litellm"),
     ("gpt-5", "openai_responses"),
 )
 
@@ -83,7 +83,7 @@ async def on_take_photo(runtime, image, input_data):
         return "No camera image is available."
     response = await asyncio.to_thread(
         call_model,
-        "gemini/gemini-3.1-flash-lite-preview",
+        "gemini/gemini-3.1-flash-lite",
         [{"role": "user", "content": TOOL_PROMPT}],
         [image],
         {"timeout": 60, "num_retries": 0},

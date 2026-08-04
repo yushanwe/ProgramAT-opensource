@@ -29,7 +29,7 @@ from scripts.benchmark_gemini_video_inputs import generation_config  # noqa: E40
 from scripts.compare_last_hosted_clip import normalize_expected_card, serializable  # noqa: E402
 from scripts.test_nvidia_hosted_video import played_card_prompt  # noqa: E402
 
-MODEL = "gemini-3.1-flash-lite-preview"
+MODEL = "gemini-3.1-flash-lite"
 RUNS = 5
 FRAME_COUNTS = (4, 6, 8)
 REPORT_PATH = BACKEND_DIR / "debug" / "gemini_ordered_image_frame_count_benchmark.json"
