@@ -6565,6 +6565,8 @@ async def handle_update_submit(request: web.Request) -> web.Response:
     try:
         # Reuse the normal update path so Claude is triggered on an associated
         # open PR (when present) instead of starting duplicate issue work.
+        # Note: update_github_issue() already broadcasts issue_updated internally —
+        # do NOT broadcast again here or the client hears "Update sent to issue" twice.
         await update_github_issue(int(issue_number), comment, mention_copilot=True)
 
         def _get_issue_url():
@@ -6575,13 +6577,6 @@ async def handle_update_submit(request: web.Request) -> web.Response:
 
         issue_url = await asyncio.to_thread(_get_issue_url)
         logger.info("Posted comment to issue #%s via /submit-update", issue_number)
-
-        await _broadcast_ws({
-            'type': 'issue_updated',
-            'message': f"Comment added to issue #{issue_number}",
-            'issue_number': int(issue_number),
-            'issue_url': issue_url,
-        })
 
         return web.json_response({
             'status': 'updated',

@@ -135,6 +135,12 @@ function AppContent() {
     });
 
     // Listen for ALL message types from server (centralized handler)
+    // Dedup timestamps: the same handler is registered on both the main WS and the
+    // review WS, so broadcasts that arrive on both connections (e.g. issue_updated)
+    // would otherwise fire TTS twice.
+    let lastIssuedUpdatedTs = 0;
+    let lastIssuedCreatedTs = 0;
+
     const handleMessage = (message: any) => {
       console.log('[App] Received message:', message);
       
@@ -188,6 +194,9 @@ function AppContent() {
         }
       } else if (message.type === 'issue_created') {
         // Clear selection after successful create
+        const now = Date.now();
+        if (now - lastIssuedCreatedTs < 2000) return; // dedup: both WS connections receive the broadcast
+        lastIssuedCreatedTs = now;
         setSelectedPR(null);
         setPRTools([]);
         const feedbackMsg = 'New issue created successfully';
@@ -195,6 +204,9 @@ function AppContent() {
         setSpokenFeedback(feedbackMsg);
       } else if (message.type === 'issue_updated') {
         // Provide feedback for successful update
+        const now = Date.now();
+        if (now - lastIssuedUpdatedTs < 2000) return; // dedup: both WS connections receive the broadcast
+        lastIssuedUpdatedTs = now;
         const feedbackMsg = 'Update sent to issue';
         TextToSpeechService.speakWithInterrupt(feedbackMsg);
         setSpokenFeedback(feedbackMsg);
