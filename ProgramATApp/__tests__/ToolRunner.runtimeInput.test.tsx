@@ -86,9 +86,18 @@ describe('ToolRunner runtime input rendering', () => {
       node => node.props?.placeholder === 'Enter an object, such as a water cup',
     );
     expect(tree!.root.findAllByType('CameraView').length).toBeGreaterThan(0);
+    const lowerScrollWrappers = tree!.root.findAll(
+      node => node.props?.keyboardShouldPersistTaps === 'handled',
+    );
+    expect(lowerScrollWrappers.length).toBeGreaterThan(0);
+    expect(lowerScrollWrappers[0].props.accessible).toBe(false);
     expect(inputs.length).toBeGreaterThan(0);
-    expect(tree!.root.findAllByProps({children: 'Enter'}).length).toBeGreaterThan(0);
-    expect(tree!.root.findAllByProps({children: 'Clear'}).length).toBeGreaterThan(0);
+    expect(
+      tree!.root.findAll(node => node.props?.accessibilityLabel === 'Enter').length,
+    ).toBeGreaterThan(0);
+    expect(
+      tree!.root.findAll(node => node.props?.accessibilityLabel === 'Clear').length,
+    ).toBeGreaterThan(0);
     expect(tree!.root.findAllByProps({children: 'Active target: none'}).length).toBeGreaterThan(0);
     await ReactTestRenderer.act(() => {
       tree!.unmount();
@@ -113,6 +122,11 @@ describe('ToolRunner runtime input rendering', () => {
       node => node.props?.placeholder === 'Enter an object, such as a water cup',
     );
     expect(tree!.root.findAllByType('CameraView').length).toBeGreaterThan(0);
+    const lowerScrollWrappers = tree!.root.findAll(
+      node => node.props?.keyboardShouldPersistTaps === 'handled',
+    );
+    expect(lowerScrollWrappers.length).toBeGreaterThan(0);
+    expect(lowerScrollWrappers[0].props.accessible).toBe(false);
     expect(inputs).toHaveLength(0);
     expect(tree!.root.findAllByProps({children: 'Active target: none'})).toHaveLength(0);
     await ReactTestRenderer.act(() => {
