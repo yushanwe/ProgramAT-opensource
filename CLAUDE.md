@@ -38,7 +38,7 @@ Select from repository-defined model profiles rather than inventing new profile 
 - `yolo`: a local object detector for object presence or localization, not general scene reasoning.
 - `gpt-4o-mini`: a lightweight text model for evaluation or aggregation, not the default vision model.
 
-Select only from the model pool listed in this file and the repository-backed helpers or profiles that implement it. In lifecycle tools, pass the provider model string expected by the helper call, such as `"gemini/gemini-3.1-flash-lite-preview"` or `"gpt-5"`, and keep the choice aligned with the registry-backed intent above.
+Select only from the model pool listed in this file and the repository-backed helpers or profiles that implement it. In lifecycle tools, pass the provider model string expected by the helper call, such as `"gemini/gemini-3.1-flash-lite"` or `"gpt-5"`, and keep the choice aligned with the registry-backed intent above.
 
 Unless the request clearly calls for another listed model, default to Gemini for VLM work. If YOLO alone is not sufficient to solve the task end to end, do not use YOLO as the only model; use Gemini by default unless the user explicitly requests another listed model or the task clearly requires a stronger listed alternative.
 
