@@ -842,11 +842,15 @@ async def _initialize_executable_streaming_tool(
         _generated_input_data(tool.get("input")),
         tool.get("runtime_inputs", {}) or {},
     )
+    parsed_value = None
+    if isinstance(input_data, dict):
+        parsed_value = next(iter((input_data.get('runtime_inputs') or {}).values()), None)
     logger.info(
-        "[Runtime Input Trace] stage=on_stream_start tool=%s keys=%s value_present=%s",
+        "[Runtime Input Trace] stage=on_stream_start tool=%s keys=%s value_present=%s value=%s",
         tool["name"],
         sorted((input_data or {}).keys()) if isinstance(input_data, dict) else [],
         str(bool(tool.get("runtime_inputs"))).lower(),
+        _preview_runtime_value(parsed_value),
     )
     await invoke_tool_hook(
         namespace, "on_stream_start", runtime, input_data
@@ -921,8 +925,11 @@ async def _run_executable_take_photo(
     runtime._frames.add(_tool_frame(1, image, image_base64))
     namespace = _validated_generated_namespace(tool_name, tool_code)
     try:
+        parsed_value = None
+        if isinstance(input_data, dict):
+            parsed_value = next(iter((input_data.get("runtime_inputs") or {}).values()), None)
         logger.info(
-            "[Runtime Input Trace] stage=on_take_photo tool=%s keys=%s value_present=%s",
+            "[Runtime Input Trace] stage=on_take_photo tool=%s keys=%s value_present=%s value=%s",
             tool_name,
             sorted(input_data.keys()) if isinstance(input_data, dict) else [],
             str(
@@ -931,6 +938,7 @@ async def _run_executable_take_photo(
                     and input_data.get("runtime_inputs")
                 )
             ).lower(),
+            _preview_runtime_value(parsed_value),
         )
         result = await invoke_tool_hook(
             namespace, "on_take_photo", runtime, image, input_data
@@ -2262,6 +2270,54 @@ def _take_photo_tool_prompt(tool_name: str, tool_code: str) -> str:
 _RUNTIME_INPUT_MAX_LENGTH = 200
 
 
+def _preview_runtime_value(value: Any, limit: int = 80) -> str:
+    if not isinstance(value, str):
+        return 'none'
+    normalized = " ".join(value.split()).strip()
+    if not normalized:
+        return 'none'
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + '...'
+
+
+def _log_runtime_prompt_trace(
+    stage: str,
+    tool_name: str,
+    prompt: str,
+    runtime_inputs: Optional[Dict[str, str]] = None,
+    runtime_input_definition: Optional[Dict[str, str]] = None,
+) -> None:
+    runtime_key = (
+        runtime_input_definition.get('key')
+        if isinstance(runtime_input_definition, dict)
+        else None
+    )
+    runtime_value = (
+        runtime_inputs.get(runtime_key)
+        if runtime_key and isinstance(runtime_inputs, dict)
+        else None
+    )
+    runtime_instruction_present = False
+    if runtime_key and runtime_value and runtime_input_definition:
+        expected_instruction = runtime_input_definition['prompt_instruction'].replace(
+            '{value}', runtime_value
+        )
+        runtime_instruction_present = expected_instruction in prompt
+    logger.info(
+        "[Runtime Input Prompt] stage=%s tool=%s runtime_key=%s runtime_value=%s "
+        "value_present=%s prompt_length=%s runtime_instruction_present=%s prompt_preview=%s",
+        stage,
+        tool_name,
+        runtime_key or 'none',
+        _preview_runtime_value(runtime_value),
+        str(bool(runtime_value)).lower(),
+        len(prompt or ''),
+        str(runtime_instruction_present).lower(),
+        json.dumps((prompt or '')[:240], ensure_ascii=False),
+    )
+
+
 def _sanitize_runtime_input_definition(raw: Any) -> Optional[Dict[str, str]]:
     if not isinstance(raw, dict):
         return None
@@ -2321,13 +2377,35 @@ def _effective_tool_prompt(
         runtime_inputs, runtime_input_definition
     )
     if not runtime_input_definition or not sanitized_runtime_inputs:
+        _log_runtime_prompt_trace(
+            'effective_prompt',
+            tool_name,
+            prompt,
+            sanitized_runtime_inputs,
+            runtime_input_definition,
+        )
         return prompt
     declared_key = runtime_input_definition['key']
     value = sanitized_runtime_inputs.get(declared_key)
     if not value:
+        _log_runtime_prompt_trace(
+            'effective_prompt',
+            tool_name,
+            prompt,
+            sanitized_runtime_inputs,
+            runtime_input_definition,
+        )
         return prompt
     instruction = runtime_input_definition['prompt_instruction'].replace('{value}', value)
-    return f"{prompt}\n\n{instruction}"
+    effective_prompt = f"{prompt}\n\n{instruction}"
+    _log_runtime_prompt_trace(
+        'effective_prompt',
+        tool_name,
+        effective_prompt,
+        sanitized_runtime_inputs,
+        runtime_input_definition,
+    )
+    return effective_prompt
 
 
 def _tool_runtime_input_metadata(tool_code: str) -> Optional[Dict[str, str]]:
@@ -2349,11 +2427,13 @@ def _parse_runtime_inputs_from_request(
         data.get('runtime_inputs'),
         _tool_runtime_input_definition(tool_code),
     )
+    preview_value = next(iter(parsed.values()), None) if parsed else None
     logger.info(
-        "[Runtime Input Trace] stage=backend_parse tool=%s keys=%s value_present=%s",
+        "[Runtime Input Trace] stage=backend_parse tool=%s keys=%s value_present=%s value=%s",
         data.get('tool_name', 'unknown'),
         sorted(parsed.keys()),
         str(bool(parsed)).lower(),
+        _preview_runtime_value(preview_value),
     )
     return parsed
 
@@ -2421,9 +2501,13 @@ def _with_runtime_inputs(input_data: Any, runtime_inputs: Dict[str, str]) -> Any
         merged.update(runtime_inputs)
         merged['runtime_inputs'] = dict(runtime_inputs)
         logger.info(
-            "[Runtime Input Trace] stage=generated_handler_merge shape=dict keys=%s runtime_keys=%s",
+            "[Runtime Input Trace] stage=generated_handler_merge shape=dict keys=%s runtime_keys=%s runtime_values=%s",
             sorted(merged.keys()),
             sorted(runtime_inputs.keys()),
+            json.dumps(
+                {key: _preview_runtime_value(value) for key, value in runtime_inputs.items()},
+                ensure_ascii=False,
+            ),
         )
         return merged
     merged = {
@@ -2432,8 +2516,12 @@ def _with_runtime_inputs(input_data: Any, runtime_inputs: Dict[str, str]) -> Any
         'runtime_inputs': dict(runtime_inputs),
     }
     logger.info(
-        "[Runtime Input Trace] stage=generated_handler_merge shape=wrapped runtime_keys=%s",
+        "[Runtime Input Trace] stage=generated_handler_merge shape=wrapped runtime_keys=%s runtime_values=%s",
         sorted(runtime_inputs.keys()),
+        json.dumps(
+            {key: _preview_runtime_value(value) for key, value in runtime_inputs.items()},
+            ensure_ascii=False,
+        ),
     )
     return merged
 
