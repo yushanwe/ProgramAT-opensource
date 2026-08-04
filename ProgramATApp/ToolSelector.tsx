@@ -11,7 +11,6 @@ import {
   View,
   ScrollView,
   AccessibilityInfo,
-  findNodeHandle,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Config from './config';
@@ -51,19 +50,12 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
   const [loading, setLoading] = useState(true);
   const [expectingNewTools, setExpectingNewTools] = useState(false);
   const [loadingStartTime, setLoadingStartTime] = useState<number>(0); // Track when loading started
-  const headerRef = useRef<Text>(null);
-
   console.log('[ToolSelector] Rendered - productionMode:', productionMode, 'issueTools:', issueTools.length);
 
-  // Set accessibility focus to header when component mounts
+  // Announce the screen title when entering the tool selector.
   useEffect(() => {
     const timeout = setTimeout(() => {
-      if (headerRef.current) {
-        const reactTag = findNodeHandle(headerRef.current);
-        if (reactTag) {
-          AccessibilityInfo.setAccessibilityFocus(reactTag);
-        }
-      }
+      AccessibilityInfo.announceForAccessibility('Tools');
     }, 100); // Small delay to ensure component is rendered
     
     return () => clearTimeout(timeout);
@@ -189,7 +181,6 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     <SafeAreaView style={[styles.container, { backgroundColor: theme.backgroundSecondary }]} edges={[]} accessible={false}>
       <View style={[styles.header, { backgroundColor: theme.background, borderBottomColor: theme.border }]} accessible={false}>
         <Text 
-          ref={headerRef}
           style={[styles.headerText, { color: theme.text }]}
           accessible={true}
           accessibilityRole="header"
