@@ -14,6 +14,8 @@ import {
   Platform,
   AccessibilityInfo,
   useWindowDimensions,
+  findNodeHandle,
+  NativeModules,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -38,12 +40,23 @@ import {
   normalizeRuntimeInputValue,
   RuntimeInputDefinition,
 } from './runtimeInput';
+import { isRecordSessionArmed } from './Settings';
 
 // Configuration for text similarity filtering
 const SIMILARITY_THRESHOLDS = {
-  STREAMING: 0.8,   // 80% similarity threshold for streaming updates 
-  CONSERVATIVE: 0.95, // 95% for very chatty streams  
+  STREAMING: 0.8,   // 80% similarity threshold for streaming updates
+  CONSERVATIVE: 0.95, // 95% for very chatty streams
   AGGRESSIVE: 0.75,   // 75% for fewer updates
+};
+
+const TAKE_PHOTO_RECORDING_DURATION_MS = 30000;
+
+const { ScreenRecordingModule } = NativeModules as {
+  ScreenRecordingModule?: {
+    startScreenRecording?: () => Promise<boolean>;
+    stopScreenRecordingAndSave?: () => Promise<boolean>;
+    isScreenRecordingActive?: () => Promise<boolean>;
+  };
 };
 
 interface Tool {
@@ -85,6 +98,11 @@ export default function ToolRunner({
   const [isStreaming, setIsStreaming] = useState(false);
   const [, setIsStreamProcessing] = useState(false);
   const isStreamingRef = useRef(false); // Ref to avoid stale closures in cleanup effects
+  const wasStreamingRef = useRef(false); // Tracks isStreaming transitions for screen-recording stop
+  const [recordSessionArmed, setRecordSessionArmed] = useState(false); // "Record this usage session" — set in Settings
+  const [isRecordingScreen, setIsRecordingScreen] = useState(false);
+  const isRecordingScreenRef = useRef(false);
+  const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Take Photo's 30s auto-stop
   const [audioEnabled, setAudioEnabled] = useState(true); // Toggle audio output
   const [conversationMode, setConversationMode] = useState(false); // Toggle conversation mode
   const conversationModeRef = useRef(false); // Ref to track conversation mode for WebSocket handler
@@ -129,6 +147,40 @@ export default function ToolRunner({
       } visible=${visible ? 'true' : 'false'}`,
     );
   }, [selectedTool?.name, selectedTool?.path, selectedTool?.runtime_input]);
+  // Load the "Record this usage session" setting from Settings. Re-checked
+  // whenever this tab becomes active so a change made in Settings while this
+  // screen was backgrounded takes effect without an app restart.
+  useEffect(() => {
+    if (isActive) {
+      isRecordSessionArmed().then(setRecordSessionArmed).catch(() => setRecordSessionArmed(false));
+    }
+  }, [isActive]);
+
+  // Keep isRecordingScreenRef in sync with isRecordingScreen state
+  useEffect(() => {
+    isRecordingScreenRef.current = isRecordingScreen;
+  }, [isRecordingScreen]);
+
+  // Stop any in-flight screen recording whenever streaming ends, regardless
+  // of which code path (manual stop, WS error, tab-inactive, unmount) flipped
+  // isStreaming to false.
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) {
+      stopScreenRecordingIfActive();
+    }
+    wasStreamingRef.current = isStreaming;
+  }, [isStreaming]);
+
+  // Clear the Take Photo recording timer on unmount so it never fires after
+  // the component is gone.
+  useEffect(() => {
+    return () => {
+      if (recordingTimeoutRef.current) {
+        clearTimeout(recordingTimeoutRef.current);
+        recordingTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   // Voice event listeners for follow-up speech-to-text
   useEffect(() => {
@@ -996,8 +1048,103 @@ export default function ToolRunner({
     };
   }, []);
 
+  // Speaks a failure both through VoiceOver and audio output, since a blind
+  // user cannot see a silently failed recording indicator.
+  const announceRecordingFailure = (text: string) => {
+    AccessibilityInfo.announceForAccessibility(text);
+    AudioOutputService.play({
+      type: 'error' as any,
+      text,
+      interrupt: false,
+    });
+  };
+
+  const announceRecordingSuccess = (text: string) => {
+    AccessibilityInfo.announceForAccessibility(text);
+    AudioOutputService.play({
+      type: 'success' as any,
+      text,
+      interrupt: false,
+    });
+  };
+
+  const startScreenRecordingIfArmed = async () => {
+    if (!recordSessionArmed || isRecordingScreenRef.current) {
+      return;
+    }
+    try {
+      await ScreenRecordingModule?.startScreenRecording?.();
+      setIsRecordingScreen(true);
+      isRecordingScreenRef.current = true;
+      AccessibilityInfo.announceForAccessibility('Recording started');
+    } catch (error: any) {
+      console.error('[ToolRunner] Failed to start screen recording:', error);
+      const code = error?.code;
+      if (code === 'already_recording') {
+        return;
+      }
+      const message =
+        code === 'recording_permission_denied'
+          ? 'Screen recording or microphone permission was denied. This session will not be recorded.'
+          : code === 'recorder_unavailable'
+          ? 'Screen recording is not available on this device.'
+          : 'Could not start screen recording.';
+      announceRecordingFailure(message);
+    }
+  };
+
+  const stopScreenRecordingIfActive = async () => {
+    if (!isRecordingScreenRef.current) {
+      return;
+    }
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    setIsRecordingScreen(false);
+    isRecordingScreenRef.current = false;
+    try {
+      await ScreenRecordingModule?.stopScreenRecordingAndSave?.();
+      announceRecordingSuccess('Recording saved to Photos');
+    } catch (error: any) {
+      console.error('[ToolRunner] Failed to stop/save screen recording:', error);
+      const code = error?.code;
+      if (code === 'not_recording') {
+        return;
+      }
+      const message =
+        code === 'photos_permission_denied'
+          ? 'Recording finished but could not be saved. Photos access was denied.'
+          : 'Recording finished but could not be saved.';
+      announceRecordingFailure(message);
+    }
+  };
+
+  const armTakePhotoRecordingIfNeeded = () => {
+    if (!recordSessionArmed) {
+      return;
+    }
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    if (!isRecordingScreenRef.current) {
+      startScreenRecordingIfArmed();
+    }
+    recordingTimeoutRef.current = setTimeout(() => {
+      recordingTimeoutRef.current = null;
+      // If streaming has taken over this recording in the meantime, let the
+      // isStreaming transition effect own stopping it instead.
+      if (!isStreamingRef.current) {
+        stopScreenRecordingIfActive();
+      }
+    }, TAKE_PHOTO_RECORDING_DURATION_MS);
+  };
+
   const handleRunTool = async (isConversation: boolean = false) => {
     if (!selectedTool) return;
+
+    armTakePhotoRecordingIfNeeded();
 
     console.log('[ToolRunner] Starting tool execution, isConversation:', isConversation);
     console.log('[ToolRunner] Tool:', selectedTool.name);
@@ -1132,7 +1279,10 @@ export default function ToolRunner({
     } else {
       console.warn('[ToolRunner] Camera ref not available');
     }
-    
+
+    // Fire-and-forget: streaming must not wait on the OS recording permission dialog.
+    startScreenRecordingIfArmed();
+
     // Start a fresh session optimistically for immediate UI feedback.
     isStreamingRef.current = true;
     setIsStreaming(true);

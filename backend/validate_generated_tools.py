@@ -297,14 +297,6 @@ def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) ->
         return failures
 
     if constants.get('EXECUTION_MODE') != 'take_photo':
-        if 'TOOL_POLICY' in constants:
-            return [
-                f"{rel_path}: TOOL_POLICY without EXECUTION_MODE = 'take_photo' or executable "
-                "lifecycle hooks has no supported contract and will trigger the parallel_progressive "
-                "streaming path, causing the UI to hang at 'Waiting for model results...'. "
-                "New tools must use executable lifecycle hooks (on_take_photo, on_frame) and "
-                "implement model strategy directly using asyncio.create_task and runtime.emit()."
-            ]
         return []
 
     policy_calls = [

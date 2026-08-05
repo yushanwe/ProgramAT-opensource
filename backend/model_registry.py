@@ -52,14 +52,14 @@ MODEL_REGISTRY = {
     "gpt-4o-mini": {
         "provider_model": "openai/gpt-4o-mini",
         "executor": "model",
-        "supported_input_types": ["text"],
+        "supported_input_types": ["text"],  # text-only: do NOT use for visual tool calls
         "supported_capabilities": ["text_evaluation", "result_aggregation", "lightweight_reasoning"],
         "relative_latency": "low",
         "relative_accuracy": "medium",
         "cost": "low",
         "strengths": "Fast text evaluation and lightweight result aggregation.",
-        "limitations": "Not the default vision model.",
-        "recommended_use_cases": ["Evaluating or aggregating candidate results."],
+        "limitations": "Text-only — no image support. Not for use in visual assistive tools.",
+        "recommended_use_cases": ["Evaluating or aggregating candidate results (text only)."],
     },
 }
 
@@ -70,3 +70,7 @@ DEFAULT_TAKE_PHOTO_POLICY = {
 
 # Infrastructure calls are deliberately separate from generated visual tool policies.
 SYSTEM_MODEL = "groq/llama-3.1-8b-instant"
+
+# Transcript parsing uses Gemini instead of the Groq system model; ideation
+# questions and summaries still use SYSTEM_MODEL.
+TRANSCRIPT_MODEL = "gemini/gemini-3.1-flash-lite"

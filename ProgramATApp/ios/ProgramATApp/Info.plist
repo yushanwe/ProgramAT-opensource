@@ -10,7 +10,10 @@
 	<string>en</string>
 
 	<key>CFBundleDisplayName</key>
-	<string>ProgramATApp</string>
+	<string>Program A T</string>
+
+	<key>CFBundleSpokenName</key>
+	<string>Program A T</string>
 
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
@@ -81,6 +84,14 @@
 		<false/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>34.162.254.126</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
 	</dict>
 
 	<key>NSLocationWhenInUseUsageDescription</key>
