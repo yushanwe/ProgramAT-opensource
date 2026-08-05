@@ -14,6 +14,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import TabNavigator from './TabNavigator';
 import WebSocketService from './WebSocketService';
+import { DEFAULT_SERVER_URL } from './config';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
 import { ThemeProvider, useTheme } from './ThemeContext';
@@ -308,17 +309,15 @@ function AppContent() {
       try {
         const savedCode = await AsyncStorage.getItem(SERVER_URL_KEY);
         console.log('[App] AsyncStorage returned server URL:', savedCode);
-        
+
         if (savedCode && savedCode.trim()) {
           console.log('[App] Found saved server URL:', savedCode);
           WebSocketService.setServerUrl(savedCode.trim(), false);
-          setServerConfigured(true);
         } else {
-          console.log('[App] No server URL configured — skipping connect');
-          setServerConfigured(false);
-          setIsConnecting(false);
-          return;
+          console.log('[App] No server URL configured — falling back to default:', DEFAULT_SERVER_URL);
+          WebSocketService.setServerUrl(DEFAULT_SERVER_URL, false);
         }
+        setServerConfigured(true);
       } catch (storageError) {
         console.error('[App] Error loading saved server code:', storageError);
       }

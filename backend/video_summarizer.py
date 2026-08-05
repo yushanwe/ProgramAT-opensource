@@ -44,6 +44,14 @@ PROMPT = (
     "If the user specifies a particular relationship between an action they take/a thing that comes onscreen and an output produced, include that relationship in your description"
     "Conclude with a sentence summarizing the key functionality and behavior of the desired tool"
 )
+ITERATION_PROMPT = (
+    "This video shows a case of an existing tool for visual assistance recently running, not a hypothetical example. "
+    "Summarize what is happening in this video, including any relevant audio context, so it can be used to contextualize a request to iterate on or change this tool. "
+    "Describe what the tool actually did, and any behavior the user reacted to or commented on, so its relevance to the requested change is clear. "
+    "In the event the user is describing a hypothetical scenario/pretending with things in their environment, your description should match what they are pretending things are, not the actual item in the mock up. "
+    "If the user specifies a particular relationship between an action they take/a thing that comes onscreen and an output produced, include that relationship in your description. "
+    "Conclude with a sentence summarizing what the tool did during this run and how it relates to the requested iteration."
+)
 POLL_INTERVAL = 2.0   # seconds between file-state checks
 POLL_TIMEOUT  = 120.0  # max seconds to wait for file to become ACTIVE
 _video_inference_client = None
@@ -181,7 +189,7 @@ async def infer_mp4_with_gemini(path: Path, prompt: str, model: str):
                 logger.warning("Could not delete Gemini temporary file %s: %s", uploaded.name, exc)
 
 
-async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
+async def _summarize_via_gcs(path: Path, mime_type: str, loop, prompt: str = PROMPT) -> str:
     """
     Upload video to GCS and summarize via Vertex AI using a gs:// URI.
     Reads BUCKET_NAME and PROJECT_ID from env. Deletes the GCS object after use.
@@ -225,7 +233,7 @@ async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
             part = types.Part.from_uri(file_uri=gs_uri, mime_type=mime_type)
             return client.models.generate_content(
                 model=MODEL,
-                contents=[part, PROMPT],
+                contents=[part, prompt],
             )
 
         response = await _with_retry(_generate)
@@ -252,7 +260,7 @@ async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
             logger.warning("Could not delete GCS object: %s", gs_uri, exc_info=True)
 
 
-async def summarize_video(video_path: str) -> str:
+async def summarize_video(video_path: str, prompt: str = PROMPT) -> str:
     """
     Summarize a local video file using Gemini.
 
@@ -305,7 +313,7 @@ async def summarize_video(video_path: str) -> str:
             response = await _with_retry(
                 client.models.generate_content,
                 model=MODEL,
-                contents=[uploaded_file, PROMPT],
+                contents=[uploaded_file, prompt],
             )
 
             summary = (response.text or "").strip()
@@ -326,4 +334,4 @@ async def summarize_video(video_path: str) -> str:
 
     # --- Fallback: GCS + Vertex AI ---
     logger.info("Attempting GCS fallback for video summarization")
-    return await _summarize_via_gcs(path, mime_type, loop)
+    return await _summarize_via_gcs(path, mime_type, loop, prompt)

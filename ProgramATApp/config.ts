@@ -26,16 +26,20 @@ export const SERVER_CONFIGS: Record<string, { url: string; name: string }> = {
   // Example: 'mysecret123': { url: 'ws://10.0.0.1:8081', name: 'Dev Server' },
 };
 
+// Fallback server used when the user has not entered a server address in
+// Settings — lets the app connect out of the box with no configuration.
+export const DEFAULT_SERVER_URL = 'ws://34.162.254.126:8081';
+
 export const Config = {
   // Application Mode
   // 'development': Full features including Issues tab, PR selection, GitHub integration
   // 'production': Simplified mode - only pulls tools from main branch, no Issues tab
   APP_MODE: 'development' as AppMode, // Change to 'production' for production deployment
-  
+
   // Default WebSocket server URL
-  // Set at runtime from AsyncStorage (entered by user in Settings).
-  // Empty string means no server configured yet.
-  WEBSOCKET_SERVER_URL: '',
+  // Set at runtime from AsyncStorage (entered by user in Settings), falling
+  // back to DEFAULT_SERVER_URL when nothing has been configured.
+  WEBSOCKET_SERVER_URL: DEFAULT_SERVER_URL,
 
   // General/review server URL — used in review mode for tool execution and PR fetching.
   // This is the shared server that hosts the tools being reviewed.
