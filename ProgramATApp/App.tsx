@@ -6,7 +6,7 @@
  */
 //import packages
 import React, { useEffect, useState, useCallback } from 'react';
-import { StatusBar, StyleSheet, useColorScheme, View, Text, TouchableOpacity, LogBox } from 'react-native';
+import { StatusBar, StyleSheet, useColorScheme, View, Text, LogBox } from 'react-native';
 import {
   SafeAreaProvider,
   useSafeAreaInsets,
@@ -377,40 +377,6 @@ function AppContent() {
           </Text>
         </View>
       )}
-      
-      {/* PR Mode Indicator */}
-      {selectedPR && (
-        <View 
-          style={[styles.issueModeBar, { backgroundColor: theme.primaryDark + '20', borderBottomColor: theme.primary }]}
-          accessible={false}>
-          <Text 
-            style={[styles.issueModeText, { color: theme.primary }]}
-            accessible={true}
-            accessibilityRole="text"
-            accessibilityLabel={selectedPR.number === 0 
-              ? 'Current mode: Running from main branch' 
-              : `Current mode: Updating PR ${selectedPR.number}: ${selectedPR.title}`}
-            accessibilityLiveRegion="polite">
-            {selectedPR.number === 0 
-              ? 'Mode: Running from main' 
-              : `Mode: Updating #${selectedPR.number} - ${selectedPR.title}`}
-          </Text>
-          <TouchableOpacity
-            style={[styles.newIssueButton, { backgroundColor: theme.success }]}
-            onPress={handleNewIssue}
-            accessible={true}
-            accessibilityRole="button"
-            accessibilityLabel="Switch to create new issue mode"
-            accessibilityHint="Double tap to stop updating the current issue and switch to creating a new issue">
-            <Text 
-              style={styles.newIssueButtonText}
-              accessible={false}
-              importantForAccessibility="no-hide-descendants">
-              New Issue
-            </Text>
-          </TouchableOpacity>
-        </View>
-      )}
 
       {/* Tab Navigator */}
       <TabNavigator 
@@ -432,30 +398,6 @@ function AppContent() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-  },
-  issueModeBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-  },
-  issueModeText: {
-    fontSize: 13,
-    fontWeight: '500',
-    flex: 1,
-    marginRight: 8,
-  },
-  newIssueButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderRadius: 4,
-  },
-  newIssueButtonText: {
-    color: '#fff',
-    fontSize: 12,
-    fontWeight: '600',
   },
   setupBanner: {
     paddingHorizontal: 16,

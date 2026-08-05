@@ -839,8 +839,22 @@ async def _initialize_executable_streaming_tool(
         "generated_tasks": set(),
         "generated_frame_sequence": 0,
     })
+    input_data = _with_runtime_inputs(
+        _generated_input_data(tool.get("input")),
+        tool.get("runtime_inputs", {}) or {},
+    )
+    parsed_value = None
+    if isinstance(input_data, dict):
+        parsed_value = next(iter((input_data.get('runtime_inputs') or {}).values()), None)
+    logger.info(
+        "[Runtime Input Trace] stage=on_stream_start tool=%s keys=%s value_present=%s value=%s",
+        tool["name"],
+        sorted((input_data or {}).keys()) if isinstance(input_data, dict) else [],
+        str(bool(tool.get("runtime_inputs"))).lower(),
+        _preview_runtime_value(parsed_value),
+    )
     await invoke_tool_hook(
-        namespace, "on_stream_start", runtime, _generated_input_data(tool.get("input"))
+        namespace, "on_stream_start", runtime, input_data
     )
 
 
@@ -912,6 +926,21 @@ async def _run_executable_take_photo(
     runtime._frames.add(_tool_frame(1, image, image_base64))
     namespace = _validated_generated_namespace(tool_name, tool_code)
     try:
+        parsed_value = None
+        if isinstance(input_data, dict):
+            parsed_value = next(iter((input_data.get("runtime_inputs") or {}).values()), None)
+        logger.info(
+            "[Runtime Input Trace] stage=on_take_photo tool=%s keys=%s value_present=%s value=%s",
+            tool_name,
+            sorted(input_data.keys()) if isinstance(input_data, dict) else [],
+            str(
+                bool(
+                    isinstance(input_data, dict)
+                    and input_data.get("runtime_inputs")
+                )
+            ).lower(),
+            _preview_runtime_value(parsed_value),
+        )
         result = await invoke_tool_hook(
             namespace, "on_take_photo", runtime, image, input_data
         )
@@ -957,7 +986,7 @@ NVIDIA_VIDEO_MODEL = os.getenv('NVIDIA_VIDEO_MODEL', NVIDIA_HOSTED_MODEL).strip(
 NVIDIA_VIDEO_INPUT_MODE = os.getenv('NVIDIA_VIDEO_INPUT_MODE', 'base64').strip().lower()
 VIDEO_VLM_PROVIDER = os.getenv('VIDEO_VLM_PROVIDER', 'nvidia').strip().lower()
 VIDEO_GEMINI_MODEL = os.getenv(
-    'VIDEO_GEMINI_MODEL', 'gemini-3.1-flash-lite-preview'
+    'VIDEO_GEMINI_MODEL', 'gemini-3.1-flash-lite'
 ).strip().removeprefix('gemini/')
 HOSTED_VIDEO_WINDOW_SECONDS = float(os.getenv('HOSTED_VIDEO_WINDOW_SECONDS', '6'))
 HOSTED_VIDEO_INTERVAL_SECONDS = float(os.getenv('HOSTED_VIDEO_INTERVAL_SECONDS', '3'))
@@ -2229,22 +2258,273 @@ def _log_final_tool_response(_tool_name: str, response_data: Dict[str, Any]) -> 
 
 def _take_photo_tool_prompt(tool_name: str, tool_code: str) -> str:
     """Read the Copilot-authored TOOL_PROMPT without executing generated tool code."""
-    try:
-        tree = ast.parse(tool_code or '')
-        for node in tree.body:
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(target, ast.Name) and target.id == 'TOOL_PROMPT' for target in targets):
-                value = ast.literal_eval(node.value)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-    except (SyntaxError, ValueError, TypeError):
-        logger.debug("Could not extract TOOL_PROMPT from %s", tool_name, exc_info=True)
+    prompt = _literal_tool_metadata(tool_code, 'TOOL_PROMPT')
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+    logger.debug("Could not extract TOOL_PROMPT from %s", tool_name, exc_info=True)
     raise ValueError(
         f"Take-photo tool {tool_name!r} has no string TOOL_PROMPT; regenerate the tool "
         "with the unified take-photo contract."
     )
+
+
+_RUNTIME_INPUT_MAX_LENGTH = 200
+
+
+def _preview_runtime_value(value: Any, limit: int = 80) -> str:
+    if not isinstance(value, str):
+        return 'none'
+    normalized = " ".join(value.split()).strip()
+    if not normalized:
+        return 'none'
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + '...'
+
+
+def _log_runtime_prompt_trace(
+    stage: str,
+    tool_name: str,
+    prompt: str,
+    runtime_inputs: Optional[Dict[str, str]] = None,
+    runtime_input_definition: Optional[Dict[str, str]] = None,
+) -> None:
+    runtime_key = (
+        runtime_input_definition.get('key')
+        if isinstance(runtime_input_definition, dict)
+        else None
+    )
+    runtime_value = (
+        runtime_inputs.get(runtime_key)
+        if runtime_key and isinstance(runtime_inputs, dict)
+        else None
+    )
+    runtime_instruction_present = False
+    if runtime_key and runtime_value and runtime_input_definition:
+        expected_instruction = runtime_input_definition['prompt_instruction'].replace(
+            '{value}', runtime_value
+        )
+        runtime_instruction_present = expected_instruction in prompt
+    logger.info(
+        "[Runtime Input Prompt] stage=%s tool=%s runtime_key=%s runtime_value=%s "
+        "value_present=%s prompt_length=%s runtime_instruction_present=%s prompt_preview=%s",
+        stage,
+        tool_name,
+        runtime_key or 'none',
+        _preview_runtime_value(runtime_value),
+        str(bool(runtime_value)).lower(),
+        len(prompt or ''),
+        str(runtime_instruction_present).lower(),
+        json.dumps((prompt or '')[:240], ensure_ascii=False),
+    )
+
+
+def _sanitize_runtime_input_definition(raw: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(raw, dict):
+        return None
+    required_fields = (
+        'key',
+        'label',
+        'placeholder',
+        'prompt_instruction',
+    )
+    normalized: Dict[str, str] = {}
+    for field in required_fields:
+        value = raw.get(field)
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        normalized[field] = stripped
+    if '{value}' not in normalized['prompt_instruction']:
+        return None
+    return normalized
+
+
+def _tool_runtime_input_definition(tool_code: str) -> Optional[Dict[str, str]]:
+    for metadata_name in ('TOOL_RUNTIME_INPUT', 'runtime_input', 'RUNTIME_INPUT'):
+        normalized = _sanitize_runtime_input_definition(
+            _literal_tool_metadata(tool_code, metadata_name)
+        )
+        if normalized:
+            return normalized
+    return None
+
+
+def _sanitize_runtime_inputs(
+    runtime_inputs: Any, runtime_input_definition: Optional[Dict[str, str]]
+) -> Dict[str, str]:
+    if not runtime_input_definition or not isinstance(runtime_inputs, dict):
+        return {}
+    declared_key = runtime_input_definition['key']
+    raw_value = runtime_inputs.get(declared_key)
+    if not isinstance(raw_value, str):
+        return {}
+    normalized = " ".join(raw_value.split()).strip()
+    if not normalized or len(normalized) > _RUNTIME_INPUT_MAX_LENGTH:
+        return {}
+    return {declared_key: normalized}
+
+
+def _effective_tool_prompt(
+    tool_name: str,
+    tool_code: str,
+    runtime_inputs: Any = None,
+) -> str:
+    prompt = _take_photo_tool_prompt(tool_name, tool_code)
+    runtime_input_definition = _tool_runtime_input_definition(tool_code)
+    sanitized_runtime_inputs = _sanitize_runtime_inputs(
+        runtime_inputs, runtime_input_definition
+    )
+    if not runtime_input_definition or not sanitized_runtime_inputs:
+        _log_runtime_prompt_trace(
+            'effective_prompt',
+            tool_name,
+            prompt,
+            sanitized_runtime_inputs,
+            runtime_input_definition,
+        )
+        return prompt
+    declared_key = runtime_input_definition['key']
+    value = sanitized_runtime_inputs.get(declared_key)
+    if not value:
+        _log_runtime_prompt_trace(
+            'effective_prompt',
+            tool_name,
+            prompt,
+            sanitized_runtime_inputs,
+            runtime_input_definition,
+        )
+        return prompt
+    instruction = runtime_input_definition['prompt_instruction'].replace('{value}', value)
+    effective_prompt = f"{prompt}\n\n{instruction}"
+    _log_runtime_prompt_trace(
+        'effective_prompt',
+        tool_name,
+        effective_prompt,
+        sanitized_runtime_inputs,
+        runtime_input_definition,
+    )
+    return effective_prompt
+
+
+def _tool_runtime_input_metadata(tool_code: str) -> Optional[Dict[str, str]]:
+    definition = _tool_runtime_input_definition(tool_code)
+    if not definition:
+        return None
+    return {
+        'key': definition['key'],
+        'label': definition['label'],
+        'placeholder': definition['placeholder'],
+        'prompt_instruction': definition['prompt_instruction'],
+    }
+
+
+def _parse_runtime_inputs_from_request(
+    data: Dict[str, Any], tool_code: str
+) -> Dict[str, str]:
+    parsed = _sanitize_runtime_inputs(
+        data.get('runtime_inputs'),
+        _tool_runtime_input_definition(tool_code),
+    )
+    preview_value = next(iter(parsed.values()), None) if parsed else None
+    logger.info(
+        "[Runtime Input Trace] stage=backend_parse tool=%s keys=%s value_present=%s value=%s",
+        data.get('tool_name', 'unknown'),
+        sorted(parsed.keys()),
+        str(bool(parsed)).lower(),
+        _preview_runtime_value(preview_value),
+    )
+    return parsed
+
+
+def _inject_runtime_input_metadata(tool_record: Dict[str, Any]) -> Dict[str, Any]:
+    code = tool_record.get('code')
+    if not isinstance(code, str) or not code.strip():
+        return tool_record
+    runtime_input = _tool_runtime_input_metadata(code)
+    if not runtime_input:
+        return tool_record
+    enriched = dict(tool_record)
+    enriched['runtime_input'] = runtime_input
+    return enriched
+
+
+def _log_runtime_input_tool_metadata(source: str, tool_record: Dict[str, Any]) -> None:
+    tool_id = str(
+        tool_record.get('path')
+        or tool_record.get('name')
+        or 'unknown'
+    )
+    enabled = isinstance(tool_record.get('runtime_input'), dict)
+    metadata = tool_record.get('runtime_input') if enabled else 'none'
+    logger.info(
+        "[Runtime Input] source=%s tool=%s enabled=%s",
+        source,
+        tool_id,
+        str(enabled).lower(),
+    )
+    logger.info(
+        "[Runtime Input Metadata] tool=%s metadata=%s",
+        tool_id,
+        json.dumps(metadata, ensure_ascii=False) if enabled else 'none',
+    )
+
+
+def _log_runtime_input_tool_source(
+    tool_record: Dict[str, Any],
+    source_mode: str,
+    repo_name: str,
+    branch_name: str = '',
+    pr_number: Optional[int] = None,
+    commit_sha: str = '',
+) -> None:
+    tool_id = str(tool_record.get('path') or tool_record.get('name') or 'unknown')
+    declared = isinstance(tool_record.get('runtime_input'), dict)
+    logger.info(
+        "[Runtime Input Source] tool=%s source=%s repo=%s branch=%s pr=%s sha=%s declared=%s",
+        tool_id,
+        source_mode,
+        repo_name or 'unknown',
+        branch_name or '',
+        '' if pr_number is None else str(pr_number),
+        commit_sha or '',
+        str(declared).lower(),
+    )
+
+
+def _with_runtime_inputs(input_data: Any, runtime_inputs: Dict[str, str]) -> Any:
+    if not runtime_inputs:
+        return input_data
+    if isinstance(input_data, dict):
+        merged = dict(input_data)
+        merged.update(runtime_inputs)
+        merged['runtime_inputs'] = dict(runtime_inputs)
+        logger.info(
+            "[Runtime Input Trace] stage=generated_handler_merge shape=dict keys=%s runtime_keys=%s runtime_values=%s",
+            sorted(merged.keys()),
+            sorted(runtime_inputs.keys()),
+            json.dumps(
+                {key: _preview_runtime_value(value) for key, value in runtime_inputs.items()},
+                ensure_ascii=False,
+            ),
+        )
+        return merged
+    merged = {
+        'value': input_data,
+        **dict(runtime_inputs),
+        'runtime_inputs': dict(runtime_inputs),
+    }
+    logger.info(
+        "[Runtime Input Trace] stage=generated_handler_merge shape=wrapped runtime_keys=%s runtime_values=%s",
+        sorted(runtime_inputs.keys()),
+        json.dumps(
+            {key: _preview_runtime_value(value) for key, value in runtime_inputs.items()},
+            ensure_ascii=False,
+        ),
+    )
+    return merged
 
 
 def _run_take_photo_vlm(
@@ -2253,9 +2533,10 @@ def _run_take_photo_vlm(
     image,
     mode: str = 'take-photo',
     request_id: Optional[str] = None,
+    runtime_inputs: Any = None,
 ) -> str:
     """Execute the fused prompt through the shared structured policy executor."""
-    prompt = _take_photo_tool_prompt(tool_name, tool_code)
+    prompt = _effective_tool_prompt(tool_name, tool_code, runtime_inputs)
     policy = _take_photo_tool_policy(tool_code)
     logger.info(
         "[Tool Policy] mode=%s prompt_author=copilot policy_source=%s "
@@ -3353,6 +3634,7 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
     tool_code = tool.get('code', '')
     tool_language = tool.get('language', 'python')
     tool_input = tool.get('input', '')
+    runtime_inputs = tool.get('runtime_inputs', {})
     
     # Get cached execution environment or create it
     if 'exec_env' not in tool_config:
@@ -3393,6 +3675,7 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
     # Get cached environment
     exec_env = tool_config['exec_env']
     parsed_input = exec_env['parsed_input']  # Make it available as local variable
+    parsed_input = _with_runtime_inputs(parsed_input, runtime_inputs)
 
     def streaming_cancelled() -> bool:
         current = active_streaming_tools.get(client_id)
@@ -3429,6 +3712,7 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
                 image,
                 'streaming',
                 str(execution_id or 'unknown'),
+                runtime_inputs,
             )
         except Exception as exc:
             logger.error(
@@ -3916,6 +4200,19 @@ def get_local_tools_for_pr_merge() -> list:
     """Get local tools that can be used for PR merging"""
     local_tools = []
     local_tools_dir = Path(__file__).parent.parent / 'tools'
+    source_repo = GITHUB_REPO
+    branch_name = ''
+    commit_sha = ''
+    try:
+        head_ref = (Path(__file__).parent.parent / '.git' / 'HEAD').read_text(encoding='utf-8').strip()
+        if head_ref.startswith('ref: '):
+            ref_path = head_ref.split(' ', 1)[1].strip()
+            branch_name = Path(ref_path).name
+            commit_sha = (Path(__file__).parent.parent / '.git' / ref_path).read_text(encoding='utf-8').strip()
+        else:
+            commit_sha = head_ref
+    except Exception:
+        logger.debug("Could not determine local git source info", exc_info=True)
     
     if not local_tools_dir.exists():
         return []
@@ -3955,7 +4252,7 @@ def get_local_tools_for_pr_merge() -> list:
                         description = description[:200] + "..."
             
             tool_name = py_file.stem
-            local_tools.append({
+            tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': f'tools/{py_file.name}',
                 'description': description,
@@ -3963,6 +4260,16 @@ def get_local_tools_for_pr_merge() -> list:
                 'language': 'python',
                 'source': 'local'
             })
+            _log_runtime_input_tool_source(
+                tool_record,
+                'local',
+                source_repo,
+                branch_name,
+                None,
+                commit_sha,
+            )
+            _log_runtime_input_tool_metadata('local_pr_merge', tool_record)
+            local_tools.append(tool_record)
             
         except Exception as e:
             logger.warning(f"Failed to read local tool {py_file}: {e}")
@@ -4070,6 +4377,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
     commit = repo.get_commit(pr.head.sha)
     tree = commit.commit.tree
     logger.info(f"Successfully fetched tree for PR #{pr.number}, tree SHA: {tree.sha}")
+    repo_name = getattr(repo, 'full_name', GITHUB_REPO)
     
     # Recursively traverse the tree to find files in tools/ directory
     def find_tool_files(tree_obj, current_path=""):
@@ -4161,7 +4469,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
             }
             language = language_map.get(file_ext, file_ext)
             
-            tools.append({
+            tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': file_info['path'],
                 'description': description,
@@ -4176,6 +4484,16 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
                 'system_instruction': pr_system_instruction,
                 'query_interval': pr_query_interval,
             })
+            _log_runtime_input_tool_source(
+                tool_record,
+                'github_pr',
+                repo_name,
+                pr.head.ref,
+                pr.number,
+                pr.head.sha,
+            )
+            _log_runtime_input_tool_metadata('github_pr', tool_record)
+            tools.append(tool_record)
             logger.info(f"Added PR tool: {tool_name} from {file_info['path']} (PR #{pr.number})")
         except Exception as e:
             logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -4272,6 +4590,7 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
     try:
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO)
+        repo_name = getattr(repo, 'full_name', GITHUB_REPO)
         
         logger.info(f"Fetching production tools from branch: {branch_name}")
         
@@ -4361,7 +4680,7 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
                 }
                 language = language_map.get(file_ext, file_ext)
                 
-                tools.append({
+                tool_record = _inject_runtime_input_metadata({
                     'name': tool_name,
                     'path': file_info['path'],
                     'description': description,
@@ -4371,6 +4690,16 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
                     'is_production': True,
                     'source': 'github_branch',
                 })
+                _log_runtime_input_tool_source(
+                    tool_record,
+                    'github_branch',
+                    repo_name,
+                    branch_name,
+                    None,
+                    commit_sha,
+                )
+                _log_runtime_input_tool_metadata('github_branch', tool_record)
+                tools.append(tool_record)
                 logger.info(f"Added production tool: {tool_name} from {file_info['path']} (branch {branch_name})")
             except Exception as e:
                 logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -4500,7 +4829,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                     'system_instruction': issue_system_instruction,
                     'query_interval': issue_query_interval,
                 })
-                return tools
+                return [_inject_runtime_input_metadata(tool) for tool in tools]
         
         # Extract tools from the best matched PR (only use the first one)
         for pr in matched_prs[:1]:  # Only use the best match
@@ -4616,7 +4945,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                         }
                         language = language_map.get(file_ext, file_ext)
                         
-                        tools.append({
+                        tools.append(_inject_runtime_input_metadata({
                             'name': tool_name,
                             'path': file_info['path'],
                             'description': description,
@@ -4630,7 +4959,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                             'gpt_query': issue_gpt_query,
                             'system_instruction': issue_system_instruction,
                             'query_interval': issue_query_interval,
-                        })
+                        }))
                         logger.info(f"Added tool: {tool_name} from {file_info['path']} (PR #{pr.number}, branch {pr.head.ref})")
                     except Exception as e:
                         logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -4639,7 +4968,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                 logger.error(f"Failed to process PR #{pr.number}: {e}")
         
         logger.info(f"Found {len(tools)} tools for issue #{issue_number}")
-        return tools
+        return [_inject_runtime_input_metadata(tool) for tool in tools]
         
     except Exception as e:
         logger.error(f"Failed to fetch tools for issue #{issue_number}: {e}")
@@ -7096,6 +7425,7 @@ async def handle_client(websocket):
                             'language': data.get('tool_language', 'python'),
                             'input': data.get('input', ''),
                             'task': data.get('task', ''),
+                            'runtime_inputs': _parse_runtime_inputs_from_request(data, tool_code),
                         },
                         'last_run': None,
                         'throttle_ms': data.get('throttle_ms', 1000),
@@ -7408,6 +7738,8 @@ async def handle_client(websocket):
                         # Fetch PR title and tools separately to ensure we always have the title
                         pr_title = fetch_pr_title(pr_number)
                         tools = fetch_pr_tools(pr_number)
+                        for tool in tools:
+                            _log_runtime_input_tool_metadata('pr_response', tool)
                         await websocket.send(json.dumps({
                             'type': 'pr_tools',
                             'pr_number': pr_number,
@@ -7469,6 +7801,8 @@ async def handle_client(websocket):
                 if msg_type == 'request_production_tools':
                     branch = data.get('branch', 'main')
                     tools = fetch_branch_tools(branch)
+                    for tool in tools:
+                        _log_runtime_input_tool_metadata('production_response', tool)
                     await websocket.send(json.dumps({
                         'type': 'production_tools',
                         'branch': branch,
@@ -7862,6 +8196,8 @@ async def handle_client(websocket):
                             # Fetch tools associated with this issue
                             logger.info(f"Fetching tools for issue #{issue_number}...")
                             issue_tools = fetch_issue_tools(issue_number)
+                            for tool in issue_tools:
+                                _log_runtime_input_tool_metadata('issue_update_response', tool)
                             
                             # Send confirmation
                             confirm_data = {
@@ -7896,6 +8232,7 @@ async def handle_client(websocket):
                         client_tool_code=data.get('tool_code', ''),
                         client_tool_source=data.get('tool_source', ''),
                     )
+                    runtime_inputs = _parse_runtime_inputs_from_request(data, tool_code)
                     tool_language = data.get('tool_language', 'python')
                     tool_input = data.get('input', '')
                     frame_data = data.get('frame', None)  # Get optional frame data
@@ -8017,7 +8354,7 @@ async def handle_client(websocket):
                                     resolved_tool_code,
                                     frame_image,
                                     frame_base64 or "",
-                                    parsed_input,
+                                    _with_runtime_inputs(parsed_input, runtime_inputs),
                                 )
                                 if lifecycle_result is not None and emitted_count == 0:
                                     response_data = _build_mobile_tool_response(
@@ -8046,6 +8383,9 @@ async def handle_client(websocket):
                                 tool_name,
                                 resolved_tool_code,
                                 frame_image,
+                                'take-photo',
+                                None,
+                                runtime_inputs,
                             )
                             response_data = _build_mobile_tool_response(
                                 'tool_result', tool_name, vlm_result, datetime.now()

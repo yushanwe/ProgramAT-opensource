@@ -23,7 +23,6 @@ import {
   KeyboardAvoidingView,
   ActivityIndicator,
   AccessibilityInfo,
-  findNodeHandle,
   Modal,
   NativeModules,
 } from 'react-native';
@@ -48,6 +47,23 @@ interface IssueChatProps {
 
 type Awaiting = 'answer' | 'choice' | null;
 
+function extractCreateToolName(summary: string | null): string | null {
+  if (!summary) return null;
+  const normalized = summary.trim();
+  const patterns = [
+    /tool name\s*:\s*([^\n.]+)/i,
+    /title\s*:\s*([^\n.]+)/i,
+    /name\s*:\s*([^\n.]+)/i,
+  ];
+  for (const pattern of patterns) {
+    const candidate = normalized.match(pattern)?.[1]?.trim();
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return null;
+} 
+  
 const { ScreenRecordingModule } = NativeModules as {
   ScreenRecordingModule?: {
     fetchMostRecentVideoPath?: () => Promise<string>;
@@ -103,26 +119,30 @@ export default function IssueChat({
   const inFlightRef = useRef(false);
   const scrollViewRef = useRef<ScrollView>(null);
   const composeInputRef = useRef<RNTextInput>(null);
-  const headerRef = useRef<Text>(null);
   const lastAnnouncedIdRef = useRef<string | null>(null);
+  const createToolName = extractCreateToolName(understandingSummary);
+  const modeBannerText = isCreateMode
+    ? createToolName
+      ? `Mode: Creating ${createToolName}`
+      : null
+    : selectedIssue?.title
+    ? `Mode: Updating ${selectedIssue.title}`
+    : null;
 
   useEffect(() => {
     isBrainstormingEnabled().then(setBrainstormingEnabled).catch(() => setBrainstormingEnabled(true));
     isBasicModeEnabled().then(setBasicMode).catch(() => setBasicMode(false));
   }, []);
 
-  // Focus the header on mount, matching ToolSelector's screen-entry pattern.
+  // Announce the screen title on mount, matching ToolSelector's entry pattern.
   useEffect(() => {
     const timeout = setTimeout(() => {
-      if (headerRef.current) {
-        const reactTag = findNodeHandle(headerRef.current);
-        if (reactTag) {
-          AccessibilityInfo.setAccessibilityFocus(reactTag);
-        }
-      }
+      AccessibilityInfo.announceForAccessibility(
+        isCreateMode ? 'Create issue' : `Updating ${selectedIssue?.title}`,
+      );
     }, 100);
     return () => clearTimeout(timeout);
-  }, []);
+  }, [isCreateMode, selectedIssue?.title]);
 
   // Auto-scroll to the newest message.
   useEffect(() => {
@@ -772,6 +792,26 @@ export default function IssueChat({
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
+        {modeBannerText && (
+          <View
+            style={[
+              styles.modeBanner,
+              {
+                backgroundColor: (isCreateMode ? theme.success : theme.primary) + '18',
+              },
+            ]}
+            accessible={false}>
+            <Text
+              style={[styles.modeBannerText, { color: theme.text }]}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={modeBannerText}
+              numberOfLines={1}
+              ellipsizeMode="tail">
+              {modeBannerText}
+            </Text>
+          </View>
+        )}
         <View style={styles.headerTopRow}>
           {showBackButton && onBack && (
             <TouchableOpacity
@@ -810,7 +850,6 @@ export default function IssueChat({
             </Text>
           </View>
           <Text
-            ref={headerRef}
             style={[styles.headerText, { color: theme.text }]}
             accessible={true}
             accessibilityRole="header"
@@ -1065,6 +1104,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
     borderBottomWidth: 1,
+  },
+  modeBanner: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginBottom: 10,
+  },
+  modeBannerText: {
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
   },
   headerTopRow: {
     flexDirection: 'row',

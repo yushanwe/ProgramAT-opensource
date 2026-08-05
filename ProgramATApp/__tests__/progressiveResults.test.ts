@@ -40,13 +40,13 @@ describe('progressive result lifecycle', () => {
   it('keeps model metadata from either transport shape', () => {
     expect(progressiveResultModel({model: 'moondream'})).toBe('moondream');
     expect(progressiveResultModel({
-      metadata: {model: 'gemini/gemini-3.1-flash-lite-preview'},
-    })).toBe('gemini/gemini-3.1-flash-lite-preview');
+      metadata: {model: 'gemini/gemini-3.1-flash-lite'},
+    })).toBe('gemini/gemini-3.1-flash-lite');
     expect(progressiveResultModelLabel({
       model: 'moondream/moondream3-preview',
     })).toBe('Moondream');
     expect(progressiveResultModelLabel({
-      model: 'gemini/gemini-3.1-flash-lite-preview',
+      model: 'gemini/gemini-3.1-flash-lite',
     })).toBe('Gemini');
     expect(progressiveResultModelLabel({model: 'gpt-5'})).toBe('GPT');
   });
@@ -57,7 +57,7 @@ describe('progressive result lifecycle', () => {
       text: 'Moondream: First answer',
     })).toBe('Moondream: First answer');
     expect(formatProgressiveResult({
-      model: 'gemini/gemini-3.1-flash-lite-preview',
+      model: 'gemini/gemini-3.1-flash-lite',
       text: 'Gemini: Second answer',
     })).toBe('Gemini: Second answer');
     expect(formatProgressiveResult({

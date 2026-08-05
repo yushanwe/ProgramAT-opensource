@@ -9,6 +9,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from './ThemeContext';
 import ToolSelector from './ToolSelector';
 import ToolRunner from './ToolRunner';
+import { RuntimeInputDefinition } from './runtimeInput';
 
 interface Tool {
   name: string;
@@ -24,6 +25,7 @@ interface Tool {
   system_instruction?: string;
   query_interval?: number;
   source?: string;
+  runtime_input?: RuntimeInputDefinition;
 }
 
 interface ToolsAndRunnerProps {
@@ -32,6 +34,7 @@ interface ToolsAndRunnerProps {
   isActive?: boolean; // Whether this tab is currently active
   selectedIssue?: {number: number; title: string} | null;
   onNavigateToChat?: (conversationId?: string) => void; // Callback to navigate to chat tab with optional conversation ID
+  onRunnerVisibilityChange?: (visible: boolean) => void;
 }
 
 type ViewMode = 'tool-selector' | 'tool-runner';
@@ -41,7 +44,8 @@ export default function ToolsAndRunner({
   productionMode = false,
   isActive = true,
   selectedIssue = null,
-  onNavigateToChat
+  onNavigateToChat,
+  onRunnerVisibilityChange,
 }: ToolsAndRunnerProps) {
   const { theme } = useTheme();
   const [viewMode, setViewMode] = useState<ViewMode>('tool-selector');
@@ -71,6 +75,10 @@ export default function ToolsAndRunner({
     }
   }, [isActive]);
 
+  useEffect(() => {
+    onRunnerVisibilityChange?.(viewMode === 'tool-runner');
+  }, [onRunnerVisibilityChange, viewMode]);
+
   // Validate that selected tool still exists when issueTools changes
   // and update its fields (e.g. gpt_query) from the fresh data
   useEffect(() => {
@@ -88,10 +96,12 @@ export default function ToolsAndRunner({
         freshTool.gpt_query !== selectedTool.gpt_query ||
         freshTool.code !== selectedTool.code ||
         freshTool.system_instruction !== selectedTool.system_instruction ||
-        freshTool.query_interval !== selectedTool.query_interval
+        freshTool.query_interval !== selectedTool.query_interval ||
+        JSON.stringify(freshTool.runtime_input || null) !==
+          JSON.stringify(selectedTool.runtime_input || null)
       ) {
         // Update the selected tool with fresh data (e.g. updated gpt_query from code)
-        console.log('[ToolsAndRunner] Updating selected tool with fresh data (gpt_query or code changed)');
+        console.log('[ToolsAndRunner] Updating selected tool with fresh data (gpt_query, code, or runtime_input changed)');
         const updated = { ...selectedTool, ...freshTool };
         setSelectedTool(updated);
         AsyncStorage.setItem('selectedTool', JSON.stringify(updated)).catch(error => {
@@ -102,6 +112,9 @@ export default function ToolsAndRunner({
   }, [issueTools]);
 
   const handleToolSelect = (tool: Tool) => {
+    console.log(
+      `[Runtime Input] tool=${tool.path || tool.name} enabled=${tool.runtime_input ? 'true' : 'false'}`,
+    );
     setSelectedTool(tool);
     setViewMode('tool-runner'); // Navigate to runner after selecting tool
     // Persist the selected tool

@@ -71,8 +71,17 @@ TOOL_NAME = "concise_snake_case_name"  # required
 TOOL_PROMPT = (
     "One concise task-specific instruction shared across Take Photo and Streaming."
 )  # required
+TOOL_RUNTIME_INPUT = {  # optional
+    "key": "target_object",
+    "label": "Object to find",
+    "placeholder": "Enter an object, such as a water cup",
+    "prompt_instruction": (
+        "The user is specifically looking for: {value}. Focus only on this "
+        "target and do not report unrelated results."
+    ),
+}
 
-DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite-preview"  # optional
+DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite"  # optional
 FALLBACK_TEXT = "I am not sure from this view."  # optional but recommended
 USE_RECENT_FRAMES = False  # optional explanatory constant if helpful
 
@@ -96,6 +105,10 @@ async def on_take_photo(runtime, image, input_data):  # optional
 
 
 async def on_stream_start(runtime, input_data):  # optional
+    value = None
+    if isinstance(input_data, dict):
+        value = input_data.get(TOOL_RUNTIME_INPUT["key"])
+    runtime.set_state("runtime_input_value", value)
     runtime.set_state("in_flight", False)
 
 
@@ -119,6 +132,10 @@ async def on_stream_stop(runtime):  # optional
 
 Required definitions for lifecycle tools are `TOOL_NAME`, `TOOL_PROMPT`, and at least one supported entry point: `on_take_photo()` or `on_frame()`. `on_stream_start()` and `on_stream_stop()` are optional but recommended when streaming needs state or cleanup. Local helper functions are optional and should stay narrow and tool-specific.
 
+When a tool needs one optional runtime text field in the mobile UI, declare it as one literal `TOOL_RUNTIME_INPUT` dictionary with exactly the keys `key`, `label`, `placeholder`, and `prompt_instruction`. The backend will substitute only the `{value}` placeholder in `prompt_instruction` at execution time. Do not invent alternate field names or dynamic templates.
+
+When a tool declares `TOOL_RUNTIME_INPUT`, preserve and use that value in every relevant execution path. Do not discard `input_data` in `on_stream_start()` if later frames need the runtime input. Extract `input_data.get(TOOL_RUNTIME_INPUT["key"])`, store it in runtime state during `on_stream_start()`, retrieve it in `on_frame()`, and include it in the effective task or VLM prompt. Apply the same runtime-input behavior consistently in both `on_take_photo()` and streaming handlers. If there is no runtime input, preserve the tool's original behavior. Follow the repository's current generated-tool input contract instead of inventing a different payload structure.
+
 Do not introduce deprecated or non-default interfaces in new tools such as `TOOL_POLICY`, `execute_tool_policy()`, `EXECUTION_MODE`, mode-specific prompt constants, or runtime-owned hosted-video configuration unless you are deliberately maintaining an existing legacy tool that already uses that format.
 
 ### Prompt rules
@@ -134,6 +151,7 @@ Do not introduce deprecated or non-default interfaces in new tools such as `TOOL
 - Ask for only the final user-facing answer, not analysis, JSON, chain-of-thought, or the result of each internal step.
 - Include a short uncertainty fallback for unreadable, unavailable, or insufficient evidence.
 - Keep the wording natural when spoken by text-to-speech.
+- VLM prompts should explicitly request a concise user-facing answer suitable for spoken output. Prefer one or two short sentences in a single paragraph with no unnecessary line breaks, headings, bullet points, or JSON. State only the information needed for the user's task, and for blind or low-vision users give the actionable result directly rather than describing the analysis process. A suitable final instruction is: `Return one concise user-facing response suitable for spoken output. Prefer one or two short sentences in a single paragraph with no unnecessary line breaks. State only the information needed for the user's task.`
 
 ### Output rules
 
