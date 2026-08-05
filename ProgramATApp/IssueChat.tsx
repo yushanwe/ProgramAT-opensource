@@ -735,7 +735,6 @@ export default function IssueChat({
               styles.modeBanner,
               {
                 backgroundColor: (isCreateMode ? theme.success : theme.primary) + '18',
-                borderColor: isCreateMode ? theme.success : theme.primary,
               },
             ]}
             accessible={false}>
@@ -1018,8 +1017,6 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
   },
   modeBanner: {
-    borderWidth: 1,
-    borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 8,
     marginBottom: 10,
@@ -1027,6 +1024,7 @@ const styles = StyleSheet.create({
   modeBannerText: {
     fontSize: 14,
     fontWeight: '600',
+    textAlign: 'center',
   },
   headerTopRow: {
     flexDirection: 'row',
