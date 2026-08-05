@@ -8700,7 +8700,7 @@ async def main():
     # 100MB — HTTP video-attachment uploads (/submit-creation, /submit-update)
     # need more headroom than the 20MB WebSocket frame limit; a phone
     # recording a minute or two at default camera quality can exceed 20MB.
-    app = web.Application(client_max_size=100 * 1024 * 1024)
+    app = web.Application(client_max_size=800 * 1024 * 1024)
     app.router.add_get('/', websocket_handler)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_post('/test-door-recognition', test_door_recognition)
