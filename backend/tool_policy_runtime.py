@@ -15,7 +15,7 @@ from model_adapters import (
     StreamingExecutionCancelled,
     _response_text,
 )
-from model_registry import DEFAULT_TAKE_PHOTO_POLICY, MODEL_REGISTRY, SYSTEM_MODEL
+from model_registry import DEFAULT_TAKE_PHOTO_POLICY, MODEL_REGISTRY, SYSTEM_MODEL, TRANSCRIPT_MODEL
 from policy_executor import ToolPolicyError, execute_tool_policy, validate_tool_policy
 
 logger = logging.getLogger(__name__)
@@ -120,6 +120,11 @@ def system_llm_call(messages=None, images=None, metadata=None):
     return call_model(SYSTEM_MODEL, messages or [], images=images, metadata=metadata)
 
 
+def transcript_llm_call(messages=None, images=None, metadata=None):
+    logger.info("[Transcript Model] model=%s", TRANSCRIPT_MODEL)
+    return call_model(TRANSCRIPT_MODEL, messages or [], images=images, metadata=metadata)
+
+
 def copilot_llm_call(capability=None, messages=None, images: Optional[Iterable[Any]] = None,
                      metadata=None, task=None, task_category=None, goal=None):
     del capability, task_category
@@ -142,4 +147,5 @@ def copilot_llm_call(capability=None, messages=None, images: Optional[Iterable[A
 __all__ = [
     "STREAMING_EXECUTION_CONTEXT", "StreamingExecutionCancelled", "TOOL_EXECUTION_IMAGES",
     "copilot_llm_call", "execute_resolved_tool_policy", "resolve_tool_policy", "system_llm_call",
+    "transcript_llm_call",
 ]
