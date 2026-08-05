@@ -12,6 +12,9 @@
 	<key>CFBundleDisplayName</key>
 	<string>ProgramATApp</string>
 
+	<key>CFBundleSpokenName</key>
+	<string>Program A T</string>
+
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 
