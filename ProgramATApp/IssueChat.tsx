@@ -45,6 +45,23 @@ interface IssueChatProps {
 
 type Awaiting = 'answer' | 'choice' | null;
 
+function extractCreateToolName(summary: string | null): string | null {
+  if (!summary) return null;
+  const normalized = summary.trim();
+  const patterns = [
+    /tool name\s*:\s*([^\n.]+)/i,
+    /title\s*:\s*([^\n.]+)/i,
+    /name\s*:\s*([^\n.]+)/i,
+  ];
+  for (const pattern of patterns) {
+    const candidate = normalized.match(pattern)?.[1]?.trim();
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 export default function IssueChat({
   selectedIssue,
   onBack,
@@ -76,6 +93,14 @@ export default function IssueChat({
   const scrollViewRef = useRef<ScrollView>(null);
   const composeInputRef = useRef<RNTextInput>(null);
   const lastAnnouncedIdRef = useRef<string | null>(null);
+  const createToolName = extractCreateToolName(understandingSummary);
+  const modeBannerText = isCreateMode
+    ? createToolName
+      ? `Mode: Creating ${createToolName}`
+      : null
+    : selectedIssue?.title
+    ? `Mode: Updating ${selectedIssue.title}`
+    : null;
 
   useEffect(() => {
     isBrainstormingEnabled().then(setBrainstormingEnabled).catch(() => setBrainstormingEnabled(true));
@@ -86,11 +111,11 @@ export default function IssueChat({
   useEffect(() => {
     const timeout = setTimeout(() => {
       AccessibilityInfo.announceForAccessibility(
-        isCreateMode ? 'Create issue' : `Updating issue ${selectedIssue?.number}`,
+        isCreateMode ? 'Create issue' : `Updating ${selectedIssue?.title}`,
       );
     }, 100);
     return () => clearTimeout(timeout);
-  }, [isCreateMode, selectedIssue?.number]);
+  }, [isCreateMode, selectedIssue?.title]);
 
   // Auto-scroll to the newest message.
   useEffect(() => {
@@ -704,6 +729,27 @@ export default function IssueChat({
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
+        {modeBannerText && (
+          <View
+            style={[
+              styles.modeBanner,
+              {
+                backgroundColor: (isCreateMode ? theme.success : theme.primary) + '18',
+                borderColor: isCreateMode ? theme.success : theme.primary,
+              },
+            ]}
+            accessible={false}>
+            <Text
+              style={[styles.modeBannerText, { color: theme.text }]}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={modeBannerText}
+              numberOfLines={1}
+              ellipsizeMode="tail">
+              {modeBannerText}
+            </Text>
+          </View>
+        )}
         <View style={styles.headerTopRow}>
           {showBackButton && onBack && (
             <TouchableOpacity
@@ -970,6 +1016,17 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
     borderBottomWidth: 1,
+  },
+  modeBanner: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginBottom: 10,
+  },
+  modeBannerText: {
+    fontSize: 14,
+    fontWeight: '600',
   },
   headerTopRow: {
     flexDirection: 'row',
