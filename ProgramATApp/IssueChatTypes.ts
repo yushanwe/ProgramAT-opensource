@@ -23,8 +23,8 @@ export type IssueChatItem =
 
 export type CreationResponse =
   | { status: 'created'; issue_number: number; issue_url: string; video_summary: string }
-  | { status: 'ideation'; question: string; token: string; summary?: string }
-  | { status: 'brainstorm_choice'; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string }
+  | { status: 'ideation'; question: string; token: string; summary?: string; integration_note?: string }
+  | { status: 'brainstorm_choice'; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string; video_failed?: boolean };
 
 export type UpdateResponse =
@@ -32,5 +32,5 @@ export type UpdateResponse =
   | { status: 'error'; error: string };
 
 export type NextQuestionResponse =
-  | { status: 'ideation'; question: string; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string }
+  | { status: 'ideation'; question: string; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string };

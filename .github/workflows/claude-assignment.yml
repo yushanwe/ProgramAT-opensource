@@ -97,6 +97,14 @@ jobs:
             After writing the tool, validate it before committing by running:
               cd backend && python3 validate_generated_tools.py ../tools/<tool_name>.py
             Fix any reported errors before committing or pushing.
+
+            Model rules (enforced — do not deviate):
+            - Default visual tool calls to `gemini/gemini-3.1-flash-lite`.
+            - Do not use gpt-4o-mini, gpt-4, gpt-4o, or any non-Gemini model for
+              visual tasks. gpt-4o-mini is text-only and has no image support.
+            - `call_model` is a synchronous function. Always call it as
+              `await asyncio.to_thread(call_model, model, messages, images)`.
+              Never write `await call_model(...)` — that raises a TypeError at runtime.
           claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(find:*),Bash(ls:*),Bash(python3:*),Bash(cd:*),Read,View,Glob,GlobTool,Grep,GrepTool,Write,Edit" --max-turns 100 --model claude-sonnet-5'
       - name: Create PR for Claude branch if needed
         if: github.event.issue.pull_request == null

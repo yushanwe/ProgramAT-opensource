@@ -25,6 +25,7 @@ import {
   AccessibilityInfo,
   findNodeHandle,
   Modal,
+  NativeModules,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { launchImageLibrary } from 'react-native-image-picker';
@@ -35,6 +36,7 @@ import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
 import TextToSpeechService from './TextToSpeechService';
+import BeepService from './BeepService';
 
 interface IssueChatProps {
   serverFeedback?: string;
@@ -45,6 +47,30 @@ interface IssueChatProps {
 }
 
 type Awaiting = 'answer' | 'choice' | null;
+
+const { ScreenRecordingModule } = NativeModules as {
+  ScreenRecordingModule?: {
+    fetchMostRecentVideoPath?: () => Promise<string>;
+  };
+};
+
+/**
+ * Build the short VoiceOver announcement for the "What I understand" card.
+ * On first arrival (no integration note) we extract just the first sentence.
+ * On updates we use the integration note — it is already a single sentence
+ * describing only what changed.
+ * Always prefixed with the card label so the user knows what they're hearing.
+ */
+function buildUnderstandingAnnouncement(summary: string, integrationNote?: string | null): string {
+  const label = 'What I understand: ';
+  if (integrationNote) {
+    return label + integrationNote;
+  }
+  // Extract first sentence only.
+  const match = summary.match(/^[^.!?]+[.!?]/);
+  const firstSentence = match ? match[0] : summary;
+  return label + firstSentence;
+}
 
 export default function IssueChat({
   selectedIssue,
@@ -65,6 +91,7 @@ export default function IssueChat({
   const [activeToken, setActiveToken] = useState<string | null>(null);
   const [awaiting, setAwaiting] = useState<Awaiting>(null);
   const [understandingSummary, setUnderstandingSummary] = useState<string | null>(null);
+  const [lastIntegrated, setLastIntegrated] = useState<string | null>(null);
   const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
 
   const [brainstormingEnabled, setBrainstormingEnabled] = useState(true);
@@ -114,11 +141,14 @@ export default function IssueChat({
     if (!last || last.id === lastAnnouncedIdRef.current) return;
     if (last.kind === 'assistant-question') {
       lastAnnouncedIdRef.current = last.id;
-      TextToSpeechService.speakWithInterrupt(last.question);
+      // Announce the question and play an earcon. All question announcements
+      // are handled here regardless of how the question arrived.
       AccessibilityInfo.announceForAccessibility(last.question);
+      BeepService.playBeep(880, 120);
     } else if (last.kind === 'assistant-choice-prompt') {
       lastAnnouncedIdRef.current = last.id;
-      TextToSpeechService.speakWithInterrupt(last.text);
+      // Announce the choice prompt. Summary card is silently updated and
+      // readable by VoiceOver navigation — no competing announcement needed.
       AccessibilityInfo.announceForAccessibility(last.text);
     } else if (last.kind === 'assistant-created') {
       lastAnnouncedIdRef.current = last.id;
@@ -140,6 +170,13 @@ export default function IssueChat({
       return () => clearTimeout(timeout);
     }
   }, [awaiting]);
+
+  // Announce progress text updates to VoiceOver as they arrive.
+  useEffect(() => {
+    if (progressText) {
+      AccessibilityInfo.announceForAccessibility(progressText);
+    }
+  }, [progressText]);
 
   // Listen for WS 'progress' broadcasts fired by the backend while an HTTP
   // request from this screen is in flight (e.g. "Summarizing video…"). This
@@ -184,6 +221,7 @@ export default function IssueChat({
     setActiveToken(null);
     setAwaiting(null);
     setUnderstandingSummary(null);
+    setLastIntegrated(null);
     setIsSummaryModalOpen(false);
     brainstormHistoryRef.current = [];
   };
@@ -202,6 +240,25 @@ export default function IssueChat({
       }
     } finally {
       setIsPickingFromLibrary(false);
+    }
+  };
+
+  const handleAttachRecentSession = async () => {
+    try {
+      const path = await ScreenRecordingModule?.fetchMostRecentVideoPath?.();
+      if (path) {
+        setStagedVideoUri(path);
+      }
+    } catch (error: any) {
+      console.error('[IssueChat] Failed to attach recent session:', error);
+      const code = error?.code;
+      const message =
+        code === 'no_recent_video'
+          ? 'No recent recording was found.'
+          : code === 'photos_read_permission_denied'
+          ? 'Photos access was denied. Could not attach a recent recording.'
+          : 'Could not attach a recent recording.';
+      AccessibilityInfo.announceForAccessibility(message);
     }
   };
 
@@ -288,6 +345,7 @@ export default function IssueChat({
       setActiveToken(result.token);
       setAwaiting('answer');
       if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
       append({
         kind: 'assistant-question',
         id: nextId('assistant-question'),
@@ -302,6 +360,7 @@ export default function IssueChat({
       setActiveToken(result.token);
       setAwaiting('choice');
       if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
       brainstormHistoryRef.current = result.brainstorm_history || [];
       append({
         kind: 'assistant-choice-prompt',
@@ -339,6 +398,7 @@ export default function IssueChat({
         brainstormHistoryRef.current = result.brainstorm_history || [];
         setAwaiting('answer');
         if (result.summary) setUnderstandingSummary(result.summary);
+        if (result.integration_note) setLastIntegrated(result.integration_note);
         append({
           kind: 'assistant-question',
           id: nextId('assistant-question'),
@@ -589,12 +649,14 @@ export default function IssueChat({
         return (
           <View
             key={item.id}
-            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
-            accessible={true}
-            accessibilityLabel={`Assistant said: ${item.question}`}
-            accessibilityRole="text"
-            accessibilityHint="Long press to copy text">
-            <Text style={[styles.messageText, { color: theme.text }]} selectable={true} accessible={false}>
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text
+              style={[styles.messageText, { color: theme.text }]}
+              selectable={true}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={`Assistant said: ${item.question}`}
+              accessibilityHint="Long press to copy text">
               {item.question}
             </Text>
             <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
@@ -606,11 +668,12 @@ export default function IssueChat({
         return (
           <View
             key={item.id}
-            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
-            accessible={true}
-            accessibilityLabel={`Assistant said: ${item.text}`}
-            accessibilityRole="text">
-            <Text style={[styles.messageText, { color: theme.text }]} accessible={false}>
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text
+              style={[styles.messageText, { color: theme.text }]}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={`Assistant said: ${item.text}`}>
               {item.text}
             </Text>
             {!item.resolved && (
@@ -764,15 +827,15 @@ export default function IssueChat({
         style={styles.messagesContainer}
         contentContainerStyle={styles.messagesContent}
         keyboardShouldPersistTaps="handled"
-        accessible={true}
-        accessibilityLabel="Conversation messages"
         accessibilityLiveRegion="polite">
         {items.map(renderItem)}
         {isSending && (
           <View
             style={[styles.messageContainer, styles.assistantAlign, styles.thinkingMessage, { backgroundColor: theme.card, borderColor: theme.border }]}
-            accessible={false}>
-            <Text style={[styles.thinkingText, { color: theme.textSecondary }]}>
+            accessible={true}
+            accessibilityLiveRegion="polite"
+            accessibilityLabel={progressText ?? 'Thinking…'}>
+            <Text style={[styles.thinkingText, { color: theme.textSecondary }]} accessible={false}>
               {progressText ?? 'Thinking…'}
             </Text>
           </View>
@@ -786,8 +849,7 @@ export default function IssueChat({
           activeOpacity={0.7}
           accessible={true}
           accessibilityRole="button"
-          accessibilityLiveRegion="polite"
-          accessibilityLabel={`What I understand: ${understandingSummary}`}
+          accessibilityLabel={`What I understand. ${lastIntegrated ? `Just integrated: ${lastIntegrated}. ` : ''}${understandingSummary}`}
           accessibilityHint="Double tap to view the full text">
           <View style={styles.summaryCardHeader}>
             <Text style={[styles.summaryCardLabel, { color: theme.textSecondary }]} accessible={false}>
@@ -797,6 +859,15 @@ export default function IssueChat({
               View full ›
             </Text>
           </View>
+          {lastIntegrated && (
+            <Text
+              style={[styles.summaryCardLatest, { color: theme.textSecondary }]}
+              accessible={false}
+              numberOfLines={1}
+              ellipsizeMode="tail">
+              Just integrated: {lastIntegrated}
+            </Text>
+          )}
           <Text
             style={[styles.summaryCardText, { color: theme.text }]}
             accessible={false}
@@ -831,6 +902,15 @@ export default function IssueChat({
               </TouchableOpacity>
             </View>
             <ScrollView style={styles.summaryModalScroll} contentContainerStyle={styles.summaryModalScrollContent}>
+              {lastIntegrated && (
+                <Text
+                  style={[styles.summaryModalLatest, { color: theme.textSecondary }]}
+                  accessible={true}
+                  accessibilityRole="text"
+                  accessibilityLabel={`Just integrated: ${lastIntegrated}`}>
+                  Just integrated: {lastIntegrated}
+                </Text>
+              )}
               <Text
                 style={[styles.summaryModalText, { color: theme.text }]}
                 selectable={true}
@@ -904,6 +984,15 @@ export default function IssueChat({
                 accessibilityRole="button"
                 accessibilityLabel="Choose a video from your photo library">
                 <Text style={styles.attachButtonText}>📁</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
+                onPress={handleAttachRecentSession}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel="Attach most recent recording"
+                accessibilityHint="Attaches the most recent video from your camera roll">
+                <Text style={styles.attachButtonText}>🎬</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -1126,9 +1215,19 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
+  summaryCardLatest: {
+    fontSize: 13,
+    fontStyle: 'italic',
+    marginBottom: 4,
+  },
   summaryCardText: {
     fontSize: 15,
     lineHeight: 20,
+  },
+  summaryModalLatest: {
+    fontSize: 14,
+    fontStyle: 'italic',
+    marginBottom: 12,
   },
   summaryModalOverlay: {
     flex: 1,

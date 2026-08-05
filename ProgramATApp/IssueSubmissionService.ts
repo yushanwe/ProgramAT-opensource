@@ -14,7 +14,7 @@ const VIDEO_REQUEST_TIMEOUT_MS = 300_000; // video upload + summarization + two 
 /** Convert the WebSocket URL to an HTTP base URL for REST endpoints. */
 export function getHttpBaseUrl(): string {
   const wsUrl = WebSocketService.getServerUrl(); // e.g. 'ws://1.2.3.4:8081'
-  return wsUrl.replace(/^wss?/, 'http');
+  return wsUrl.replace(/^ws/, 'http'); // ws:// → http://, wss:// → https://
 }
 
 /**
