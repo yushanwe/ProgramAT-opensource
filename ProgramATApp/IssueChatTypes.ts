@@ -22,15 +22,35 @@ export type IssueChatItem =
   | { kind: 'assistant-error'; id: string; ts: Date; text: string; retry?: RetryDescriptor };
 
 export type CreationResponse =
-  | { status: 'created'; issue_number: number; issue_url: string; video_summary: string }
+  | { status: 'created'; issue_number: number; issue_url: string; video_summary: string; pr_number?: number | null; comment_id?: number | null }
   | { status: 'ideation'; question: string; token: string; summary?: string; integration_note?: string }
   | { status: 'brainstorm_choice'; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string; video_failed?: boolean };
 
 export type UpdateResponse =
-  | { status: 'updated'; issue_number: number; issue_url: string; video_summary: string }
+  | { status: 'updated'; issue_number: number; issue_url: string; video_summary: string; pr_number?: number | null; comment_id?: number | null }
   | { status: 'error'; error: string };
 
 export type NextQuestionResponse =
   | { status: 'ideation'; question: string; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string };
+
+export type ClaudeProgressStepStatus = 'completed' | 'in_progress' | 'pending' | 'failed';
+
+export interface ClaudeProgressStep {
+  id: string;
+  label: string;
+  raw_label: string;
+  status: ClaudeProgressStepStatus;
+}
+
+export interface ClaudeProgressResponse {
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'waiting' | 'retrying' | 'unavailable' | 'error';
+  title?: string | null;
+  issue_number?: number | null;
+  comment_id?: number | null;
+  steps: ClaudeProgressStep[];
+  updated_at?: string | null;
+  message?: string;
+  error?: string;
+}
