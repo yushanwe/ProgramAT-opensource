@@ -105,7 +105,7 @@ jobs:
             - `call_model` is a synchronous function. Always call it as
               `await asyncio.to_thread(call_model, model, messages, images)`.
               Never write `await call_model(...)` — that raises a TypeError at runtime.
-          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(find:*),Bash(ls:*),Bash(python3:*),Bash(cd:*),Read,View,Glob,GlobTool,Grep,GrepTool,Write,Edit" --max-turns 100 --model claude-sonnet-4-5'
+          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(find:*),Bash(ls:*),Bash(python3:*),Bash(cd:*),Read,View,Glob,GlobTool,Grep,GrepTool,Write,Edit" --max-turns 100 --model claude-sonnet-5'
       - name: Create PR for Claude branch if needed
         if: github.event.issue.pull_request == null
         env:

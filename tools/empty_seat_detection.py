@@ -98,13 +98,20 @@ async def on_stream_start(runtime, input_data):
     runtime.set_state("scene_generation", 0)
     runtime.set_state("analyzing_generation", None)
     runtime.set_state("completed_generation", None)
+    runtime.set_state("embedding_in_flight", False)
 
 
 async def on_frame(runtime, frame):
     """Analyze each distinct scene once and emit model results as they finish."""
     if runtime.is_cancelled():
         return
-    embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+    if runtime.get_state("embedding_in_flight"):
+        return
+    runtime.set_state("embedding_in_flight", True)
+    try:
+        embedding = await asyncio.to_thread(compute_scene_embedding, frame.image)
+    finally:
+        runtime.set_state("embedding_in_flight", False)
     anchor = runtime.get_state("scene_anchor")
     generation = int(runtime.get_state("scene_generation", 0))
 
