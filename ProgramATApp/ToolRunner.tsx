@@ -102,6 +102,7 @@ export default function ToolRunner({
   const [recordSessionArmed, setRecordSessionArmed] = useState(false); // "Record this usage session" — set in Settings
   const [isRecordingScreen, setIsRecordingScreen] = useState(false);
   const isRecordingScreenRef = useRef(false);
+  const recordingDesiredRef = useRef(false);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Take Photo's 30s auto-stop
   const [audioEnabled, setAudioEnabled] = useState(true); // Toggle audio output
   const [conversationMode, setConversationMode] = useState(false); // Toggle conversation mode
@@ -172,15 +173,24 @@ export default function ToolRunner({
   }, [isStreaming]);
 
   // Clear the Take Photo recording timer on unmount so it never fires after
-  // the component is gone.
+  // the component is gone, and stop any active recording when leaving.
   useEffect(() => {
     return () => {
       if (recordingTimeoutRef.current) {
         clearTimeout(recordingTimeoutRef.current);
         recordingTimeoutRef.current = null;
       }
+      recordingDesiredRef.current = false;
+      stopScreenRecordingIfActive();
     };
   }, []);
+
+  useEffect(() => {
+    if (!isActive) {
+      recordingDesiredRef.current = false;
+      stopScreenRecordingIfActive();
+    }
+  }, [isActive]);
 
   // Voice event listeners for follow-up speech-to-text
   useEffect(() => {
@@ -1072,13 +1082,19 @@ export default function ToolRunner({
     if (!recordSessionArmed || isRecordingScreenRef.current) {
       return;
     }
+    recordingDesiredRef.current = true;
     try {
       await ScreenRecordingModule?.startScreenRecording?.();
       setIsRecordingScreen(true);
       isRecordingScreenRef.current = true;
+      if (!recordingDesiredRef.current) {
+        stopScreenRecordingIfActive();
+        return;
+      }
       AccessibilityInfo.announceForAccessibility('Recording started');
     } catch (error: any) {
       console.error('[ToolRunner] Failed to start screen recording:', error);
+      recordingDesiredRef.current = false;
       const code = error?.code;
       if (code === 'already_recording') {
         return;
@@ -1094,16 +1110,20 @@ export default function ToolRunner({
   };
 
   const stopScreenRecordingIfActive = async () => {
-    if (!isRecordingScreenRef.current) {
-      return;
-    }
+    recordingDesiredRef.current = false;
     if (recordingTimeoutRef.current) {
       clearTimeout(recordingTimeoutRef.current);
       recordingTimeoutRef.current = null;
     }
-    setIsRecordingScreen(false);
-    isRecordingScreenRef.current = false;
     try {
+      const nativeActive = await ScreenRecordingModule?.isScreenRecordingActive?.();
+      if (!isRecordingScreenRef.current && !nativeActive) {
+        setIsRecordingScreen(false);
+        isRecordingScreenRef.current = false;
+        return;
+      }
+      setIsRecordingScreen(false);
+      isRecordingScreenRef.current = false;
       await ScreenRecordingModule?.stopScreenRecordingAndSave?.();
       announceRecordingSuccess('Recording saved to Photos');
     } catch (error: any) {
