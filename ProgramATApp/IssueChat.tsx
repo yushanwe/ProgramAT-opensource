@@ -153,6 +153,28 @@ export default function IssueChat({
     }
   }, [items, progressText, isSending]);
 
+  // Loading sound while a request is in flight — video uploads can take
+  // 15+ seconds to summarize, and the "Thinking…" bubble alone isn't audible.
+  // Delayed so quick text-only requests don't beep unnecessarily.
+  useEffect(() => {
+    let beepTimer: ReturnType<typeof setTimeout> | null = null;
+
+    if (isSending) {
+      beepTimer = setTimeout(() => {
+        BeepService.startLoadingSound();
+      }, 3000);
+    } else {
+      BeepService.stopLoadingSound();
+    }
+
+    return () => {
+      if (beepTimer) {
+        clearTimeout(beepTimer);
+      }
+      BeepService.stopLoadingSound();
+    };
+  }, [isSending]);
+
   // Announce new assistant-originated items. assistant-updated is skipped
   // because App.tsx's WS listener already speaks "Update sent to issue" for
   // the issue_updated broadcast that /submit-update still triggers.
