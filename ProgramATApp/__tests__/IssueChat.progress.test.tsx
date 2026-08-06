@@ -4,7 +4,7 @@ import { AccessibilityInfo, TextInput, TouchableOpacity } from 'react-native';
 import IssueChat from '../IssueChat';
 import PRsAndText from '../PRsAndText';
 import { ThemeProvider } from '../ThemeContext';
-import { buildClaudeAccessibilityLabel, isTerminalClaudeProgress, sanitizeClaudeCommentBody } from '../claudeCommentSanitizer';
+import { buildClaudeAccessibilityLabel, getChangedClaudeAnnouncement, isTerminalClaudeProgress, parseClaudeRenderLines, sanitizeClaudeCommentBody } from '../claudeCommentSanitizer';
 
 jest.useFakeTimers();
 
@@ -148,7 +148,7 @@ describe('IssueChat progress', () => {
         title: 'Creating Tool',
         issue_number: 7,
         comment_id: 101,
-        body: '### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py',
+        body: '### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py\n\n### Recent work\nInspected runtime input handling.',
         message: 'Claude comment available.',
         steps: [
           { id: 'step_1', label: 'Reading your tool requirements', raw_label: 'Read issue and repository CLAUDE.md', status: 'completed' },
@@ -160,7 +160,7 @@ describe('IssueChat progress', () => {
         title: 'Creating Tool',
         issue_number: 7,
         comment_id: 101,
-        body: '### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py',
+        body: '### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py\n\n### Recent work\nInspected runtime input handling.',
         message: 'Claude comment available.',
         steps: [
           { id: 'step_1', label: 'Reading your tool requirements', raw_label: 'Read issue and repository CLAUDE.md', status: 'completed' },
@@ -183,13 +183,11 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
 
-    const claudeLabel = renderer!.root.findAll((node) =>
-      typeof node.props?.accessibilityLabel === 'string'
-      && node.props.accessibilityLabel.includes('Finished: Read issue and repository CLAUDE.md')
-      && node.props.accessibilityLabel.includes('Ongoing: Implement tool.py')
-    );
-    expect(claudeLabel.length).toBeGreaterThan(0);
-    expect(announceSpy).toHaveBeenCalledWith('In progress: Building the tool');
+    const finishedLabel = renderer!.root.findAll((node) => node.props?.accessibilityLabel === 'Finished: Read issue and repository CLAUDE.md');
+    const ongoingLabel = renderer!.root.findAll((node) => node.props?.accessibilityLabel === 'Ongoing: Implement tool.py');
+    expect(finishedLabel.length).toBeGreaterThan(0);
+    expect(ongoingLabel.length).toBeGreaterThan(0);
+    expect(announceSpy).toHaveBeenCalledWith('Recent Work: Inspected runtime input handling.');
 
     await act(async () => {
       jest.advanceTimersByTime(2500);
@@ -446,5 +444,18 @@ describe('Claude accessibility helpers', () => {
     })).toBe(true);
     expect(isTerminalClaudeProgress({ status: 'available', body: 'Finished implementation and opened PR #8', steps: [] })).toBe(true);
     expect(isTerminalClaudeProgress({ status: 'available', body: 'Still working', steps: [] })).toBe(false);
+  });
+
+  test('extracts changed section announcements', () => {
+    const previous = '### Recent work\nChecked tool patterns.\n\n### Next step\nImplement the tool.';
+    const next = '### Recent work\nValidated the generated tool.\n\n### Next step\nCommit and push.';
+    expect(getChangedClaudeAnnouncement(previous, next)).toBe('Recent Work: Validated the generated tool.');
+  });
+
+  test('parses render lines with separate headings and bullets', () => {
+    const lines = parseClaudeRenderLines('### Current analysis\n- [x] Read `CLAUDE.md`\nParagraph text');
+    expect(lines[0].kind).toBe('heading');
+    expect(lines[1].accessibilityLabel).toBe('Finished: Read CLAUDE.md');
+    expect(lines[2].kind).toBe('paragraph');
   });
 });
