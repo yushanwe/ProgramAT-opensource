@@ -155,22 +155,16 @@ export default function IssueChat({
 
   // Loading sound while a request is in flight — video uploads can take
   // 15+ seconds to summarize, and the "Thinking…" bubble alone isn't audible.
-  // Delayed so quick text-only requests don't beep unnecessarily.
+  // Starts immediately (no delay) since requests here are never near-instant
+  // and the user should hear confirmation from the moment they hit send.
   useEffect(() => {
-    let beepTimer: ReturnType<typeof setTimeout> | null = null;
-
     if (isSending) {
-      beepTimer = setTimeout(() => {
-        BeepService.startLoadingSound();
-      }, 3000);
+      BeepService.startLoadingSound();
     } else {
       BeepService.stopLoadingSound();
     }
 
     return () => {
-      if (beepTimer) {
-        clearTimeout(beepTimer);
-      }
       BeepService.stopLoadingSound();
     };
   }, [isSending]);
