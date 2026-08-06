@@ -82,6 +82,13 @@ from claude_progress import (
     parse_claude_progress_comment,
     select_claude_progress_comment,
 )
+from implementation_traceability import (
+    build_traceability_response,
+    extract_implementation_summary,
+    get_traceability_record,
+    infer_tool_path,
+    upsert_traceability_record,
+)
 from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
 from webrtc_handler import webrtc_offer_handler, cleanup_webrtc_peers
@@ -3974,6 +3981,13 @@ async def poll_for_copilot_session(issue_number: int, websocket, client_id: str)
                         or f"Closes #{issue_number}" in pr_text
                     ):
                         logger.info(f"Found Claude PR #{pr.number} for issue #{issue_number}")
+                        upsert_traceability_record(
+                            mode='create',
+                            issue_number=issue_number,
+                            pr_number=pr.number,
+                            commit_sha=pr.head.sha,
+                            metadata={'pr_url': pr.html_url, 'branch_name': pr.head.ref},
+                        )
                         if issue_number in pending_copilot_issues:
                             pending_copilot_issues[issue_number]['pr_number'] = pr.number
                             pending_copilot_issues.pop(issue_number, None)
@@ -5366,6 +5380,13 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 associated_pr.create_issue_comment(pr_comment)
                 _log_to_all_sessions("INFO", f"GitHub API: Added comment to associated PR #{pr_number}")
                 logger.info(f"Added comment to associated PR #{pr_number}")
+                upsert_traceability_record(
+                    mode='update',
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                    commit_sha=associated_pr.head.sha,
+                    metadata={'pr_url': associated_pr.html_url, 'branch_name': associated_pr.head.ref},
+                )
             except Exception as e:
                 _log_to_all_sessions("WARNING", f"Could not add comment to PR for issue #{issue_number}: {e}")
                 logger.warning(f"Could not add comment to PR for issue #{issue_number}: {e}")
@@ -6890,6 +6911,13 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
 
         issue = await asyncio.to_thread(_create_issue)
         logger.info("Created GitHub issue #%d via /submit-creation: %s", issue.number, title[:60])
+        upsert_traceability_record(
+            mode='create',
+            issue_number=issue.number,
+            tool_name=title,
+            tool_path=infer_tool_path(title),
+            metadata={'source': 'submit_creation'},
+        )
 
         return web.json_response({
             'status': 'created',
@@ -7063,12 +7091,23 @@ async def handle_update_submit(request: web.Request) -> web.Response:
 
         issue_url = await asyncio.to_thread(_get_issue_url)
         logger.info("Posted comment to issue #%s via /submit-update", issue_number)
+        trace_record = get_traceability_record(issue_number=int(issue_number))
+        tracked_pr_number = trace_record.get('pr_number') if trace_record else None
+        upsert_traceability_record(
+            mode='update',
+            issue_number=int(issue_number),
+            pr_number=tracked_pr_number,
+            tool_name=trace_record.get('tool_name') if trace_record else None,
+            tool_path=trace_record.get('tool_path') if trace_record else None,
+            metadata={'source': 'submit_update'},
+        )
 
         return web.json_response({
             'status': 'updated',
             'issue_number': int(issue_number),
             'issue_url': issue_url,
             'video_summary': video_summary,
+            'pr_number': tracked_pr_number,
         })
 
     except Exception as e:
@@ -7163,7 +7202,51 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
         parsed['status'] = 'available'
         parsed['message'] = 'Claude comment available.'
 
+    summary_fields = extract_implementation_summary(getattr(comment, 'body', '') or '')
+    upsert_traceability_record(
+        mode=mode,
+        issue_number=issue_number if mode == 'create' else None,
+        pr_number=issue_number if mode == 'update' else None,
+        comment_id=getattr(comment, 'id', exact_comment_id),
+        tool_name=parsed.get('title') or getattr(issue, 'title', None),
+        implementation_summary=summary_fields,
+        metadata={'repo_name': repo_name},
+    )
+
     return web.json_response(parsed)
+
+
+async def handle_implementation_history(request: web.Request) -> web.Response:
+    if not GITHUB_TOKEN:
+        return web.json_response({'status': 'error', 'error': 'GitHub not configured'}, status=503)
+
+    repo_name = (request.query.get('repo') or GITHUB_REPO or '').strip()
+    issue_number_raw = request.query.get('issue_number')
+    pr_number_raw = request.query.get('pr_number')
+    comment_id_raw = request.query.get('comment_id')
+    include_logs = request.query.get('include_logs') in {'1', 'true', 'yes'}
+
+    issue_number = int(issue_number_raw) if issue_number_raw and issue_number_raw.isdigit() else None
+    pr_number = int(pr_number_raw) if pr_number_raw and pr_number_raw.isdigit() else None
+    comment_id = int(comment_id_raw) if comment_id_raw and comment_id_raw.isdigit() else None
+
+    record = get_traceability_record(issue_number=issue_number, pr_number=pr_number, comment_id=comment_id)
+    if not record:
+        return web.json_response({'status': 'not_found', 'error': 'No implementation metadata found yet.'}, status=404)
+
+    try:
+        payload = await asyncio.to_thread(
+            build_traceability_response,
+            repo_name=repo_name,
+            token=GITHUB_TOKEN,
+            record=record,
+            include_logs=include_logs,
+        )
+    except Exception as e:
+        logger.error("Failed to build implementation history: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'error': str(e)}, status=502)
+
+    return web.json_response({'status': 'ok', **payload})
 
 
 async def handle_test_video_summary(request: web.Request) -> web.Response:
@@ -8838,6 +8921,7 @@ async def main():
     app.router.add_post('/brainstorm-next-question', handle_brainstorm_next_question)
     app.router.add_post('/submit-update', handle_update_submit)
     app.router.add_get('/claude-progress', handle_claude_progress)
+    app.router.add_get('/implementation-history', handle_implementation_history)
     app.router.add_post('/test-video-summary', handle_test_video_summary)
     app.router.add_post('/offer', webrtc_offer_handler)  # WebRTC signaling
 
