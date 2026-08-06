@@ -46,7 +46,7 @@ export interface ClaudeProgressStep {
 }
 
 export interface ClaudeProgressResponse {
-  status: 'waiting_for_comment' | 'available' | 'completed' | 'failed' | 'unavailable';
+  status: 'waiting_for_comment' | 'available' | 'completed' | 'failed' | 'cancelled' | 'unavailable';
   title?: string | null;
   issue_number?: number | null;
   comment_id?: number | null;

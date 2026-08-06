@@ -34,7 +34,7 @@ import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
-import { sanitizeClaudeCommentBody } from './claudeCommentSanitizer';
+import { buildClaudeAccessibilityLabel, isTerminalClaudeProgress, sanitizeClaudeCommentBody } from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
 
@@ -145,7 +145,9 @@ export default function IssueChat({
   const lastAnnouncedIdRef = useRef<string | null>(null);
   const lastAnnouncedProgressStepRef = useRef<string | null>(null);
   const progressPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const claudeLoadingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const claudeProgressItemIdRef = useRef<string | null>(null);
+  const claudePollingStoppedRef = useRef(false);
   const createToolName = extractCreateToolName(understandingSummary);
   const modeBannerText = isCreateMode
     ? createToolName
@@ -237,6 +239,34 @@ export default function IssueChat({
   }, [claudeProgress]);
 
   useEffect(() => {
+    const stopLoading = () => {
+      if (claudeLoadingIntervalRef.current) {
+        clearInterval(claudeLoadingIntervalRef.current);
+        claudeLoadingIntervalRef.current = null;
+      }
+      BeepService.stopLoadingSound();
+    };
+
+    const shouldPlay = !!claudeProgress
+      && claudeProgress.status !== 'waiting_for_comment'
+      && claudeProgress.status !== 'unavailable'
+      && !isTerminalClaudeProgress(claudeProgress);
+
+    if (!shouldPlay) {
+      stopLoading();
+      return () => stopLoading();
+    }
+
+    stopLoading();
+    BeepService.playLoadingSound();
+    claudeLoadingIntervalRef.current = setInterval(() => {
+      BeepService.playLoadingSound();
+    }, 3000);
+
+    return () => stopLoading();
+  }, [claudeProgress]);
+
+  useEffect(() => {
     let cancelled = false;
 
     const clearPoll = () => {
@@ -247,14 +277,17 @@ export default function IssueChat({
     };
 
     const poll = async () => {
-      if (!progressTarget) return;
+      if (!progressTarget || claudePollingStoppedRef.current) return;
       const result = await fetchClaudeProgress(progressTarget);
-      if (cancelled) return;
+      if (cancelled || claudePollingStoppedRef.current) return;
       if (!result) {
         progressPollTimeoutRef.current = setTimeout(poll, 2500);
         return;
       }
       setClaudeProgress((prev) => {
+        if (prev && isTerminalClaudeProgress(prev)) {
+          return prev;
+        }
         if (result.status === 'unavailable' && prev && prev.comment_id) {
           return {
             ...prev,
@@ -264,14 +297,19 @@ export default function IssueChat({
         }
         return result;
       });
-      if (!['completed', 'failed'].includes(result.status)) {
+      if (!isTerminalClaudeProgress(result)) {
         progressPollTimeoutRef.current = setTimeout(poll, 2500);
+      } else {
+        claudePollingStoppedRef.current = true;
+        clearPoll();
+        console.log(`[Claude Progress] polling=stopped reason=${result.status}`);
       }
     };
 
     clearPoll();
     setClaudeProgress(null);
     lastAnnouncedProgressStepRef.current = null;
+    claudePollingStoppedRef.current = false;
 
     if (progressTarget) {
       poll();
@@ -279,6 +317,7 @@ export default function IssueChat({
 
     return () => {
       cancelled = true;
+      claudePollingStoppedRef.current = true;
       clearPoll();
     };
   }, [progressTarget]);
@@ -713,6 +752,7 @@ export default function IssueChat({
     setClaudeProgress(null);
     setProgressTarget(null);
     claudeProgressItemIdRef.current = null;
+    claudePollingStoppedRef.current = true;
     resetConversation();
     Keyboard.dismiss();
   };
@@ -888,9 +928,7 @@ export default function IssueChat({
         );
       }
       case 'assistant-claude-progress': {
-        const accessibilityLabel = item.message
-          ? `${item.message} ${item.body}`
-          : item.body;
+        const accessibilityLabel = buildClaudeAccessibilityLabel(item.body, item.message);
         return (
           <View
             key={item.id}
