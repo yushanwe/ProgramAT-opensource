@@ -37,6 +37,7 @@ import { IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
+import RayBanRecorderModal from './RayBanRecorderModal';
 
 interface IssueChatProps {
   serverFeedback?: string;
@@ -71,6 +72,8 @@ const { ScreenRecordingModule } = NativeModules as {
   };
 };
 
+const hasRayBan = !!(NativeModules as any).MetaWearablesModule?.startRayBanStream;
+
 /**
  * Build the short VoiceOver announcement for the "What I understand" card.
  * On first arrival (no integration note) we extract just the first sentence.
@@ -101,6 +104,7 @@ export default function IssueChat({
   const [composeText, setComposeText] = useState('');
   const [stagedVideoUri, setStagedVideoUri] = useState<string | null>(null);
   const [isVideoRecorderOpen, setIsVideoRecorderOpen] = useState(false);
+  const [isRayBanRecorderOpen, setIsRayBanRecorderOpen] = useState(false);
   const [isPickingFromLibrary, setIsPickingFromLibrary] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [progressText, setProgressText] = useState<string | null>(null);
@@ -300,16 +304,18 @@ export default function IssueChat({
   };
 
   const handleAttachVideoMenu = () => {
-    Alert.alert(
-      'Attach a video',
-      'Choose how to attach a video to this message.',
-      [
-        { text: 'Record a new video', onPress: () => setIsVideoRecorderOpen(true) },
-        { text: 'Choose from photo library', onPress: handlePickFromLibrary },
-        { text: 'Attach most recent recording', onPress: handleAttachRecentSession },
-        { text: 'Cancel', style: 'cancel' },
-      ],
+    const actions: any[] = [
+      { text: 'Record a new video', onPress: () => setIsVideoRecorderOpen(true) },
+    ];
+    if (hasRayBan) {
+      actions.push({ text: 'Record with Ray-Ban glasses', onPress: () => setIsRayBanRecorderOpen(true) });
+    }
+    actions.push(
+      { text: 'Choose from photo library', onPress: handlePickFromLibrary },
+      { text: 'Attach most recent recording', onPress: handleAttachRecentSession },
+      { text: 'Cancel', style: 'cancel' },
     );
+    Alert.alert('Attach a video', 'Choose how to attach a video to this message.', actions);
   };
 
   // --- Turn dispatchers ---
@@ -1105,6 +1111,16 @@ export default function IssueChat({
             setIsVideoRecorderOpen(false);
           }}
           onCancel={() => setIsVideoRecorderOpen(false)}
+        />
+      )}
+      {!basicMode && hasRayBan && (
+        <RayBanRecorderModal
+          visible={isRayBanRecorderOpen}
+          onVideoRecorded={(path) => {
+            setStagedVideoUri(path);
+            setIsRayBanRecorderOpen(false);
+          }}
+          onCancel={() => setIsRayBanRecorderOpen(false)}
         />
       )}
       </KeyboardAvoidingView>
