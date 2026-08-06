@@ -6,7 +6,7 @@
  */
 
 import WebSocketService from './WebSocketService';
-import { CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
+import { ClaudeProgressResponse, CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
 
 const REQUEST_TIMEOUT_MS = 120_000; // text-only requests: brainstorm question, no video
 const VIDEO_REQUEST_TIMEOUT_MS = 300_000; // video upload + summarization + two Gemini calls; uploads over a tunnel (e.g. ngrok) can be slow
@@ -153,5 +153,37 @@ export async function nextBrainstormQuestion(token: string): Promise<NextQuestio
   } catch (e) {
     console.log('[IssueSubmissionService] brainstorm-next-question threw:', String(e));
     return { status: 'error', error: 'Network error. Please try again.' };
+  }
+}
+
+export interface FetchClaudeProgressArgs {
+  mode: 'create' | 'update';
+  issueNumber?: number | null;
+  prNumber?: number | null;
+  commentId?: number | null;
+}
+
+export async function fetchClaudeProgress(args: FetchClaudeProgressArgs): Promise<ClaudeProgressResponse> {
+  const baseUrl = getHttpBaseUrl();
+  if (!baseUrl) {
+    return { status: 'error', steps: [], error: 'Server URL not configured' };
+  }
+  const issueNumber = args.mode === 'update' ? args.prNumber : args.issueNumber;
+  if (!issueNumber) {
+    return { status: 'error', steps: [], error: 'No issue number available for progress lookup' };
+  }
+
+  const query = new URLSearchParams();
+  query.set(args.mode === 'update' ? 'pr_number' : 'issue_number', String(issueNumber));
+  query.set('mode', args.mode);
+  if (args.commentId) query.set('comment_id', String(args.commentId));
+
+  try {
+    const response = await fetch(`${baseUrl}/claude-progress?${query.toString()}`);
+    const result = await response.json();
+    return result as ClaudeProgressResponse;
+  } catch (e) {
+    console.log('[IssueSubmissionService] claude-progress threw:', String(e));
+    return { status: 'unavailable', steps: [], message: 'Could not load Claude progress. Retrying…' };
   }
 }

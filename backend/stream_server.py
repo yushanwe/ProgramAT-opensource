@@ -76,6 +76,12 @@ from litellm_utils import extract_text, call_model
 from model_execution import execute_tool_policy
 from module_manager import get_module_manager
 import copilot_db
+from claude_progress import (
+    CHECKLIST_LINE_RE,
+    looks_like_claude_progress_comment,
+    parse_claude_progress_comment,
+    select_claude_progress_comment,
+)
 from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
 from webrtc_handler import webrtc_offer_handler, cleanup_webrtc_peers
@@ -5255,6 +5261,40 @@ def build_copilot_comment(
     return f"{mention}\n\n{comment_text}", True
 
 
+def resolve_claude_progress_comment(repo_name: str, number: int,
+                                    comment_id: Optional[int] = None,
+                                    mode: str = 'create') -> tuple[object, object, list]:
+    g = Github(GITHUB_TOKEN)
+    repo = g.get_repo(repo_name)
+    issue = repo.get_issue(int(number))
+    endpoint = f"/repos/{repo_name}/issues/{number}/comments"
+
+    comments = list(issue.get_comments())
+    logger.info(
+        "[Claude Comment] mode=%s number=%s endpoint=%s comments=%s",
+        mode, number, endpoint, len(comments),
+    )
+    if comment_id:
+        selected = select_claude_progress_comment(comments, int(comment_id))
+        logger.info("[Claude Comment] selected_id=%s", getattr(selected, 'id', None))
+        return issue, selected, comments
+    for comment in comments:
+        logger.info(
+            "[Claude Comment] candidate_id=%s author=%s body_present=%s",
+            getattr(comment, 'id', None),
+            getattr(getattr(comment, 'user', None), 'login', None),
+            bool(getattr(comment, 'body', None)),
+        )
+    try:
+        selected = select_claude_progress_comment(comments)
+        logger.info("[Claude Comment] selected_id=%s", getattr(selected, 'id', None))
+        return issue, selected, comments
+    except LookupError:
+        logger.info("[Claude Comment] selected_id=none")
+        raise
+
+
+
 async def update_github_issue(issue_number: int, comment_text: str, mention_copilot: bool = True):
     """
     Add a comment to an existing GitHub issue or PR.
@@ -7049,6 +7089,96 @@ async def handle_update_submit(request: web.Request) -> web.Response:
         return web.json_response({'status': 'error', 'error': str(e)}, status=500)
 
 
+async def handle_claude_progress(request: web.Request) -> web.Response:
+    """
+    GET /claude-progress
+    Returns the full Claude comment plus optional parsed checklist metadata.
+    Query params:
+      - issue_number (required for create mode)
+      - pr_number (required for update mode)
+      - mode (create|update)
+      - comment_id (optional exact GitHub comment id)
+      - repo (optional owner/repo override, defaults to configured repo)
+    """
+    if not GITHUB_TOKEN:
+        return web.json_response({'status': 'unavailable', 'error': 'GitHub not configured'}, status=503)
+
+    repo_name = (request.query.get('repo') or GITHUB_REPO or '').strip()
+    mode = (request.query.get('mode') or ('update' if request.query.get('pr_number') else 'create')).strip().lower()
+    issue_or_pr_number = request.query.get('pr_number') if mode == 'update' else request.query.get('issue_number')
+    comment_id = request.query.get('comment_id')
+
+    if not repo_name:
+        return web.json_response({'status': 'error', 'error': 'Repository is required'}, status=400)
+    if mode not in {'create', 'update'}:
+        return web.json_response({'status': 'error', 'error': 'mode must be create or update'}, status=400)
+    if not issue_or_pr_number:
+        return web.json_response({'status': 'error', 'error': 'issue_number or pr_number is required'}, status=400)
+
+    try:
+        issue_number = int(issue_or_pr_number)
+    except ValueError:
+        return web.json_response({'status': 'error', 'error': 'issue_number must be an integer'}, status=400)
+
+    try:
+        exact_comment_id = int(comment_id) if comment_id else None
+    except ValueError:
+        return web.json_response({'status': 'error', 'error': 'comment_id must be an integer'}, status=400)
+
+    try:
+        issue, comment, _comments = await asyncio.to_thread(
+            resolve_claude_progress_comment,
+            repo_name,
+            issue_number,
+            exact_comment_id,
+            mode,
+        )
+    except LookupError:
+        return web.json_response({
+            'status': 'waiting_for_comment',
+            'title': getattr(issue, 'title', None) if 'issue' in locals() else None,
+            'issue_number': issue_number,
+            'comment_id': exact_comment_id,
+            'body': '',
+            'steps': [],
+            'updated_at': None,
+            'message': 'Claude progress comment has not been created yet.',
+        })
+    except Exception as e:
+        logger.error("Failed to fetch Claude progress for #%s: %s", issue_number, e, exc_info=True)
+        return web.json_response({
+            'status': 'unavailable',
+            'title': None,
+            'issue_number': issue_number,
+            'comment_id': exact_comment_id,
+            'body': '',
+            'steps': [],
+            'updated_at': None,
+            'message': 'GitHub progress is temporarily unavailable. Retrying…',
+            'error': str(e),
+        }, status=502)
+
+    parsed = parse_claude_progress_comment(
+        getattr(comment, 'body', '') or '',
+        issue_number=issue_number,
+        comment_id=getattr(comment, 'id', exact_comment_id),
+        updated_at=getattr(comment, 'updated_at', None).isoformat() if getattr(comment, 'updated_at', None) else None,
+    )
+    parsed['title'] = parsed.get('title') or getattr(issue, 'title', None)
+
+    if parsed['status'] == 'failed':
+        parsed['status'] = 'failed'
+        parsed['message'] = 'Claude reported a failure while working on this task.'
+    elif parsed['status'] == 'completed':
+        parsed['status'] = 'completed'
+        parsed['message'] = 'Claude finished all checklist steps.'
+    else:
+        parsed['status'] = 'available'
+        parsed['message'] = 'Claude comment available.'
+
+    return web.json_response(parsed)
+
+
 async def handle_test_video_summary(request: web.Request) -> web.Response:
     """
     POST /test-video-summary
@@ -8720,6 +8850,7 @@ async def main():
     app.router.add_post('/submit-creation', handle_creation_submit)
     app.router.add_post('/brainstorm-next-question', handle_brainstorm_next_question)
     app.router.add_post('/submit-update', handle_update_submit)
+    app.router.add_get('/claude-progress', handle_claude_progress)
     app.router.add_post('/test-video-summary', handle_test_video_summary)
     app.router.add_post('/offer', webrtc_offer_handler)  # WebRTC signaling
 
