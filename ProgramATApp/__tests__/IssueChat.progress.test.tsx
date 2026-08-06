@@ -4,7 +4,7 @@ import { AccessibilityInfo, TextInput, TouchableOpacity } from 'react-native';
 import IssueChat from '../IssueChat';
 import PRsAndText from '../PRsAndText';
 import { ThemeProvider } from '../ThemeContext';
-import { sanitizeClaudeCommentBody } from '../claudeCommentSanitizer';
+import { buildClaudeAccessibilityLabel, isTerminalClaudeProgress, sanitizeClaudeCommentBody } from '../claudeCommentSanitizer';
 
 jest.useFakeTimers();
 
@@ -40,9 +40,17 @@ jest.mock('../TextToSpeechService', () => ({
   default: { speakWithInterrupt: jest.fn() },
 }));
 
+const mockPlayBeep = jest.fn();
+const mockPlayLoadingSound = jest.fn();
+const mockStopLoadingSound = jest.fn();
+
 jest.mock('../BeepService', () => ({
   __esModule: true,
-  default: { playBeep: jest.fn() },
+  default: {
+    playBeep: (...args: any[]) => mockPlayBeep(...args),
+    playLoadingSound: (...args: any[]) => mockPlayLoadingSound(...args),
+    stopLoadingSound: (...args: any[]) => mockStopLoadingSound(...args),
+  },
 }));
 
 jest.mock('../VideoRecorderModal', () => 'VideoRecorderModal');
@@ -74,6 +82,9 @@ describe('IssueChat progress', () => {
     mockSubmitUpdate.mockReset();
     mockNextBrainstormQuestion.mockReset();
     mockFetchClaudeProgress.mockReset();
+    mockPlayBeep.mockReset();
+    mockPlayLoadingSound.mockReset();
+    mockStopLoadingSound.mockReset();
   });
 
   test('polls for Claude progress and cleans up on unmount', async () => {
@@ -172,7 +183,11 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
 
-    const claudeLabel = renderer!.root.findAll((node) => node.props?.accessibilityLabel === 'Claude comment available. ### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py');
+    const claudeLabel = renderer!.root.findAll((node) =>
+      typeof node.props?.accessibilityLabel === 'string'
+      && node.props.accessibilityLabel.includes('Finished: Read issue and repository CLAUDE.md')
+      && node.props.accessibilityLabel.includes('Ongoing: Implement tool.py')
+    );
     expect(claudeLabel.length).toBeGreaterThan(0);
     expect(announceSpy).toHaveBeenCalledWith('In progress: Building the tool');
 
@@ -247,6 +262,66 @@ describe('IssueChat progress', () => {
     const claudeTexts = renderer!.root.findAll((node) => node.type === 'Text' && node.props?.children === 'Claude');
     expect(claudeTexts).toHaveLength(1);
     expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('stops polling and loading sound after terminal status', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 21,
+      issue_url: 'https://github.test/issues/21',
+      video_summary: '',
+      pr_number: 21,
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 21,
+        comment_id: 401,
+        body: 'Working now\n- [ ] Build tool',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+      })
+      .mockResolvedValueOnce({
+        status: 'completed',
+        issue_number: 21,
+        comment_id: 401,
+        body: 'Done\n- [x] Build tool',
+        message: 'Claude finished all checklist steps.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 21, title: 'PR 21' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+
+    expect(mockPlayLoadingSound).toHaveBeenCalled();
+
+    await act(async () => {
+      jest.advanceTimersByTime(2500);
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(6000);
+      await Promise.resolve();
+    });
+    expect(mockFetchClaudeProgress.mock.calls.length).toBeLessThanOrEqual(5);
+    expect(mockStopLoadingSound).toHaveBeenCalled();
+    await act(async () => {
+      renderer!.unmount();
+    });
   });
 
   test('renders Claude progress inside the normal message list for create and update', async () => {
@@ -336,5 +411,40 @@ describe('sanitizeClaudeCommentBody', () => {
     expect(output).not.toContain('<img');
     expect(output).not.toContain('spinner.gif');
     expect(output).toContain('Error: validation failed');
+  });
+
+  test('removes manual create-pr link and compare url', () => {
+    const input = `Create a PR\nhttps://github.com/org/repo/compare/main...very-long-branch?expand=1\nUseful summary\nhttps://github.com/org/repo/pull/5`;
+    const output = sanitizeClaudeCommentBody(input);
+    expect(output).not.toContain('Create a PR');
+    expect(output).not.toContain('/compare/main...very-long-branch');
+    expect(output).toContain('Useful summary');
+    expect(output).toContain('/pull/5');
+  });
+});
+
+describe('Claude accessibility helpers', () => {
+  test('normalizes checklist items for VoiceOver', () => {
+    const output = buildClaudeAccessibilityLabel(
+      '- [x] Read issue and repository `CLAUDE.md`\n- [x] Implement `tools/exit_finder.py`\n- [ ] Add focused tests\n- [] Commit and push',
+      'Claude comment available.',
+    );
+    expect(output).toContain('Finished: Read issue and repository CLAUDE.md');
+    expect(output).toContain('Finished: Implement tools/exit_finder.py');
+    expect(output).toContain('Ongoing: Add focused tests');
+    expect(output).toContain('To do: Commit and push');
+    expect(output).not.toContain('[x]');
+    expect(output).not.toContain('`');
+  });
+
+  test('detects terminal progress conditions', () => {
+    expect(isTerminalClaudeProgress({ status: 'completed', body: '', steps: [] })).toBe(true);
+    expect(isTerminalClaudeProgress({
+      status: 'available',
+      body: '- [x] One\n- [x] Two',
+      steps: [{ status: 'completed' }, { status: 'completed' }] as any,
+    })).toBe(true);
+    expect(isTerminalClaudeProgress({ status: 'available', body: 'Finished implementation and opened PR #8', steps: [] })).toBe(true);
+    expect(isTerminalClaudeProgress({ status: 'available', body: 'Still working', steps: [] })).toBe(false);
   });
 });
