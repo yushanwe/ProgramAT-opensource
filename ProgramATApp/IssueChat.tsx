@@ -34,6 +34,7 @@ import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
+import { sanitizeClaudeCommentBody } from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
 
@@ -63,7 +64,7 @@ function summarizeClaudeAnnouncement(progress: ClaudeProgressResponse): string {
 }
 
 function formatClaudeBody(body: string | undefined): string {
-  const value = (body || '').trim();
+  const value = sanitizeClaudeCommentBody(body);
   return value || 'Claude has not posted a progress comment yet.';
 }
 
@@ -940,10 +941,6 @@ export default function IssueChat({
     }
   };
 
-  const renderClaudeProgress = () => {
-    return null;
-  };
-
   return (
     <KeyboardAvoidingView
       style={[styles.container, { backgroundColor: theme.background }]}
@@ -1017,7 +1014,6 @@ export default function IssueChat({
             {isCreateMode ? 'New Visual AT Tool' : `Update ${selectedIssue?.title}`}
           </Text>
         </View>
-        {renderClaudeProgress()}
       </View>
 
       <ScrollView
