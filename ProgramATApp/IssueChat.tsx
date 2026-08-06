@@ -787,10 +787,11 @@ export default function IssueChat({
   };
 
   return (
-    <KeyboardAvoidingView
-      style={[styles.container, { backgroundColor: theme.background }]}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={['bottom']}>
+      <KeyboardAvoidingView
+        style={styles.container}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
         {modeBannerText && (
           <View
@@ -1092,7 +1093,8 @@ export default function IssueChat({
           onCancel={() => setIsVideoRecorderOpen(false)}
         />
       )}
-    </KeyboardAvoidingView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
