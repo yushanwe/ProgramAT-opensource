@@ -4,6 +4,7 @@ import { AccessibilityInfo, TextInput, TouchableOpacity } from 'react-native';
 import IssueChat from '../IssueChat';
 import PRsAndText from '../PRsAndText';
 import { ThemeProvider } from '../ThemeContext';
+import { sanitizeClaudeCommentBody } from '../claudeCommentSanitizer';
 
 jest.useFakeTimers();
 
@@ -246,5 +247,94 @@ describe('IssueChat progress', () => {
     const claudeTexts = renderer!.root.findAll((node) => node.type === 'Text' && node.props?.children === 'Claude');
     expect(claudeTexts).toHaveLength(1);
     expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('renders Claude progress inside the normal message list for create and update', async () => {
+    mockSubmitCreation.mockResolvedValue({
+      status: 'created',
+      issue_number: 12,
+      issue_url: 'https://github.test/issues/12',
+      video_summary: '',
+    });
+    mockFetchClaudeProgress.mockResolvedValue({
+      status: 'available',
+      issue_number: 12,
+      comment_id: 300,
+      body: 'Claude create progress',
+      message: 'Claude comment available.',
+      steps: [],
+    });
+
+    let createRenderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      createRenderer = renderWithTheme(<IssueChat />);
+    });
+    const createInput = createRenderer!.root.findByType(TextInput);
+    await act(async () => {
+      createInput.props.onChangeText('Create it');
+    });
+    const createSend = createRenderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      createSend!.props.onPress();
+    });
+
+    const createJson = JSON.stringify(createRenderer!.toJSON());
+    expect(createJson).toContain('Issue #12 created.');
+    expect(createJson).toContain('Claude create progress');
+
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 13,
+      issue_url: 'https://github.test/issues/13',
+      video_summary: '',
+      pr_number: 13,
+    });
+    mockFetchClaudeProgress.mockResolvedValue({
+      status: 'available',
+      issue_number: 13,
+      comment_id: 301,
+      body: 'Claude update progress',
+      message: 'Claude comment available.',
+      steps: [],
+    });
+
+    let updateRenderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      updateRenderer = renderWithTheme(<IssueChat selectedIssue={{ number: 13, title: 'PR 13' }} />);
+    });
+    const updateInput = updateRenderer!.root.findByType(TextInput);
+    await act(async () => {
+      updateInput.props.onChangeText('Update it');
+    });
+    const updateSend = updateRenderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      updateSend!.props.onPress();
+    });
+
+    const updateJson = JSON.stringify(updateRenderer!.toJSON());
+    expect(updateJson).toContain('Issue #13 updated.');
+    expect(updateJson).toContain('Claude update progress');
+  });
+});
+
+describe('sanitizeClaudeCommentBody', () => {
+  test('removes img tags and image markdown', () => {
+    const input = `Before\n<img src="https://example.com/spinner.gif" width="14px" />\n![spinner](https://example.com/spinner.gif)\nAfter`;
+    expect(sanitizeClaudeCommentBody(input)).toBe('Before\n\nAfter');
+  });
+
+  test('preserves meaningful text and checklist content', () => {
+    const input = `### Progress\n<div>Working on validation</div>\n- [x] Read issue\n- [ ] Validate tool\nPR: https://github.com/example/repo/pull/5`;
+    expect(sanitizeClaudeCommentBody(input)).toContain('### Progress');
+    expect(sanitizeClaudeCommentBody(input)).toContain('- [x] Read issue');
+    expect(sanitizeClaudeCommentBody(input)).toContain('PR: https://github.com/example/repo/pull/5');
+  });
+
+  test('removes raw media attachment urls and unsupported html', () => {
+    const input = `<div><img src="https://github.com/user-attachments/files/spinner.gif" /></div>\nhttps://github.com/user-attachments/files/spinner.gif\nError: validation failed`;
+    const output = sanitizeClaudeCommentBody(input);
+    expect(output).not.toContain('<img');
+    expect(output).not.toContain('spinner.gif');
+    expect(output).toContain('Error: validation failed');
   });
 });
