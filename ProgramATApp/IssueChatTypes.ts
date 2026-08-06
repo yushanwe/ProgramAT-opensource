@@ -19,6 +19,7 @@ export type IssueChatItem =
   | { kind: 'assistant-choice-prompt'; id: string; ts: Date; text: string; token: string; resolved: boolean }
   | { kind: 'assistant-created'; id: string; ts: Date; issueNumber: number; issueUrl: string; videoSummarySkipped: boolean }
   | { kind: 'assistant-updated'; id: string; ts: Date; issueNumber: number; issueUrl: string; videoSummarySkipped: boolean }
+  | { kind: 'assistant-claude-progress'; id: string; ts: Date; status: string; body: string; commentId?: number | null; updatedAt?: string | null; message?: string }
   | { kind: 'assistant-error'; id: string; ts: Date; text: string; retry?: RetryDescriptor };
 
 export type CreationResponse =
@@ -45,10 +46,11 @@ export interface ClaudeProgressStep {
 }
 
 export interface ClaudeProgressResponse {
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'waiting' | 'retrying' | 'unavailable' | 'error';
+  status: 'waiting_for_comment' | 'available' | 'completed' | 'failed' | 'unavailable';
   title?: string | null;
   issue_number?: number | null;
   comment_id?: number | null;
+  body?: string;
   steps: ClaudeProgressStep[];
   updated_at?: string | null;
   message?: string;

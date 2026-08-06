@@ -84,12 +84,13 @@ describe('IssueChat progress', () => {
       pr_number: 42,
     });
     mockFetchClaudeProgress.mockResolvedValue({
-      status: 'running',
+      status: 'available',
       title: 'Creating Tool',
       issue_number: 42,
       comment_id: 100,
-      message: 'Claude is working through the checklist.',
-      steps: [{ id: 'step_1', label: 'Building the tool', raw_label: 'Implement tool.py', status: 'in_progress' }],
+      body: 'Working on the PR update now.',
+      message: 'Claude comment available.',
+      steps: [],
     });
 
     let renderer: ReactTestRenderer.ReactTestRenderer;
@@ -131,27 +132,27 @@ describe('IssueChat progress', () => {
     });
     mockFetchClaudeProgress
       .mockResolvedValueOnce({
-        status: 'running',
+        status: 'available',
         title: 'Creating Tool',
         issue_number: 7,
         comment_id: 101,
-        message: 'Claude is working through the checklist.',
+        body: '### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py',
+        message: 'Claude comment available.',
         steps: [
           { id: 'step_1', label: 'Reading your tool requirements', raw_label: 'Read issue and repository CLAUDE.md', status: 'completed' },
           { id: 'step_2', label: 'Building the tool', raw_label: 'Implement tool.py', status: 'in_progress' },
-          { id: 'step_3', label: 'Checking the generated tool', raw_label: 'Validate tool.py', status: 'pending' },
         ],
       })
       .mockResolvedValueOnce({
-        status: 'running',
+        status: 'available',
         title: 'Creating Tool',
         issue_number: 7,
         comment_id: 101,
-        message: 'Claude is working through the checklist.',
+        body: '### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py',
+        message: 'Claude comment available.',
         steps: [
           { id: 'step_1', label: 'Reading your tool requirements', raw_label: 'Read issue and repository CLAUDE.md', status: 'completed' },
           { id: 'step_2', label: 'Building the tool', raw_label: 'Implement tool.py', status: 'in_progress' },
-          { id: 'step_3', label: 'Checking the generated tool', raw_label: 'Validate tool.py', status: 'pending' },
         ],
       });
 
@@ -170,12 +171,8 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
 
-    const step1 = renderer!.root.findByProps({ testID: 'claude-progress-step-step_1' });
-    const step2 = renderer!.root.findByProps({ testID: 'claude-progress-step-step_2' });
-    const step3 = renderer!.root.findByProps({ testID: 'claude-progress-step-step_3' });
-    expect(step1.props.accessibilityLabel).toBe('Completed: Reading your tool requirements');
-    expect(step2.props.accessibilityLabel).toBe('In progress: Building the tool');
-    expect(step3.props.accessibilityLabel).toBe('Pending: Checking the generated tool');
+    const claudeLabel = renderer!.root.findAll((node) => node.props?.accessibilityLabel === 'Claude comment available. ### Progress\n\n- [x] Read issue and repository CLAUDE.md\n- [ ] Implement tool.py');
+    expect(claudeLabel.length).toBeGreaterThan(0);
     expect(announceSpy).toHaveBeenCalledWith('In progress: Building the tool');
 
     await act(async () => {
@@ -198,6 +195,56 @@ describe('IssueChat progress', () => {
       );
     });
 
-    expect(renderer!.root.findAllByProps({ testID: 'claude-progress-card' })).toHaveLength(0);
+    expect(renderer!.root.findAll((node) => node.props?.testID === 'claude-progress-card')).toHaveLength(0);
+  });
+
+  test('updates one in-flow Claude message without duplicates', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 9,
+      issue_url: 'https://github.test/issues/9',
+      video_summary: '',
+      pr_number: 9,
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 9,
+        comment_id: 201,
+        updated_at: '2026-08-05T12:00:00Z',
+        body: 'First Claude update',
+        message: 'Claude comment available.',
+        steps: [],
+      })
+      .mockResolvedValueOnce({
+        status: 'completed',
+        issue_number: 9,
+        comment_id: 201,
+        updated_at: '2026-08-05T12:00:05Z',
+        body: 'Final Claude update',
+        message: 'Claude finished all checklist steps.',
+        steps: [],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 9, title: 'PR 9' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(2500);
+      await Promise.resolve();
+    });
+
+    const claudeTexts = renderer!.root.findAll((node) => node.type === 'Text' && node.props?.children === 'Claude');
+    expect(claudeTexts).toHaveLength(1);
+    expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 });

@@ -76,6 +76,12 @@ from litellm_utils import extract_text, call_model
 from model_execution import execute_tool_policy
 from module_manager import get_module_manager
 import copilot_db
+from claude_progress import (
+    CHECKLIST_LINE_RE,
+    looks_like_claude_progress_comment,
+    parse_claude_progress_comment,
+    select_claude_progress_comment,
+)
 from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
 from webrtc_handler import webrtc_offer_handler, cleanup_webrtc_peers
@@ -5255,128 +5261,38 @@ def build_copilot_comment(
     return f"{mention}\n\n{comment_text}", True
 
 
-CHECKLIST_LINE_RE = re.compile(r'^\s*[-*]\s+\[(?P<checked>[ xX])\]\s+(?P<label>.+?)\s*$')
-FAILURE_PATTERNS = (
-    re.compile(r'\b(failed|failure|error|exception|traceback|unable to|could not|blocked)\b', re.IGNORECASE),
-    re.compile(r'(^|\n)\s*status\s*:\s*failed\b', re.IGNORECASE),
-)
-CLAUDE_PROGRESS_TITLE_RE = re.compile(r'^\s{0,3}#{1,6}\s+(.+?)\s*$')
-CLAUDE_PROGRESS_COMMENT_USERNAMES = {
-    'claude[bot]',
-    'claude',
-    'github-actions[bot]',
-}
-
-
-def _normalize_progress_label(raw_label: str) -> str:
-    normalized = re.sub(r'`([^`]+)`', r'\1', raw_label).strip()
-    lowered = normalized.lower()
-    replacements = [
-        (r'^(read|review) issue and repository claude\.md$', 'Reading your tool requirements'),
-        (r'^(inspect|review) existing tool patterns$', 'Planning the implementation'),
-        (r'^implement\b.+$', 'Building the tool'),
-        (r'^(validate|run validation|check)\b.+$', 'Checking the generated tool'),
-        (r'^(commit and push|save changes|save the completed tool)$', 'Saving the completed tool'),
-        (r'^(provide|share)\s+pr link$', 'Sharing the pull request'),
-    ]
-    for pattern, replacement in replacements:
-        if re.match(pattern, lowered):
-            return replacement
-    normalized = re.sub(r'\b[a-z0-9_./-]+\.(py|ts|tsx|js)\b', 'the tool', normalized, flags=re.IGNORECASE)
-    normalized = re.sub(r'\s+', ' ', normalized).strip(' .')
-    if normalized:
-        return normalized[0].upper() + normalized[1:]
-    return raw_label.strip()
-
-
-def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = None,
-                                  comment_id: Optional[int] = None,
-                                  updated_at: Optional[str] = None) -> dict:
-    lines = body.splitlines()
-    title = None
-    steps = []
-    first_pending_index = None
-
-    for line in lines:
-        if title is None:
-            title_match = CLAUDE_PROGRESS_TITLE_RE.match(line)
-            if title_match:
-                title = title_match.group(1).strip()
-        match = CHECKLIST_LINE_RE.match(line)
-        if not match:
-            continue
-        raw_label = match.group('label').strip()
-        checked = match.group('checked').lower() == 'x'
-        steps.append({
-            'raw_label': raw_label,
-            'completed': checked,
-        })
-        if not checked and first_pending_index is None:
-            first_pending_index = len(steps) - 1
-
-    has_failure_text = any(pattern.search(body) for pattern in FAILURE_PATTERNS)
-    if has_failure_text:
-        overall_status = 'failed'
-    elif steps and all(step['completed'] for step in steps):
-        overall_status = 'completed'
-    elif steps:
-        overall_status = 'running'
-    else:
-        overall_status = 'waiting'
-
-    normalized_steps = []
-    for index, step in enumerate(steps, start=1):
-        if has_failure_text and not step['completed'] and first_pending_index == index - 1:
-            step_status = 'failed'
-        elif step['completed']:
-            step_status = 'completed'
-        elif first_pending_index == index - 1:
-            step_status = 'in_progress'
-        else:
-            step_status = 'pending'
-        normalized_steps.append({
-            'id': f'step_{index}',
-            'label': _normalize_progress_label(step['raw_label']),
-            'raw_label': step['raw_label'],
-            'status': step_status,
-        })
-
-    return {
-        'status': overall_status,
-        'title': title,
-        'issue_number': issue_number,
-        'comment_id': comment_id,
-        'steps': normalized_steps,
-        'updated_at': updated_at,
-        'has_checklist': bool(normalized_steps),
-        'has_failure_text': has_failure_text,
-    }
-
-
-def _looks_like_claude_progress_comment(comment) -> bool:
-    user = getattr(getattr(comment, 'user', None), 'login', '') or ''
-    if user.lower() not in CLAUDE_PROGRESS_COMMENT_USERNAMES:
-        return False
-    body = getattr(comment, 'body', '') or ''
-    return bool(CHECKLIST_LINE_RE.search(body))
-
-
-def resolve_claude_progress_comment(repo_name: str, issue_number: int,
-                                    comment_id: Optional[int] = None) -> tuple[object, object]:
+def resolve_claude_progress_comment(repo_name: str, number: int,
+                                    comment_id: Optional[int] = None,
+                                    mode: str = 'create') -> tuple[object, object, list]:
     g = Github(GITHUB_TOKEN)
     repo = g.get_repo(repo_name)
-    issue = repo.get_issue(int(issue_number))
-
-    if comment_id:
-        target = issue.get_comment(int(comment_id))
-        return issue, target
+    issue = repo.get_issue(int(number))
+    endpoint = f"/repos/{repo_name}/issues/{number}/comments"
 
     comments = list(issue.get_comments())
-    for comment in reversed(comments):
-        if _looks_like_claude_progress_comment(comment):
-            return issue, comment
+    logger.info(
+        "[Claude Comment] mode=%s number=%s endpoint=%s comments=%s",
+        mode, number, endpoint, len(comments),
+    )
+    if comment_id:
+        selected = select_claude_progress_comment(comments, int(comment_id))
+        logger.info("[Claude Comment] selected_id=%s", getattr(selected, 'id', None))
+        return issue, selected, comments
+    for comment in comments:
+        logger.info(
+            "[Claude Comment] candidate_id=%s author=%s body_present=%s",
+            getattr(comment, 'id', None),
+            getattr(getattr(comment, 'user', None), 'login', None),
+            bool(getattr(comment, 'body', None)),
+        )
+    try:
+        selected = select_claude_progress_comment(comments)
+        logger.info("[Claude Comment] selected_id=%s", getattr(selected, 'id', None))
+        return issue, selected, comments
+    except LookupError:
+        logger.info("[Claude Comment] selected_id=none")
+        raise
 
-    raise LookupError('Claude progress comment not found')
 
 
 async def update_github_issue(issue_number: int, comment_text: str, mention_copilot: bool = True):
@@ -7163,10 +7079,11 @@ async def handle_update_submit(request: web.Request) -> web.Response:
 async def handle_claude_progress(request: web.Request) -> web.Response:
     """
     GET /claude-progress
-    Returns parsed Claude checklist progress for the current create/update task.
+    Returns the full Claude comment plus optional parsed checklist metadata.
     Query params:
-      - issue_number (required unless pr_number is provided)
-      - pr_number (optional, treated as the issue number for PR comments)
+      - issue_number (required for create mode)
+      - pr_number (required for update mode)
+      - mode (create|update)
       - comment_id (optional exact GitHub comment id)
       - repo (optional owner/repo override, defaults to configured repo)
     """
@@ -7174,11 +7091,14 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
         return web.json_response({'status': 'unavailable', 'error': 'GitHub not configured'}, status=503)
 
     repo_name = (request.query.get('repo') or GITHUB_REPO or '').strip()
-    issue_or_pr_number = request.query.get('pr_number') or request.query.get('issue_number')
+    mode = (request.query.get('mode') or ('update' if request.query.get('pr_number') else 'create')).strip().lower()
+    issue_or_pr_number = request.query.get('pr_number') if mode == 'update' else request.query.get('issue_number')
     comment_id = request.query.get('comment_id')
 
     if not repo_name:
         return web.json_response({'status': 'error', 'error': 'Repository is required'}, status=400)
+    if mode not in {'create', 'update'}:
+        return web.json_response({'status': 'error', 'error': 'mode must be create or update'}, status=400)
     if not issue_or_pr_number:
         return web.json_response({'status': 'error', 'error': 'issue_number or pr_number is required'}, status=400)
 
@@ -7193,18 +7113,20 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
         return web.json_response({'status': 'error', 'error': 'comment_id must be an integer'}, status=400)
 
     try:
-        issue, comment = await asyncio.to_thread(
+        issue, comment, _comments = await asyncio.to_thread(
             resolve_claude_progress_comment,
             repo_name,
             issue_number,
             exact_comment_id,
+            mode,
         )
     except LookupError:
         return web.json_response({
-            'status': 'waiting',
+            'status': 'waiting_for_comment',
             'title': getattr(issue, 'title', None) if 'issue' in locals() else None,
             'issue_number': issue_number,
             'comment_id': exact_comment_id,
+            'body': '',
             'steps': [],
             'updated_at': None,
             'message': 'Claude progress comment has not been created yet.',
@@ -7212,10 +7134,11 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
     except Exception as e:
         logger.error("Failed to fetch Claude progress for #%s: %s", issue_number, e, exc_info=True)
         return web.json_response({
-            'status': 'retrying',
+            'status': 'unavailable',
             'title': None,
             'issue_number': issue_number,
             'comment_id': exact_comment_id,
+            'body': '',
             'steps': [],
             'updated_at': None,
             'message': 'GitHub progress is temporarily unavailable. Retrying…',
@@ -7230,18 +7153,16 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
     )
     parsed['title'] = parsed.get('title') or getattr(issue, 'title', None)
 
-    if not parsed['has_checklist']:
-        parsed['status'] = 'waiting'
-        parsed['message'] = 'Claude comment exists, but the checklist has not appeared yet.'
-    elif parsed['status'] == 'failed':
+    if parsed['status'] == 'failed':
+        parsed['status'] = 'failed'
         parsed['message'] = 'Claude reported a failure while working on this task.'
     elif parsed['status'] == 'completed':
+        parsed['status'] = 'completed'
         parsed['message'] = 'Claude finished all checklist steps.'
     else:
-        parsed['message'] = 'Claude is working through the checklist.'
+        parsed['status'] = 'available'
+        parsed['message'] = 'Claude comment available.'
 
-    parsed.pop('has_checklist', None)
-    parsed.pop('has_failure_text', None)
     return web.json_response(parsed)
 
 

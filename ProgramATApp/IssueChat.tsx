@@ -46,13 +46,25 @@ interface IssueChatProps {
 }
 
 type Awaiting = 'answer' | 'choice' | null;
-type ProgressTarget = { issueNumber: number; prNumber?: number | null; commentId?: number | null };
+type ProgressTarget = { mode: 'create' | 'update'; issueNumber?: number | null; prNumber?: number | null; commentId?: number | null };
 
 function buildProgressAnnouncement(status: string, label: string): string {
   if (status === 'completed') return `Completed: ${label}`;
   if (status === 'in_progress') return `In progress: ${label}`;
   if (status === 'failed') return `Failed: ${label}`;
   return `Pending: ${label}`;
+}
+
+function summarizeClaudeAnnouncement(progress: ClaudeProgressResponse): string {
+  if (progress.status === 'waiting_for_comment') return 'Claude has not posted a progress comment yet.';
+  if (progress.status === 'failed') return 'Claude posted a failed status update.';
+  if (progress.status === 'completed') return 'Claude posted a completed status update.';
+  return 'Claude updated progress.';
+}
+
+function formatClaudeBody(body: string | undefined): string {
+  const value = (body || '').trim();
+  return value || 'Claude has not posted a progress comment yet.';
 }
 
 function extractCreateToolName(summary: string | null): string | null {
@@ -132,6 +144,7 @@ export default function IssueChat({
   const lastAnnouncedIdRef = useRef<string | null>(null);
   const lastAnnouncedProgressStepRef = useRef<string | null>(null);
   const progressPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const claudeProgressItemIdRef = useRef<string | null>(null);
   const createToolName = extractCreateToolName(understandingSummary);
   const modeBannerText = isCreateMode
     ? createToolName
@@ -211,11 +224,15 @@ export default function IssueChat({
   }, [progressText]);
 
   useEffect(() => {
-    const activeStep = claudeProgress?.steps.find((step) => step.status === 'in_progress' || step.status === 'failed');
-    if (!activeStep) return;
-    if (lastAnnouncedProgressStepRef.current === activeStep.id) return;
-    lastAnnouncedProgressStepRef.current = activeStep.id;
-    AccessibilityInfo.announceForAccessibility(buildProgressAnnouncement(activeStep.status, activeStep.label));
+    if (!claudeProgress) return;
+    const activeStep = claudeProgress.steps.find((step) => step.status === 'in_progress' || step.status === 'failed');
+    const announcement = activeStep
+      ? buildProgressAnnouncement(activeStep.status, activeStep.label)
+      : summarizeClaudeAnnouncement(claudeProgress);
+    const announcementKey = `${claudeProgress.comment_id || 'none'}:${claudeProgress.updated_at || claudeProgress.status}:${announcement}`;
+    if (lastAnnouncedProgressStepRef.current === announcementKey) return;
+    lastAnnouncedProgressStepRef.current = announcementKey;
+    AccessibilityInfo.announceForAccessibility(announcement);
   }, [claudeProgress]);
 
   useEffect(() => {
@@ -232,8 +249,21 @@ export default function IssueChat({
       if (!progressTarget) return;
       const result = await fetchClaudeProgress(progressTarget);
       if (cancelled) return;
-      setClaudeProgress(result);
-      if (!['completed', 'failed', 'cancelled'].includes(result.status)) {
+      if (!result) {
+        progressPollTimeoutRef.current = setTimeout(poll, 2500);
+        return;
+      }
+      setClaudeProgress((prev) => {
+        if (result.status === 'unavailable' && prev && prev.comment_id) {
+          return {
+            ...prev,
+            message: result.message || prev.message,
+            error: result.error || prev.error,
+          };
+        }
+        return result;
+      });
+      if (!['completed', 'failed'].includes(result.status)) {
         progressPollTimeoutRef.current = setTimeout(poll, 2500);
       }
     };
@@ -251,6 +281,11 @@ export default function IssueChat({
       clearPoll();
     };
   }, [progressTarget]);
+
+  useEffect(() => {
+    if (!claudeProgress || !progressTarget) return;
+    upsertClaudeProgressItem(claudeProgress);
+  }, [claudeProgress, progressTarget]);
 
   // Listen for WS 'progress' broadcasts fired by the backend while an HTTP
   // request from this screen is in flight (e.g. "Summarizing video…"). This
@@ -277,6 +312,42 @@ export default function IssueChat({
   };
 
   const append = (item: IssueChatItem) => setItems((prev) => [...prev, item]);
+
+  const upsertClaudeProgressItem = (progress: ClaudeProgressResponse) => {
+    const body = formatClaudeBody(progress.body);
+    setItems((prev) => {
+      const existingId = claudeProgressItemIdRef.current
+        || prev.find((item) => item.kind === 'assistant-claude-progress')?.id
+        || null;
+      if (!existingId) {
+        const id = nextId('assistant-claude-progress');
+        claudeProgressItemIdRef.current = id;
+        return [...prev, {
+          kind: 'assistant-claude-progress',
+          id,
+          ts: new Date(),
+          status: progress.status,
+          body,
+          commentId: progress.comment_id,
+          updatedAt: progress.updated_at,
+          message: progress.message,
+        }];
+      }
+      return prev.map((item) => {
+        if (item.kind !== 'assistant-claude-progress' || item.id !== existingId) return item;
+        claudeProgressItemIdRef.current = existingId;
+        return {
+          ...item,
+          ts: new Date(),
+          status: progress.status,
+          body,
+          commentId: progress.comment_id,
+          updatedAt: progress.updated_at,
+          message: progress.message,
+        };
+      });
+    });
+  };
 
   const resolveLatestChoicePrompt = () => {
     setItems((prev) => {
@@ -411,7 +482,7 @@ export default function IssueChat({
         issueUrl: result.issue_url,
         videoSummarySkipped,
       });
-      setProgressTarget({ issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
+      setProgressTarget({ mode: 'create', issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
       resetConversation();
       return;
     }
@@ -530,7 +601,7 @@ export default function IssueChat({
           issueUrl: result.issue_url,
           videoSummarySkipped,
         });
-        setProgressTarget({ issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
+        setProgressTarget({ mode: 'create', issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
         resetConversation();
       } else {
         const message = result.status === 'error' ? result.error : 'Failed to create issue';
@@ -573,7 +644,7 @@ export default function IssueChat({
           issueUrl: result.issue_url,
           videoSummarySkipped,
         });
-        setProgressTarget({ issueNumber: result.issue_number, prNumber: result.pr_number ?? selectedIssue.number, commentId: result.comment_id });
+        setProgressTarget({ mode: 'update', prNumber: result.pr_number ?? selectedIssue.number, commentId: result.comment_id });
       } else {
         append({
           kind: 'assistant-error',
@@ -640,6 +711,7 @@ export default function IssueChat({
     setStagedVideoUri(null);
     setClaudeProgress(null);
     setProgressTarget(null);
+    claudeProgressItemIdRef.current = null;
     resetConversation();
     Keyboard.dismiss();
   };
@@ -814,6 +886,29 @@ export default function IssueChat({
           </View>
         );
       }
+      case 'assistant-claude-progress': {
+        const accessibilityLabel = item.message
+          ? `${item.message} ${item.body}`
+          : item.body;
+        return (
+          <View
+            key={item.id}
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
+            accessible={true}
+            accessibilityRole="text"
+            accessibilityLabel={accessibilityLabel}>
+            <Text style={[styles.progressMessageLabel, { color: theme.primary }]} accessible={false}>
+              Claude
+            </Text>
+            <Text style={[styles.messageText, { color: theme.text }]} selectable={true} accessible={false}>
+              {item.body}
+            </Text>
+            <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
+              {item.ts.toLocaleTimeString()}
+            </Text>
+          </View>
+        );
+      }
       case 'assistant-error':
         return (
           <View
@@ -846,51 +941,7 @@ export default function IssueChat({
   };
 
   const renderClaudeProgress = () => {
-    if (!progressTarget || !claudeProgress) return null;
-    const hasSteps = claudeProgress.steps.length > 0;
-    return (
-      <View
-        style={[styles.progressCard, { backgroundColor: theme.card, borderColor: theme.border }]}
-        accessible={false}
-        testID="claude-progress-card">
-        <Text style={[styles.progressTitle, { color: theme.text }]} accessible={false}>
-          {claudeProgress.title || (isCreateMode ? 'Claude progress' : 'Update progress')}
-        </Text>
-        <Text style={[styles.progressMessage, { color: theme.textSecondary }]} accessible={false}>
-          {claudeProgress.message || 'Checking Claude progress…'}
-        </Text>
-        {hasSteps ? (
-          <ScrollView style={styles.progressSteps} nestedScrollEnabled>
-            {claudeProgress.steps.map((step) => {
-              const marker =
-                step.status === 'completed' ? '✓' :
-                step.status === 'in_progress' ? '●' :
-                step.status === 'failed' ? '!' : '○';
-              return (
-                <View
-                  key={step.id}
-                  style={styles.progressStepRow}
-                  accessible={true}
-                  accessibilityRole="text"
-                  accessibilityLabel={buildProgressAnnouncement(step.status, step.label)}
-                  testID={`claude-progress-step-${step.id}`}>
-                  <Text style={[styles.progressMarker, { color: theme.primary }]} accessible={false}>
-                    {marker}
-                  </Text>
-                  <Text style={[styles.progressStepLabel, { color: theme.text }]} accessible={false}>
-                    {step.label}
-                  </Text>
-                </View>
-              );
-            })}
-          </ScrollView>
-        ) : (
-          <Text style={[styles.progressEmpty, { color: theme.textSecondary }]} accessible={false}>
-            {claudeProgress.message || 'Waiting for Claude to post a checklist…'}
-          </Text>
-        )}
-      </View>
-    );
+    return null;
   };
 
   return (
@@ -1387,6 +1438,12 @@ const styles = StyleSheet.create({
   retryButtonText: {
     fontSize: 13,
     fontWeight: '600',
+  },
+  progressMessageLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    marginBottom: 6,
   },
   summaryCard: {
     marginHorizontal: 12,

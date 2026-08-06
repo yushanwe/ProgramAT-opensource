@@ -157,6 +157,7 @@ export async function nextBrainstormQuestion(token: string): Promise<NextQuestio
 }
 
 export interface FetchClaudeProgressArgs {
+  mode: 'create' | 'update';
   issueNumber?: number | null;
   prNumber?: number | null;
   commentId?: number | null;
@@ -167,14 +168,14 @@ export async function fetchClaudeProgress(args: FetchClaudeProgressArgs): Promis
   if (!baseUrl) {
     return { status: 'error', steps: [], error: 'Server URL not configured' };
   }
-  const issueNumber = args.prNumber ?? args.issueNumber;
+  const issueNumber = args.mode === 'update' ? args.prNumber : args.issueNumber;
   if (!issueNumber) {
     return { status: 'error', steps: [], error: 'No issue number available for progress lookup' };
   }
 
   const query = new URLSearchParams();
-  query.set('issue_number', String(issueNumber));
-  if (args.prNumber) query.set('pr_number', String(args.prNumber));
+  query.set(args.mode === 'update' ? 'pr_number' : 'issue_number', String(issueNumber));
+  query.set('mode', args.mode);
   if (args.commentId) query.set('comment_id', String(args.commentId));
 
   try {
@@ -183,6 +184,6 @@ export async function fetchClaudeProgress(args: FetchClaudeProgressArgs): Promis
     return result as ClaudeProgressResponse;
   } catch (e) {
     console.log('[IssueSubmissionService] claude-progress threw:', String(e));
-    return { status: 'retrying', steps: [], message: 'Could not load Claude progress. Retrying…' };
+    return { status: 'unavailable', steps: [], message: 'Could not load Claude progress. Retrying…' };
   }
 }
