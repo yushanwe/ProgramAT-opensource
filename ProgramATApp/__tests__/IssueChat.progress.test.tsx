@@ -4,7 +4,13 @@ import { AccessibilityInfo, TextInput, TouchableOpacity } from 'react-native';
 import IssueChat from '../IssueChat';
 import PRsAndText from '../PRsAndText';
 import { ThemeProvider } from '../ThemeContext';
-import { buildClaudeAccessibilityLabel, getChangedClaudeAnnouncement, isTerminalClaudeProgress, parseClaudeRenderLines, sanitizeClaudeCommentBody } from '../claudeCommentSanitizer';
+import {
+  buildClaudeAccessibilityBlocks,
+  buildClaudeAccessibilityLabel,
+  getChangedClaudeAnnouncement,
+  parseClaudeRenderLines,
+  sanitizeClaudeCommentBody,
+} from '../claudeCommentSanitizer';
 
 jest.useFakeTimers();
 
@@ -87,7 +93,7 @@ describe('IssueChat progress', () => {
     mockStopLoadingSound.mockReset();
   });
 
-  test('polls for Claude progress and cleans up on unmount', async () => {
+  test('polls for Claude progress every 10 seconds and cleans up on unmount', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 42,
@@ -121,14 +127,26 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
 
+    const initialCallCount = mockFetchClaudeProgress.mock.calls.length;
+    expect(initialCallCount).toBeGreaterThanOrEqual(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(9999);
+    });
+    expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(initialCallCount);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
     const callCountBeforeUnmount = mockFetchClaudeProgress.mock.calls.length;
-    expect(callCountBeforeUnmount).toBeGreaterThanOrEqual(1);
+    expect(callCountBeforeUnmount).toBe(initialCallCount + 1);
 
     await act(async () => {
       renderer!.unmount();
     });
     await act(async () => {
-      jest.advanceTimersByTime(3000);
+      jest.advanceTimersByTime(10000);
     });
 
     expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(callCountBeforeUnmount);
@@ -190,7 +208,7 @@ describe('IssueChat progress', () => {
     expect(announceSpy).toHaveBeenCalledWith('Recent Work: Inspected runtime input handling.');
 
     await act(async () => {
-      jest.advanceTimersByTime(2500);
+      jest.advanceTimersByTime(10000);
     });
     expect(announceSpy.mock.calls.filter((call) => call[0] === 'In progress: Building the tool')).toHaveLength(1);
   });
@@ -212,7 +230,7 @@ describe('IssueChat progress', () => {
     expect(renderer!.root.findAll((node) => node.props?.testID === 'claude-progress-card')).toHaveLength(0);
   });
 
-  test('updates one in-flow Claude message without duplicates', async () => {
+  test('updates one in-flow Claude message without duplicates while continuing after completed-looking content', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 9,
@@ -231,12 +249,24 @@ describe('IssueChat progress', () => {
         steps: [],
       })
       .mockResolvedValueOnce({
-        status: 'completed',
+        status: 'available',
         issue_number: 9,
         comment_id: 201,
         updated_at: '2026-08-05T12:00:05Z',
-        body: 'Final Claude update',
-        message: 'Claude finished all checklist steps.',
+        body: '### Progress\n- [x] First task\n- [x] Second task\n\n### Implementation summary\nCompleted summary text, still reviewing.',
+        message: 'Claude comment available.',
+        steps: [
+          { id: 'step_1', label: 'First task', raw_label: 'First task', status: 'completed' },
+          { id: 'step_2', label: 'Second task', raw_label: 'Second task', status: 'completed' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 9,
+        comment_id: 201,
+        updated_at: '2026-08-05T12:00:15Z',
+        body: 'Final Claude update after review',
+        message: 'Claude comment available.',
         steps: [],
       });
 
@@ -253,16 +283,21 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
     await act(async () => {
-      jest.advanceTimersByTime(2500);
+      jest.advanceTimersByTime(10000);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(10000);
       await Promise.resolve();
     });
 
     const claudeTexts = renderer!.root.findAll((node) => node.type === 'Text' && node.props?.children === 'Claude');
     expect(claudeTexts).toHaveLength(1);
-    expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(JSON.stringify(renderer!.toJSON())).toContain('Final Claude update after review');
   });
 
-  test('stops polling and loading sound after terminal status', async () => {
+  test('keeps polling after completed-looking text but stops loading sound on terminal backend status', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 21,
@@ -275,9 +310,9 @@ describe('IssueChat progress', () => {
         status: 'available',
         issue_number: 21,
         comment_id: 401,
-        body: 'Working now\n- [ ] Build tool',
+        body: '### Progress\n- [x] Build tool\n\n### Implementation summary\nCompleted summary while Claude is still reviewing.',
         message: 'Claude comment available.',
-        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
       })
       .mockResolvedValueOnce({
         status: 'completed',
@@ -304,7 +339,7 @@ describe('IssueChat progress', () => {
     expect(mockPlayLoadingSound).toHaveBeenCalled();
 
     await act(async () => {
-      jest.advanceTimersByTime(2500);
+      jest.advanceTimersByTime(10000);
       await Promise.resolve();
     });
 
@@ -312,14 +347,65 @@ describe('IssueChat progress', () => {
       await Promise.resolve();
     });
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(10000);
       await Promise.resolve();
     });
-    expect(mockFetchClaudeProgress.mock.calls.length).toBeLessThanOrEqual(5);
+    expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mockStopLoadingSound).toHaveBeenCalled();
     await act(async () => {
       renderer!.unmount();
     });
+  });
+
+  test('prevents stale Claude responses from overwriting a newer comment', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 44,
+      issue_url: 'https://github.test/issues/44',
+      video_summary: '',
+      pr_number: 44,
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 44,
+        comment_id: 501,
+        updated_at: '2026-08-06T15:10:10Z',
+        body: 'Newer Claude update',
+        message: 'Claude comment available.',
+        steps: [],
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 44,
+        comment_id: 501,
+        updated_at: '2026-08-06T15:10:00Z',
+        body: 'Older Claude update',
+        message: 'Claude comment available.',
+        steps: [],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 44, title: 'PR 44' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+
+    await act(async () => {
+      jest.advanceTimersByTime(10000);
+      await Promise.resolve();
+    });
+
+    const rendered = JSON.stringify(renderer!.toJSON());
+    expect(rendered).toContain('Newer Claude update');
+    expect(rendered).not.toContain('Older Claude update');
   });
 
   test('renders Claude progress inside the normal message list for create and update', async () => {
@@ -435,17 +521,6 @@ describe('Claude accessibility helpers', () => {
     expect(output).not.toContain('`');
   });
 
-  test('detects terminal progress conditions', () => {
-    expect(isTerminalClaudeProgress({ status: 'completed', body: '', steps: [] })).toBe(true);
-    expect(isTerminalClaudeProgress({
-      status: 'available',
-      body: '- [x] One\n- [x] Two',
-      steps: [{ status: 'completed' }, { status: 'completed' }] as any,
-    })).toBe(true);
-    expect(isTerminalClaudeProgress({ status: 'available', body: 'Finished implementation and opened PR #8', steps: [] })).toBe(true);
-    expect(isTerminalClaudeProgress({ status: 'available', body: 'Still working', steps: [] })).toBe(false);
-  });
-
   test('extracts changed section announcements', () => {
     const previous = '### Recent work\nChecked tool patterns.\n\n### Next step\nImplement the tool.';
     const next = '### Recent work\nValidated the generated tool.\n\n### Next step\nCommit and push.';
@@ -457,5 +532,22 @@ describe('Claude accessibility helpers', () => {
     expect(lines[0].kind).toBe('heading');
     expect(lines[1].accessibilityLabel).toBe('Finished: Read CLAUDE.md');
     expect(lines[2].kind).toBe('paragraph');
+  });
+
+  test('groups major markdown sections for VoiceOver while keeping checklist items separate', () => {
+    const blocks = buildClaudeAccessibilityBlocks(`### Implementation decisions
+
+- Model choice: \`Gemini 3.1 Flash Lite\`
+- Frame strategy: latest-frame streaming
+- Runtime input: expected vehicle details
+
+- [x] Read issue and repository \`CLAUDE.md\`
+- [ ] Add focused tests
+`);
+    expect(blocks[0].label).toBe(
+      'Implementation decisions. Model choice: Gemini 3.1 Flash Lite. Frame strategy: latest-frame streaming. Runtime input: expected vehicle details'
+    );
+    expect(blocks[1].label).toBe('Finished: Read issue and repository CLAUDE.md');
+    expect(blocks[2].label).toBe('Ongoing: Add focused tests');
   });
 });

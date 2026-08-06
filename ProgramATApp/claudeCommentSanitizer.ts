@@ -78,6 +78,19 @@ export interface ClaudeRenderLine {
   accessibilityLabel?: string;
 }
 
+export interface ClaudeAccessibilityBlock {
+  kind: 'section' | 'checklist_item';
+  label: string;
+}
+
+const SECTION_HEADINGS = new Set([
+  'current analysis',
+  'implementation decisions',
+  'recent work',
+  'next step',
+  'implementation summary',
+]);
+
 export function normalizeChecklistLineForVoiceOver(line: string): string | null {
   const compactMatch = line.match(CHECKLIST_LINE_COMPACT_RE);
   const standardMatch = line.match(CHECKLIST_LINE_RE);
@@ -161,6 +174,89 @@ export function parseClaudeRenderLines(body: string | undefined | null): ClaudeR
   return renderLines;
 }
 
+function normalizeSectionText(line: string): string {
+  return stripInlineMarkdownPunctuation(line)
+    .replace(/^\s*[-*]\s*/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function flushSectionBlock(
+  blocks: ClaudeAccessibilityBlock[],
+  heading: string | null,
+  lines: string[],
+): void {
+  const normalizedHeading = heading ? stripInlineMarkdownPunctuation(heading) : '';
+  const normalizedLines = lines
+    .map(normalizeSectionText)
+    .filter(Boolean);
+  if (!normalizedHeading && normalizedLines.length === 0) return;
+  const parts = [normalizedHeading, ...normalizedLines].filter(Boolean);
+  blocks.push({
+    kind: 'section',
+    label: parts.join('. ').trim(),
+  });
+}
+
+export function buildClaudeAccessibilityBlocks(body: string | undefined | null): ClaudeAccessibilityBlock[] {
+  const sanitized = sanitizeClaudeCommentBody(body);
+  if (!sanitized) return [];
+
+  const lines = sanitized.split('\n');
+  const blocks: ClaudeAccessibilityBlock[] = [];
+  let uncheckedSeen = 0;
+  let currentHeading: string | null = null;
+  let currentLines: string[] = [];
+
+  const flush = () => {
+    flushSectionBlock(blocks, currentHeading, currentLines);
+    currentHeading = null;
+    currentLines = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const headingMatch = trimmed.match(HEADING_RE);
+    if (headingMatch) {
+      const nextHeading = headingMatch[1];
+      if (currentHeading || currentLines.length > 0) {
+        flush();
+      }
+      if (SECTION_HEADINGS.has(nextHeading.toLowerCase())) {
+        currentHeading = nextHeading;
+      } else {
+        currentLines.push(nextHeading);
+      }
+      continue;
+    }
+
+    const compactMatch = trimmed.match(CHECKLIST_LINE_COMPACT_RE);
+    const standardMatch = trimmed.match(CHECKLIST_LINE_RE);
+    const task = compactMatch?.[1] || standardMatch?.[2];
+    if (task) {
+      flush();
+      const checked = compactMatch ? false : (standardMatch?.[1] || '').toLowerCase() === 'x';
+      if (!checked) uncheckedSeen += 1;
+      const prefix = checked ? 'Finished' : uncheckedSeen === 1 ? 'Ongoing' : 'To do';
+      blocks.push({
+        kind: 'checklist_item',
+        label: `${prefix}: ${stripInlineMarkdownPunctuation(task)}`,
+      });
+      continue;
+    }
+
+    currentLines.push(trimmed);
+  }
+
+  flush();
+  return blocks;
+}
+
 function sectionBodyMap(body: string | undefined | null): Record<string, string> {
   const lines = sanitizeClaudeCommentBody(body).split('\n');
   const sections: Record<string, string[]> = {};
@@ -196,17 +292,4 @@ export function getChangedClaudeAnnouncement(
     }
   }
   return null;
-}
-
-export function isTerminalClaudeProgress(progress: { status?: string; body?: string; steps?: Array<{ status: string }> } | null | undefined): boolean {
-  if (!progress) return false;
-  if (progress.status === 'completed' || progress.status === 'failed' || progress.status === 'cancelled') {
-    return true;
-  }
-  const steps = progress.steps || [];
-  if (steps.length > 0 && steps.every((step) => step.status === 'completed')) {
-    return true;
-  }
-  const body = sanitizeClaudeCommentBody(progress.body).toLowerCase();
-  return /\b(completed|finished|done|successfully opened pr|opened pr)\b/.test(body);
 }

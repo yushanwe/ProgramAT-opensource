@@ -35,9 +35,9 @@ import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
 import {
+  buildClaudeAccessibilityBlocks,
   buildClaudeAccessibilityLabel,
   getChangedClaudeAnnouncement,
-  isTerminalClaudeProgress,
   parseClaudeRenderLines,
   sanitizeClaudeCommentBody,
 } from './claudeCommentSanitizer';
@@ -54,6 +54,7 @@ interface IssueChatProps {
 
 type Awaiting = 'answer' | 'choice' | null;
 type ProgressTarget = { mode: 'create' | 'update'; issueNumber?: number | null; prNumber?: number | null; commentId?: number | null };
+const CLAUDE_PROGRESS_POLL_MS = 10000;
 
 function buildProgressAnnouncement(status: string, label: string): string {
   if (status === 'completed') return `Completed: ${label}`;
@@ -150,11 +151,13 @@ export default function IssueChat({
   const composeInputRef = useRef<RNTextInput>(null);
   const lastAnnouncedIdRef = useRef<string | null>(null);
   const lastAnnouncedProgressStepRef = useRef<string | null>(null);
-  const progressPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const progressPollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const claudeLoadingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const claudeProgressItemIdRef = useRef<string | null>(null);
-  const claudePollingStoppedRef = useRef(false);
   const previousClaudeBodyRef = useRef<string>('');
+  const latestClaudePollRequestIdRef = useRef(0);
+  const latestClaudeAppliedRequestIdRef = useRef(0);
+  const latestClaudeAppliedUpdatedAtRef = useRef<number | null>(null);
   const createToolName = extractCreateToolName(understandingSummary);
   const modeBannerText = isCreateMode
     ? createToolName
@@ -258,7 +261,9 @@ export default function IssueChat({
     const shouldPlay = !!claudeProgress
       && claudeProgress.status !== 'waiting_for_comment'
       && claudeProgress.status !== 'unavailable'
-      && !isTerminalClaudeProgress(claudeProgress);
+      && claudeProgress.status !== 'completed'
+      && claudeProgress.status !== 'failed'
+      && claudeProgress.status !== 'cancelled';
 
     if (!shouldPlay) {
       stopLoading();
@@ -278,22 +283,38 @@ export default function IssueChat({
     let cancelled = false;
 
     const clearPoll = () => {
-      if (progressPollTimeoutRef.current) {
-        clearTimeout(progressPollTimeoutRef.current);
-        progressPollTimeoutRef.current = null;
+      if (progressPollIntervalRef.current) {
+        clearInterval(progressPollIntervalRef.current);
+        progressPollIntervalRef.current = null;
       }
     };
 
     const poll = async () => {
-      if (!progressTarget || claudePollingStoppedRef.current) return;
+      if (!progressTarget || cancelled) return;
+      latestClaudePollRequestIdRef.current += 1;
+      const requestId = latestClaudePollRequestIdRef.current;
       const result = await fetchClaudeProgress(progressTarget);
-      if (cancelled || claudePollingStoppedRef.current) return;
-      if (!result) {
-        progressPollTimeoutRef.current = setTimeout(poll, 2500);
+      if (cancelled || requestId < latestClaudeAppliedRequestIdRef.current) return;
+      if (!result) return;
+      const resultUpdatedAt = result.updated_at ? new Date(result.updated_at).getTime() : null;
+      if (
+        resultUpdatedAt !== null
+        && latestClaudeAppliedUpdatedAtRef.current !== null
+        && resultUpdatedAt < latestClaudeAppliedUpdatedAtRef.current
+      ) {
         return;
       }
+      latestClaudeAppliedRequestIdRef.current = requestId;
+      if (resultUpdatedAt !== null) {
+        latestClaudeAppliedUpdatedAtRef.current = resultUpdatedAt;
+      }
       setClaudeProgress((prev) => {
-        if (prev && isTerminalClaudeProgress(prev)) {
+        if (
+          prev
+          && prev.updated_at
+          && result.updated_at
+          && new Date(result.updated_at).getTime() < new Date(prev.updated_at).getTime()
+        ) {
           return prev;
         }
         if (result.status === 'unavailable' && prev && prev.comment_id) {
@@ -305,28 +326,26 @@ export default function IssueChat({
         }
         return result;
       });
-      if (!isTerminalClaudeProgress(result)) {
-        progressPollTimeoutRef.current = setTimeout(poll, 2500);
-      } else {
-        claudePollingStoppedRef.current = true;
-        clearPoll();
-        console.log(`[Claude Progress] polling=stopped reason=${result.status}`);
-      }
     };
 
     clearPoll();
     setClaudeProgress(null);
     lastAnnouncedProgressStepRef.current = null;
-    claudePollingStoppedRef.current = false;
+    latestClaudePollRequestIdRef.current = 0;
+    latestClaudeAppliedRequestIdRef.current = 0;
+    latestClaudeAppliedUpdatedAtRef.current = null;
 
     if (progressTarget) {
       poll();
+      progressPollIntervalRef.current = setInterval(() => {
+        poll();
+      }, CLAUDE_PROGRESS_POLL_MS);
     }
 
     return () => {
       cancelled = true;
-      claudePollingStoppedRef.current = true;
       clearPoll();
+      console.log('[Claude Progress] polling=stopped reason=page_exit');
     };
   }, [progressTarget]);
 
@@ -760,8 +779,10 @@ export default function IssueChat({
     setClaudeProgress(null);
     setProgressTarget(null);
     claudeProgressItemIdRef.current = null;
-    claudePollingStoppedRef.current = true;
     previousClaudeBodyRef.current = '';
+    latestClaudePollRequestIdRef.current = 0;
+    latestClaudeAppliedRequestIdRef.current = 0;
+    latestClaudeAppliedUpdatedAtRef.current = null;
     resetConversation();
     Keyboard.dismiss();
   };
@@ -938,6 +959,7 @@ export default function IssueChat({
       }
       case 'assistant-claude-progress': {
         const accessibilityLabel = buildClaudeAccessibilityLabel(item.body, item.message);
+        const accessibilityBlocks = buildClaudeAccessibilityBlocks(item.body);
         const renderLines = parseClaudeRenderLines(item.body);
         return (
           <View
@@ -951,6 +973,15 @@ export default function IssueChat({
               accessibilityLabel="Claude">
               Claude
             </Text>
+            {accessibilityBlocks.map((block, index) => (
+              <View
+                key={`${item.id}_a11y_${index}`}
+                accessible={true}
+                accessibilityRole="text"
+                accessibilityLabel={block.label}
+                style={styles.claudeAccessibilityOnly}
+              />
+            ))}
             {renderLines.map((line, index) => {
               if (line.kind === 'blank') {
                 return <View key={`${item.id}_blank_${index}`} style={styles.claudeLineSpacer} />;
@@ -964,7 +995,7 @@ export default function IssueChat({
                       : [styles.messageText, { color: theme.text }],
                   ]}
                   selectable={true}
-                  accessible={true}
+                  accessible={false}
                   accessibilityRole="text"
                   accessibilityLabel={line.accessibilityLabel || accessibilityLabel}>
                   {line.text}
@@ -1507,6 +1538,12 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
     marginBottom: 6,
+  },
+  claudeAccessibilityOnly: {
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    opacity: 0,
   },
   claudeHeadingText: {
     fontSize: 15,
