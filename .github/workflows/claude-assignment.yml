@@ -11,6 +11,7 @@ name: Claude VAT Implementation
 #    on that issue or its PR continue the work.
 
 on:
+  workflow_dispatch:
   issues:
     types: [opened]
   issue_comment:
