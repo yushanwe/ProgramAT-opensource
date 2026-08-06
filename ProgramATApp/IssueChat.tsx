@@ -25,6 +25,7 @@ import {
   AccessibilityInfo,
   Modal,
   NativeModules,
+  Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { launchImageLibrary } from 'react-native-image-picker';
@@ -296,6 +297,19 @@ export default function IssueChat({
           : 'Could not attach a recent recording.';
       AccessibilityInfo.announceForAccessibility(message);
     }
+  };
+
+  const handleAttachVideoMenu = () => {
+    Alert.alert(
+      'Attach a video',
+      'Choose how to attach a video to this message.',
+      [
+        { text: 'Record a new video', onPress: () => setIsVideoRecorderOpen(true) },
+        { text: 'Choose from photo library', onPress: handlePickFromLibrary },
+        { text: 'Attach most recent recording', onPress: handleAttachRecentSession },
+        { text: 'Cancel', style: 'cancel' },
+      ],
+    );
   };
 
   // --- Turn dispatchers ---
@@ -1027,28 +1041,12 @@ export default function IssueChat({
             <View style={styles.attachButtons}>
               <TouchableOpacity
                 style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
-                onPress={() => setIsVideoRecorderOpen(true)}
+                onPress={handleAttachVideoMenu}
                 accessible={true}
                 accessibilityRole="button"
-                accessibilityLabel="Record a new video">
+                accessibilityLabel="Attach a video"
+                accessibilityHint="Opens a menu to record a new video, choose one from your photo library, or attach your most recent recording">
                 <Text style={styles.attachButtonText}>📹</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
-                onPress={handlePickFromLibrary}
-                accessible={true}
-                accessibilityRole="button"
-                accessibilityLabel="Choose a video from your photo library">
-                <Text style={styles.attachButtonText}>📁</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
-                onPress={handleAttachRecentSession}
-                accessible={true}
-                accessibilityRole="button"
-                accessibilityLabel="Attach most recent recording"
-                accessibilityHint="Attaches the most recent video from your camera roll">
-                <Text style={styles.attachButtonText}>🎬</Text>
               </TouchableOpacity>
             </View>
           )}
