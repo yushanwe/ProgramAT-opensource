@@ -103,6 +103,7 @@ export default function IssueChat({
   const [items, setItems] = useState<IssueChatItem[]>([]);
   const [composeText, setComposeText] = useState('');
   const [stagedVideoUri, setStagedVideoUri] = useState<string | null>(null);
+  const [stagedVideoSource, setStagedVideoSource] = useState<'phone' | 'rayban' | 'library' | null>(null);
   const [isVideoRecorderOpen, setIsVideoRecorderOpen] = useState(false);
   const [isRayBanRecorderOpen, setIsRayBanRecorderOpen] = useState(false);
   const [isPickingFromLibrary, setIsPickingFromLibrary] = useState(false);
@@ -278,6 +279,7 @@ export default function IssueChat({
       const asset = result.assets[0];
       if (asset.uri) {
         setStagedVideoUri(asset.uri);
+        setStagedVideoSource('library');
       }
     } finally {
       setIsPickingFromLibrary(false);
@@ -289,6 +291,7 @@ export default function IssueChat({
       const path = await ScreenRecordingModule?.fetchMostRecentVideoPath?.();
       if (path) {
         setStagedVideoUri(path);
+        setStagedVideoSource('library');
       }
     } catch (error: any) {
       console.error('[IssueChat] Failed to attach recent session:', error);
@@ -340,6 +343,7 @@ export default function IssueChat({
     append({ kind: 'user-video', id: nextId('user-video'), ts: new Date(), videoUri, caption: text });
     setComposeText('');
     setStagedVideoUri(null);
+    setStagedVideoSource(null);
     Keyboard.dismiss();
     setIsSending(true);
     inFlightRef.current = true;
@@ -617,6 +621,7 @@ export default function IssueChat({
     setItems([]);
     setComposeText('');
     setStagedVideoUri(null);
+    setStagedVideoSource(null);
     resetConversation();
     Keyboard.dismiss();
   };
@@ -1010,11 +1015,21 @@ export default function IssueChat({
             accessibilityLabel="Video attached, ready to send">
             <Text style={[styles.videoChipText, { color: theme.text }]}>📹 Video attached</Text>
             <TouchableOpacity
-              onPress={() => setIsVideoRecorderOpen(true)}
+              onPress={() => {
+                if (stagedVideoSource === 'rayban') {
+                  setIsRayBanRecorderOpen(true);
+                } else if (stagedVideoSource === 'library') {
+                  handlePickFromLibrary();
+                } else {
+                  setIsVideoRecorderOpen(true);
+                }
+              }}
               accessible={true}
               accessibilityRole="button"
-              accessibilityLabel="Re-record video">
-              <Text style={[styles.videoActionText, { color: theme.primary }]}>Re-record</Text>
+              accessibilityLabel={stagedVideoSource === 'library' ? 'Pick a different video from library' : 'Re-record video'}>
+              <Text style={[styles.videoActionText, { color: theme.primary }]}>
+                {stagedVideoSource === 'library' ? 'Replace' : 'Re-record'}
+              </Text>
             </TouchableOpacity>
             <TouchableOpacity
               onPress={handlePickFromLibrary}
@@ -1024,7 +1039,7 @@ export default function IssueChat({
               <Text style={[styles.videoActionText, { color: theme.primary }]}>Library</Text>
             </TouchableOpacity>
             <TouchableOpacity
-              onPress={() => setStagedVideoUri(null)}
+              onPress={() => { setStagedVideoUri(null); setStagedVideoSource(null); }}
               accessible={true}
               accessibilityRole="button"
               accessibilityLabel="Remove video attachment">
@@ -1108,6 +1123,7 @@ export default function IssueChat({
           visible={isVideoRecorderOpen}
           onVideoRecorded={(path) => {
             setStagedVideoUri(path);
+            setStagedVideoSource('phone');
             setIsVideoRecorderOpen(false);
           }}
           onCancel={() => setIsVideoRecorderOpen(false)}
@@ -1118,6 +1134,7 @@ export default function IssueChat({
           visible={isRayBanRecorderOpen}
           onVideoRecorded={(path) => {
             setStagedVideoUri(path);
+            setStagedVideoSource('rayban');
             setIsRayBanRecorderOpen(false);
           }}
           onCancel={() => setIsRayBanRecorderOpen(false)}
