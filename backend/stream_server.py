@@ -82,6 +82,10 @@ from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
 from webrtc_handler import webrtc_offer_handler, cleanup_webrtc_peers
 from video_summarizer import summarize_video
+from brainstorming import (
+    build_update_brainstorm_context,
+    generate_brainstorming_question,
+)
 import re
 import tempfile
 import secrets
@@ -4670,53 +4674,21 @@ async def generate_ideation_question(parsed_data: dict, video_summary: str, brai
 
     Returns a plain question string, or a sensible fallback on any error.
     """
-    title = parsed_data.get('title', '')
-    description = parsed_data.get('description', '')
-    solution = parsed_data.get('solution', '')
-    example_usage = parsed_data.get('example_usage', '')
-
-    video_section = ''
-    if video_summary:
-        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
-
-    brainstorm_section = ''
-    if brainstorm_context:
-        brainstorm_pairs = []
-        for qa_pair in brainstorm_context:
-            q = qa_pair.get('question', '').strip()
-            a = qa_pair.get('answer', '').strip()
-            if q and a:
-                brainstorm_pairs.append(f"Q: {q}\nA: {a}")
-        if brainstorm_pairs:
-            brainstorm_section = "\n\nPrevious brainstorming rounds:\n" + "\n\n".join(brainstorm_pairs)
-
-    prompt = (
-        "You are helping a blind or low-vision user design a camera-based assistive tool. "
-        "They have described the tool they want. Your job is to ask them ONE concise, "
-        "open-ended question that helps them think more deeply about their idea — "
-        "such as an edge case, an environmental condition, or how the tool should behave "
-        "when something goes wrong. Do not ask about things already answered below or in previous rounds. "
-        "Return only the question itself, nothing else.\n\n"
-        f"Tool title: {title}\n"
-        f"Description: {description}\n"
-        f"Proposed solution: {solution}\n"
-        f"Example usage: {example_usage}"
-        f"{video_section}"
-        f"{brainstorm_section}"
+    create_context = {
+        'title': parsed_data.get('title', ''),
+        'description': parsed_data.get('description', ''),
+        'solution': parsed_data.get('solution', ''),
+        'example_usage': parsed_data.get('example_usage', ''),
+        'video_summary': video_summary,
+    }
+    return await generate_brainstorming_question(
+        mode='create',
+        context=create_context,
+        brainstorm_context=brainstorm_context,
+        llm_call=system_llm_call,
+        text_extractor=extract_text,
+        logger_instance=logger,
     )
-
-    try:
-        response = await asyncio.to_thread(
-            system_llm_call,
-            messages=[{'role': 'user', 'content': prompt}],
-        )
-        question = extract_text(response).strip()
-        if question:
-            return question
-    except Exception:
-        logger.warning("generate_ideation_question failed", exc_info=True)
-
-    return "Is there anything specific about how the tool should behave in difficult conditions, like low lighting or a cluttered background?"
 
 
 def _log_to_all_sessions(level: str, message: str):

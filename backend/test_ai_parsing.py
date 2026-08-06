@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from brainstorming import (
+    build_clarified_update_request,
+    build_update_brainstorm_context,
+    generate_brainstorming_question,
+    sanitize_action_log,
+)
 from stage_decomposition import (
     PLAYING_CARD_STAGE_GOAL,
     build_stage_decomposition_prompt,
@@ -72,6 +79,127 @@ class TestIssueTemplateGuidance(unittest.TestCase):
         self.assertNotIn("Google Vision", template)
         self.assertIn("must not choose implementations", template)
         self.assertIn("provider-specific `DEFAULT_MODEL` constants", template)
+
+
+class TestBrainstormingHelpers(unittest.IsolatedAsyncioTestCase):
+    def test_sanitize_action_log_removes_noise_and_redacts(self):
+        raw_log = """
+        npm install
+        Authorization: Bearer abc123
+        Claude summary: updated the matching logic.
+        Modified tools/uber_car_identifier.py
+        Modified tools/uber_car_identifier.py
+        Validation passed
+        """
+
+        cleaned = sanitize_action_log(raw_log, max_chars=500)
+
+        self.assertIn("Claude summary: updated the matching logic.", cleaned)
+        self.assertIn("Modified tools/uber_car_identifier.py", cleaned)
+        self.assertIn("Validation passed", cleaned)
+        self.assertNotIn("npm install", cleaned)
+        self.assertNotIn("abc123", cleaned)
+
+    def test_update_context_includes_expected_fields(self):
+        context = build_update_brainstorm_context(
+            repository="owner/repo",
+            issue_number=12,
+            pr_number=34,
+            tool_name="tool_a",
+            tool_path="tools/tool_a.py",
+            update_request="Make streaming quieter",
+            claude_summary="Claude says the detector flips often.",
+            action_log="Validation passed",
+            tool_source="def run(): pass",
+        )
+
+        self.assertEqual(context["repository"], "owner/repo")
+        self.assertEqual(context["issue_number"], 12)
+        self.assertEqual(context["pr_number"], 34)
+        self.assertEqual(context["tool_name"], "tool_a")
+        self.assertEqual(context["tool_path"], "tools/tool_a.py")
+        self.assertEqual(context["update_request"], "Make streaming quieter")
+        self.assertEqual(context["claude_summary"], "Claude says the detector flips often.")
+        self.assertEqual(context["action_log"], "Validation passed")
+        self.assertEqual(context["tool_source"], "def run(): pass")
+
+    async def test_create_mode_prompt_shape_remains_unchanged(self):
+        captured = {}
+
+        def fake_llm_call(*, messages):
+            captured["prompt"] = messages[0]["content"]
+            return type("Response", (), {"choices": [type("Choice", (), {"message": type("Message", (), {"content": "How should it react?"})()})()]})()
+
+        def fake_extract_text(response):
+            return response.choices[0].message.content
+
+        question = await generate_brainstorming_question(
+            mode="create",
+            context={
+                "title": "Find my Uber",
+                "description": "Identify the correct car.",
+                "solution": "Match by make and color.",
+                "example_usage": "Find the white Toyota.",
+                "video_summary": "User points at the curb.",
+            },
+            llm_call=fake_llm_call,
+            text_extractor=fake_extract_text,
+        )
+
+        self.assertEqual(question, "How should it react?")
+        self.assertIn("You are helping a blind or low-vision user design a camera-based assistive tool.", captured["prompt"])
+        self.assertIn("Tool title: Find my Uber", captured["prompt"])
+        self.assertIn("Video demonstration summary:\nUser points at the curb.", captured["prompt"])
+
+    async def test_update_mode_prompt_contains_context_and_tolerates_missing_fields(self):
+        captured = {}
+
+        def fake_llm_call(*, messages):
+            captured["prompt"] = messages[0]["content"]
+            return type("Response", (), {"choices": [type("Choice", (), {"message": type("Message", (), {"content": "Should streaming announce only on changes?"})()})()]})()
+
+        question = await generate_brainstorming_question(
+            mode="update",
+            context=build_update_brainstorm_context(
+                repository="owner/repo",
+                issue_number=77,
+                pr_number=88,
+                tool_name="uber_car_identifier",
+                tool_path="tools/uber_car_identifier.py",
+                update_request="Add a streaming mode.",
+                claude_summary="",
+                action_log="",
+                tool_source="",
+            ),
+            llm_call=fake_llm_call,
+            text_extractor=lambda response: response.choices[0].message.content,
+        )
+
+        self.assertEqual(question, "Should streaming announce only on changes?")
+        self.assertIn("Repository: owner/repo", captured["prompt"])
+        self.assertIn("Issue number: 77", captured["prompt"])
+        self.assertIn("PR number: 88", captured["prompt"])
+        self.assertIn("Current tool: uber_car_identifier", captured["prompt"])
+        self.assertIn("User update request: Add a streaming mode.", captured["prompt"])
+
+    def test_build_clarified_update_request_combines_answers(self):
+        clarified = build_clarified_update_request(
+            "Add streaming support.",
+            ["Should output change?", "What stays the same?"],
+            ["Yes, announce only changes.", "Single-frame mode should stay the same."],
+        )
+
+        self.assertIn("Original update request:", clarified)
+        self.assertIn("Q: Should output change?", clarified)
+        self.assertIn("A: Yes, announce only changes.", clarified)
+
+    def test_root_test_script_uses_shared_implementation(self):
+        script_path = Path(__file__).resolve().parent.parent / "test.py"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("from brainstorming import", script_text)
+        self.assertIn("generate_brainstorming_question", script_text)
+        self.assertNotIn("Return only the question itself, nothing else.", script_text)
 
 
 class TestParserStageIssueIntegration(unittest.TestCase):
