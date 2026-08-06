@@ -83,6 +83,14 @@ jobs:
             repository-root `CLAUDE.md`. Follow `CLAUDE.md` as the generated-tool
             instruction source of truth. The issue body, latest request comment,
             and root `CLAUDE.md` are the authoritative requirements.
+            Maintain the workflow's single existing GitHub progress comment and
+            update it in place after meaningful work or decisions. Keep a compact
+            checklist plus concise sections such as Current analysis,
+            Implementation decisions, Recent work, and Next step. Overwrite those
+            evolving sections instead of appending unlimited history. Summarize
+            observable decisions, evidence, alternatives, uncertainty, recent
+            work, and next actions without exposing hidden chain-of-thought, raw
+            command logs, token details, or long internal traces.
             Before implementing any temporal or multi-frame Streaming tool,
             inspect the relevant repository runtime and existing tool patterns
             referenced by `CLAUDE.md` rather than inventing scheduling from scratch.

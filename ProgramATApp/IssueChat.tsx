@@ -34,7 +34,13 @@ import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
-import { buildClaudeAccessibilityLabel, isTerminalClaudeProgress, sanitizeClaudeCommentBody } from './claudeCommentSanitizer';
+import {
+  buildClaudeAccessibilityLabel,
+  getChangedClaudeAnnouncement,
+  isTerminalClaudeProgress,
+  parseClaudeRenderLines,
+  sanitizeClaudeCommentBody,
+} from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
 
@@ -148,6 +154,7 @@ export default function IssueChat({
   const claudeLoadingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const claudeProgressItemIdRef = useRef<string | null>(null);
   const claudePollingStoppedRef = useRef(false);
+  const previousClaudeBodyRef = useRef<string>('');
   const createToolName = extractCreateToolName(understandingSummary);
   const modeBannerText = isCreateMode
     ? createToolName
@@ -228,13 +235,14 @@ export default function IssueChat({
 
   useEffect(() => {
     if (!claudeProgress) return;
+    const changedSectionAnnouncement = getChangedClaudeAnnouncement(previousClaudeBodyRef.current, claudeProgress.body);
     const activeStep = claudeProgress.steps.find((step) => step.status === 'in_progress' || step.status === 'failed');
-    const announcement = activeStep
-      ? buildProgressAnnouncement(activeStep.status, activeStep.label)
-      : summarizeClaudeAnnouncement(claudeProgress);
+    const announcement = changedSectionAnnouncement
+      || (activeStep ? buildProgressAnnouncement(activeStep.status, activeStep.label) : summarizeClaudeAnnouncement(claudeProgress));
     const announcementKey = `${claudeProgress.comment_id || 'none'}:${claudeProgress.updated_at || claudeProgress.status}:${announcement}`;
     if (lastAnnouncedProgressStepRef.current === announcementKey) return;
     lastAnnouncedProgressStepRef.current = announcementKey;
+    previousClaudeBodyRef.current = claudeProgress.body || '';
     AccessibilityInfo.announceForAccessibility(announcement);
   }, [claudeProgress]);
 
@@ -753,6 +761,7 @@ export default function IssueChat({
     setProgressTarget(null);
     claudeProgressItemIdRef.current = null;
     claudePollingStoppedRef.current = true;
+    previousClaudeBodyRef.current = '';
     resetConversation();
     Keyboard.dismiss();
   };
@@ -929,19 +938,39 @@ export default function IssueChat({
       }
       case 'assistant-claude-progress': {
         const accessibilityLabel = buildClaudeAccessibilityLabel(item.body, item.message);
+        const renderLines = parseClaudeRenderLines(item.body);
         return (
           <View
             key={item.id}
             style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
-            accessible={true}
-            accessibilityRole="text"
-            accessibilityLabel={accessibilityLabel}>
-            <Text style={[styles.progressMessageLabel, { color: theme.primary }]} accessible={false}>
+            accessible={false}>
+            <Text
+              style={[styles.progressMessageLabel, { color: theme.primary }]}
+              accessible={true}
+              accessibilityRole="header"
+              accessibilityLabel="Claude">
               Claude
             </Text>
-            <Text style={[styles.messageText, { color: theme.text }]} selectable={true} accessible={false}>
-              {item.body}
-            </Text>
+            {renderLines.map((line, index) => {
+              if (line.kind === 'blank') {
+                return <View key={`${item.id}_blank_${index}`} style={styles.claudeLineSpacer} />;
+              }
+              return (
+                <Text
+                  key={`${item.id}_${index}`}
+                  style={[
+                    line.kind === 'heading'
+                      ? [styles.claudeHeadingText, { color: theme.text }]
+                      : [styles.messageText, { color: theme.text }],
+                  ]}
+                  selectable={true}
+                  accessible={true}
+                  accessibilityRole="text"
+                  accessibilityLabel={line.accessibilityLabel || accessibilityLabel}>
+                  {line.text}
+                </Text>
+              );
+            })}
             <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
               {item.ts.toLocaleTimeString()}
             </Text>
@@ -1478,6 +1507,15 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
     marginBottom: 6,
+  },
+  claudeHeadingText: {
+    fontSize: 15,
+    fontWeight: '700',
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  claudeLineSpacer: {
+    height: 8,
   },
   summaryCard: {
     marginHorizontal: 12,

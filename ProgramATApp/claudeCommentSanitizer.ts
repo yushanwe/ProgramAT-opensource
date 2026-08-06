@@ -5,6 +5,7 @@ const GENERIC_HTML_RE = /<\/?[^>]+>/g;
 const RAW_URL_RE = /https?:\/\/\S+/gi;
 const CHECKLIST_LINE_RE = /^\s*[-*]\s*\[(x| |)\]\s+(.+?)\s*$/i;
 const CHECKLIST_LINE_COMPACT_RE = /^\s*[-*]\s*\[\]\s+(.+?)\s*$/i;
+const HEADING_RE = /^#{1,6}\s+(.+?)\s*$/;
 
 function decodeHtmlEntities(text: string): string {
   return text
@@ -71,6 +72,20 @@ function stripInlineMarkdownPunctuation(text: string): string {
     .trim();
 }
 
+export interface ClaudeRenderLine {
+  kind: 'heading' | 'bullet' | 'paragraph' | 'blank';
+  text: string;
+  accessibilityLabel?: string;
+}
+
+export function normalizeChecklistLineForVoiceOver(line: string): string | null {
+  const compactMatch = line.match(CHECKLIST_LINE_COMPACT_RE);
+  const standardMatch = line.match(CHECKLIST_LINE_RE);
+  const task = compactMatch?.[1] || standardMatch?.[2];
+  if (!task) return null;
+  return stripInlineMarkdownPunctuation(task);
+}
+
 export function buildClaudeAccessibilityLabel(body: string | undefined | null, message?: string): string {
   const sanitized = sanitizeClaudeCommentBody(body);
   if (!sanitized) {
@@ -97,6 +112,90 @@ export function buildClaudeAccessibilityLabel(body: string | undefined | null, m
   });
 
   return [message, normalizedLines.join('\n').trim()].filter(Boolean).join(' ').trim();
+}
+
+export function parseClaudeRenderLines(body: string | undefined | null): ClaudeRenderLine[] {
+  const sanitized = sanitizeClaudeCommentBody(body);
+  if (!sanitized) return [];
+
+  const lines = sanitized.split('\n');
+  const renderLines: ClaudeRenderLine[] = [];
+  let uncheckedSeen = 0;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    if (!line.trim()) {
+      renderLines.push({ kind: 'blank', text: '' });
+      continue;
+    }
+    const headingMatch = line.match(HEADING_RE);
+    if (headingMatch) {
+      renderLines.push({
+        kind: 'heading',
+        text: headingMatch[1],
+        accessibilityLabel: stripInlineMarkdownPunctuation(headingMatch[1]),
+      });
+      continue;
+    }
+    const compactMatch = line.match(CHECKLIST_LINE_COMPACT_RE);
+    const standardMatch = line.match(CHECKLIST_LINE_RE);
+    const task = compactMatch?.[1] || standardMatch?.[2];
+    if (task) {
+      const checked = compactMatch ? false : (standardMatch?.[1] || '').toLowerCase() === 'x';
+      if (!checked) uncheckedSeen += 1;
+      const prefix = checked ? 'Finished' : uncheckedSeen === 1 ? 'Ongoing' : 'To do';
+      renderLines.push({
+        kind: 'bullet',
+        text: line,
+        accessibilityLabel: `${prefix}: ${stripInlineMarkdownPunctuation(task)}`,
+      });
+      continue;
+    }
+    renderLines.push({
+      kind: line.startsWith('- ') || line.startsWith('* ') ? 'bullet' : 'paragraph',
+      text: line,
+      accessibilityLabel: stripInlineMarkdownPunctuation(line),
+    });
+  }
+
+  return renderLines;
+}
+
+function sectionBodyMap(body: string | undefined | null): Record<string, string> {
+  const lines = sanitizeClaudeCommentBody(body).split('\n');
+  const sections: Record<string, string[]> = {};
+  let current = '';
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const headingMatch = line.match(HEADING_RE);
+    if (headingMatch) {
+      current = headingMatch[1].toLowerCase();
+      sections[current] = [];
+      continue;
+    }
+    if (current) {
+      sections[current].push(line);
+    }
+  }
+  return Object.fromEntries(
+    Object.entries(sections).map(([key, value]) => [key, value.join(' ').replace(/\s+/g, ' ').trim()])
+  );
+}
+
+export function getChangedClaudeAnnouncement(
+  previousBody: string | undefined | null,
+  nextBody: string | undefined | null,
+): string | null {
+  const previous = sectionBodyMap(previousBody);
+  const next = sectionBodyMap(nextBody);
+  const orderedSections = ['recent work', 'current analysis', 'next step'];
+  for (const section of orderedSections) {
+    if (next[section] && next[section] !== previous[section]) {
+      const prefix = section.replace(/\b\w/g, (char) => char.toUpperCase());
+      return `${prefix}: ${next[section]}`;
+    }
+  }
+  return null;
 }
 
 export function isTerminalClaudeProgress(progress: { status?: string; body?: string; steps?: Array<{ status: string }> } | null | undefined): boolean {
