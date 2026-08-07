@@ -55,6 +55,15 @@ interface IssueChatProps {
 type Awaiting = 'answer' | 'choice' | null;
 type ProgressTarget = { mode: 'create' | 'update'; issueNumber?: number | null; prNumber?: number | null; commentId?: number | null };
 const CLAUDE_PROGRESS_POLL_MS = 10000;
+export interface AutoScrollState {
+  itemCount: number;
+  lastItemId: string | null;
+}
+
+export function shouldAutoScrollForNewItems(previousState: AutoScrollState, nextState: AutoScrollState): boolean {
+  return nextState.itemCount > previousState.itemCount
+    || (nextState.lastItemId !== null && nextState.lastItemId !== previousState.lastItemId);
+}
 
 function buildProgressAnnouncement(status: string, label: string): string {
   if (status === 'completed') return `Completed: ${label}`;
@@ -158,6 +167,10 @@ export default function IssueChat({
   const latestClaudePollRequestIdRef = useRef(0);
   const latestClaudeAppliedRequestIdRef = useRef(0);
   const latestClaudeAppliedUpdatedAtRef = useRef<number | null>(null);
+  const lastAutoScrollStateRef = useRef<{ itemCount: number; lastItemId: string | null }>({
+    itemCount: 0,
+    lastItemId: null,
+  });
   const createToolName = extractCreateToolName(understandingSummary);
   const modeBannerText = isCreateMode
     ? createToolName
@@ -182,13 +195,23 @@ export default function IssueChat({
     return () => clearTimeout(timeout);
   }, [isCreateMode, selectedIssue?.title]);
 
-  // Auto-scroll to the newest message.
+  // Auto-scroll to the newest message only when a new chat item is appended.
+  // In-place Claude progress updates intentionally preserve the user's position.
   useEffect(() => {
-    if (scrollViewRef.current) {
+    const lastItem = items[items.length - 1];
+    const nextState = {
+      itemCount: items.length,
+      lastItemId: lastItem?.id || null,
+    };
+    const previousState = lastAutoScrollStateRef.current;
+    const appendedMessage = shouldAutoScrollForNewItems(previousState, nextState);
+
+    if (scrollViewRef.current && appendedMessage) {
       setTimeout(() => {
         scrollViewRef.current?.scrollToEnd({ animated: true });
       }, 100);
     }
+    lastAutoScrollStateRef.current = nextState;
   }, [items, progressText, isSending]);
 
   // Announce new assistant-originated items. assistant-updated is skipped
@@ -964,6 +987,7 @@ export default function IssueChat({
         return (
           <View
             key={item.id}
+            testID={`claude-progress-${item.id}`}
             style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
             accessible={false}>
             <Text

@@ -84,6 +84,7 @@ export interface ClaudeAccessibilityBlock {
 }
 
 const SECTION_HEADINGS = new Set([
+  'progress',
   'current analysis',
   'implementation decisions',
   'recent work',

@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import { AccessibilityInfo, TextInput, TouchableOpacity } from 'react-native';
-import IssueChat from '../IssueChat';
+import IssueChat, { shouldAutoScrollForNewItems } from '../IssueChat';
 import PRsAndText from '../PRsAndText';
 import { ThemeProvider } from '../ThemeContext';
 import {
@@ -297,6 +297,79 @@ describe('IssueChat progress', () => {
     expect(JSON.stringify(renderer!.toJSON())).toContain('Final Claude update after review');
   });
 
+  test('appending a normal new message still triggers the auto-scroll decision', () => {
+    expect(
+      shouldAutoScrollForNewItems(
+        { itemCount: 2, lastItemId: 'assistant-created-1' },
+        { itemCount: 3, lastItemId: 'user-text-2' },
+      ),
+    ).toBe(true);
+  });
+
+  test('updating the existing Claude progress message does not trigger the auto-scroll decision and keeps a stable message id', async () => {
+    expect(
+      shouldAutoScrollForNewItems(
+        { itemCount: 4, lastItemId: 'claude-progress-stable' },
+        { itemCount: 4, lastItemId: 'claude-progress-stable' },
+      ),
+    ).toBe(false);
+
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 55,
+      issue_url: 'https://github.test/issues/55',
+      video_summary: '',
+      pr_number: 55,
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:00Z',
+        body: '### Progress\n- [ ] Build tool',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:10Z',
+        body: '### Progress\n- [x] Build tool\n\n### Recent work\nValidated output.',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 55, title: 'PR 55' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(150);
+      await Promise.resolve();
+    });
+
+    const firstContainer = renderer!.root.findAll((node) => typeof node.props?.testID === 'string' && node.props.testID.startsWith('claude-progress-'))[0];
+    const stableTestId = firstContainer.props.testID;
+
+    await act(async () => {
+      jest.advanceTimersByTime(10000);
+      await Promise.resolve();
+    });
+
+    const secondContainer = renderer!.root.findAll((node) => typeof node.props?.testID === 'string' && node.props.testID.startsWith('claude-progress-'))[0];
+    expect(secondContainer.props.testID).toBe(stableTestId);
+  });
+
   test('keeps polling after completed-looking text but stops loading sound on terminal backend status', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
@@ -535,19 +608,44 @@ describe('Claude accessibility helpers', () => {
   });
 
   test('groups major markdown sections for VoiceOver while keeping checklist items separate', () => {
-    const blocks = buildClaudeAccessibilityBlocks(`### Implementation decisions
+    const blocks = buildClaudeAccessibilityBlocks(`### Progress
+
+- [x] Read issue and repository \`CLAUDE.md\`
+- [ ] Add focused tests
+
+### Current analysis
+
+Ordinary text for current analysis.
+
+### Implementation decisions
 
 - Model choice: \`Gemini 3.1 Flash Lite\`
 - Frame strategy: latest-frame streaming
 - Runtime input: expected vehicle details
 
-- [x] Read issue and repository \`CLAUDE.md\`
-- [ ] Add focused tests
+### Recent work
+
+Validated the generated tool.
+
+### Next step
+
+Commit and push.
+
+### Implementation summary
+
+Validation passed and PR prepared.
 `);
-    expect(blocks[0].label).toBe(
-      'Implementation decisions. Model choice: Gemini 3.1 Flash Lite. Frame strategy: latest-frame streaming. Runtime input: expected vehicle details'
-    );
+    expect(blocks[0].label).toBe('Progress');
     expect(blocks[1].label).toBe('Finished: Read issue and repository CLAUDE.md');
     expect(blocks[2].label).toBe('Ongoing: Add focused tests');
+    expect(blocks[3].label).toBe(
+      'Current analysis. Ordinary text for current analysis.'
+    );
+    expect(blocks[4].label).toBe(
+      'Implementation decisions. Model choice: Gemini 3.1 Flash Lite. Frame strategy: latest-frame streaming. Runtime input: expected vehicle details'
+    );
+    expect(blocks[5].label).toBe('Recent work. Validated the generated tool.');
+    expect(blocks[6].label).toBe('Next step. Commit and push.');
+    expect(blocks[7].label).toBe('Implementation summary. Validation passed and PR prepared.');
   });
 });
