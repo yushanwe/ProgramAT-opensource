@@ -53,7 +53,8 @@ interface IssueChatProps {
 
 type Awaiting = 'answer' | 'choice' | null;
 type ProgressTarget = { mode: 'create' | 'update'; issueNumber?: number | null; prNumber?: number | null; commentId?: number | null };
-const CLAUDE_PROGRESS_POLL_MS = 10000;
+const CLAUDE_POLL_INTERVAL_MS = 6000;
+const CLAUDE_LOADING_AUDIO_INTERVAL_MS = 6000;
 export interface AutoScrollState {
   itemCount: number;
   lastItemId: string | null;
@@ -160,13 +161,15 @@ export default function IssueChat({
   const lastAnnouncedIdRef = useRef<string | null>(null);
   const lastAnnouncedProgressStepRef = useRef<string | null>(null);
   const progressPollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const claudeLoadingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const claudeLoadingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const claudeLoadingLoopTokenRef = useRef(0);
   const claudeProgressItemIdRef = useRef<string | null>(null);
   const previousClaudeBodyRef = useRef<string>('');
   const latestClaudePollRequestIdRef = useRef(0);
   const latestClaudeAppliedRequestIdRef = useRef(0);
   const latestClaudeAppliedUpdatedAtRef = useRef<number | null>(null);
-  const claudeMessageAppearedRef = useRef(false);
+  const hasClaudeMessageRef = useRef(false);
+  const allowNextClaudeAutoFollowRef = useRef(false);
   const lastAutoScrollStateRef = useRef<{ itemCount: number; lastItemId: string | null }>({
     itemCount: 0,
     lastItemId: null,
@@ -179,6 +182,21 @@ export default function IssueChat({
     : selectedIssue?.title
     ? `Mode: Updating ${selectedIssue.title}`
     : null;
+  const isClaudeWaitingActive = !!claudeProgress
+    && claudeProgress.status !== 'waiting_for_comment'
+    && claudeProgress.status !== 'unavailable'
+    && claudeProgress.status !== 'completed'
+    && claudeProgress.status !== 'failed'
+    && claudeProgress.status !== 'cancelled';
+
+  const stopClaudeLoadingSound = () => {
+    claudeLoadingLoopTokenRef.current += 1;
+    if (claudeLoadingTimeoutRef.current) {
+      clearTimeout(claudeLoadingTimeoutRef.current);
+      claudeLoadingTimeoutRef.current = null;
+    }
+    BeepService.stopLoadingSound();
+  };
 
   useEffect(() => {
     isBrainstormingEnabled().then(setBrainstormingEnabled).catch(() => setBrainstormingEnabled(true));
@@ -206,10 +224,15 @@ export default function IssueChat({
     const previousState = lastAutoScrollStateRef.current;
     const appendedMessage = shouldAutoScrollForNewItems(previousState, nextState);
 
-    if (scrollViewRef.current && appendedMessage && !claudeMessageAppearedRef.current) {
+    const shouldAutoFollow = appendedMessage
+      && scrollViewRef.current
+      && (!hasClaudeMessageRef.current || allowNextClaudeAutoFollowRef.current);
+
+    if (shouldAutoFollow) {
       setTimeout(() => {
         scrollViewRef.current?.scrollToEnd({ animated: true });
       }, 100);
+      allowNextClaudeAutoFollowRef.current = false;
     }
     lastAutoScrollStateRef.current = nextState;
   }, [items, progressText, isSending]);
@@ -273,34 +296,35 @@ export default function IssueChat({
   }, [claudeProgress]);
 
   useEffect(() => {
-    const stopLoading = () => {
-      if (claudeLoadingIntervalRef.current) {
-        clearInterval(claudeLoadingIntervalRef.current);
-        claudeLoadingIntervalRef.current = null;
-      }
-      BeepService.stopLoadingSound();
-    };
-
-    const shouldPlay = !!claudeProgress
-      && claudeProgress.status !== 'waiting_for_comment'
-      && claudeProgress.status !== 'unavailable'
-      && claudeProgress.status !== 'completed'
-      && claudeProgress.status !== 'failed'
-      && claudeProgress.status !== 'cancelled';
-
-    if (!shouldPlay) {
-      stopLoading();
-      return () => stopLoading();
+    if (!isClaudeWaitingActive) {
+      stopClaudeLoadingSound();
+      return;
     }
 
-    stopLoading();
-    BeepService.playLoadingSound();
-    claudeLoadingIntervalRef.current = setInterval(() => {
-      BeepService.playLoadingSound();
-    }, 3000);
+    const loopToken = claudeLoadingLoopTokenRef.current + 1;
+    claudeLoadingLoopTokenRef.current = loopToken;
 
-    return () => stopLoading();
-  }, [claudeProgress]);
+    const playAndScheduleNext = async () => {
+      await BeepService.playLoadingSound();
+      if (claudeLoadingLoopTokenRef.current !== loopToken) return;
+      claudeLoadingTimeoutRef.current = setTimeout(() => {
+        claudeLoadingTimeoutRef.current = null;
+        if (claudeLoadingLoopTokenRef.current !== loopToken) return;
+        void playAndScheduleNext();
+      }, CLAUDE_LOADING_AUDIO_INTERVAL_MS);
+    };
+
+    void playAndScheduleNext();
+    return () => {
+      if (claudeLoadingLoopTokenRef.current === loopToken) {
+        stopClaudeLoadingSound();
+      }
+    };
+  }, [isClaudeWaitingActive]);
+
+  useEffect(() => () => {
+    stopClaudeLoadingSound();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -362,7 +386,7 @@ export default function IssueChat({
       poll();
       progressPollIntervalRef.current = setInterval(() => {
         poll();
-      }, CLAUDE_PROGRESS_POLL_MS);
+      }, CLAUDE_POLL_INTERVAL_MS);
     }
 
     return () => {
@@ -410,7 +434,8 @@ export default function IssueChat({
         || prev.find((item) => item.kind === 'assistant-claude-progress')?.id
         || null;
       if (!existingId) {
-        claudeMessageAppearedRef.current = true;
+        hasClaudeMessageRef.current = true;
+        allowNextClaudeAutoFollowRef.current = true;
         const id = nextId('assistant-claude-progress');
         claudeProgressItemIdRef.current = id;
         return [...prev, {
@@ -807,14 +832,16 @@ export default function IssueChat({
     latestClaudePollRequestIdRef.current = 0;
     latestClaudeAppliedRequestIdRef.current = 0;
     latestClaudeAppliedUpdatedAtRef.current = null;
-    claudeMessageAppearedRef.current = false;
+    hasClaudeMessageRef.current = false;
+    allowNextClaudeAutoFollowRef.current = false;
     lastAutoScrollStateRef.current = { itemCount: 0, lastItemId: null };
     resetConversation();
     Keyboard.dismiss();
   };
 
   useEffect(() => {
-    claudeMessageAppearedRef.current = false;
+    hasClaudeMessageRef.current = false;
+    allowNextClaudeAutoFollowRef.current = false;
     claudeProgressItemIdRef.current = null;
     previousClaudeBodyRef.current = '';
     latestClaudePollRequestIdRef.current = 0;
@@ -1017,9 +1044,7 @@ export default function IssueChat({
                 key={`${item.id}_section_${sectionIndex}`}
                 accessible={true}
                 accessibilityRole="text"
-                accessibilityLabel={section.label}
-                accessibilityElementsHidden={true}
-                importantForAccessibility="no-hide-descendants">
+                accessibilityLabel={section.label}>
                 {section.lines.map((line, lineIndex) => {
                   if (line.kind === 'blank') {
                     return <View key={`${item.id}_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
