@@ -30,11 +30,31 @@ TOOL_PROMPT = (
 )
 
 DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite"
+STRONG_MODEL = "gpt-5"
 FALLBACK_TEXT = "I cannot locate a clear exit from this view."
+
+# Uncertainty indicators that trigger cascade to stronger model
+UNCERTAINTY_PHRASES = [
+    "not sure",
+    "unclear",
+    "difficult to tell",
+    "cannot determine",
+    "may be",
+    "might be",
+    "possibly",
+    "uncertain",
+    "hard to see",
+    "cannot locate",
+]
 
 
 async def analyze_image(image):
-    """Analyze a single frame to locate exit and provide navigation guidance."""
+    """Analyze a single frame to locate exit and provide navigation guidance.
+
+    Uses conditional cascade: starts with fast Gemini model, escalates to
+    GPT-5 when the initial result shows uncertainty.
+    """
+    # First attempt with fast model
     response = await asyncio.to_thread(
         call_model,
         DEFAULT_MODEL,
@@ -43,7 +63,36 @@ async def analyze_image(image):
         {"timeout": 60, "num_retries": 0},
     )
     text = extract_text(response).strip()
-    return text or FALLBACK_TEXT
+
+    # Check if result is uncertain or empty
+    if not text:
+        # Empty response - try stronger model
+        response = await asyncio.to_thread(
+            call_model,
+            STRONG_MODEL,
+            [{"role": "user", "content": TOOL_PROMPT}],
+            [image],
+            {"timeout": 90, "num_retries": 0},
+        )
+        text = extract_text(response).strip()
+        return text or FALLBACK_TEXT
+
+    # Check for uncertainty indicators in the text
+    text_lower = text.lower()
+    if any(phrase in text_lower for phrase in UNCERTAINTY_PHRASES):
+        # Uncertain response - escalate to stronger model
+        response = await asyncio.to_thread(
+            call_model,
+            STRONG_MODEL,
+            [{"role": "user", "content": TOOL_PROMPT}],
+            [image],
+            {"timeout": 90, "num_retries": 0},
+        )
+        strong_text = extract_text(response).strip()
+        # Use stronger model result if non-empty, otherwise keep original
+        return strong_text or text
+
+    return text
 
 
 async def on_take_photo(runtime, image, input_data):
