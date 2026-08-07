@@ -87,6 +87,7 @@ from implementation_traceability import (
     extract_implementation_summary,
     get_traceability_record,
     infer_tool_path,
+    resolve_update_brainstorm_context,
     upsert_traceability_record,
 )
 from gemini_summarizer import summarize_entries_sync
@@ -110,6 +111,7 @@ from nvidia_hosted_client import (
     validate_played_card_event,
 )
 from brainstorming import (
+    build_clarified_update_request,
     build_update_brainstorm_context,
     generate_brainstorming_question,
 )
@@ -5839,6 +5841,9 @@ async def generate_ranked_question_queue(
     brainstorm_history: list = None,
     existing_queue: list = None,
     max_queue_size: int = 8,
+    *,
+    mode: str = 'create',
+    update_context: Optional[Dict[str, Any]] = None,
 ) -> list:
     """
     Generate 3 new brainstorming questions using Gemini, merge them with any
@@ -5955,31 +5960,70 @@ async def generate_ranked_question_queue(
             + "\n".join(f"- {q}" for q in existing_queue)
         )
 
-    prompt = (
-        "You are helping a blind or low-vision user design a camera-based assistive tool. "
-        "Here is everything known so far about the tool they want:\n\n"
-        f"Title: {title}\n"
-        f"Description: {description}\n"
-        f"Proposed solution: {solution}\n"
-        f"Example usage: {example_usage}"
-        f"{video_section}"
-        f"{history_section}"
-        f"{existing_section}"
-        "\n\nYour task:\n"
-        "1. Generate exactly 3 new clarifying questions focused on gaps, edge cases, "
-        "environmental conditions, or failure behaviors. "
-        "Do not ask about tool UI, display, interface, or presentation — those are handled by the app, not the tool. "
-        "Do not ask about anything already answered above.\n"
-        "2. Combine these 3 new questions with any existing unasked questions listed above.\n"
-        "3. Rank ALL questions (new + existing) from MOST to LEAST relevant, "
-        "considering what gaps remain most important given what is already known.\n"
-        f"4. Return the final ranked list as a plain numbered list (at most {max_queue_size} questions), "
-        "one question per line, most relevant first. No explanations, no headings.\n\n"
-        "Format exactly:\n"
-        "1. [question]\n"
-        "2. [question]\n"
-        "..."
-    )
+    if mode == 'update':
+        update_context = update_context or {}
+        metadata_json = json.dumps(update_context.get('implementation_metadata') or {}, ensure_ascii=False)[:5000]
+        implementation_summary_json = json.dumps(update_context.get('implementation_summary') or {}, ensure_ascii=False)[:2500]
+        prompt = (
+            "You are helping a blind or low-vision user update an existing camera-based assistive tool. "
+            "Reuse the current implementation context to understand existing behavior before asking clarifying questions.\n\n"
+            f"Repository: {update_context.get('repository', '')}\n"
+            f"Issue number: {update_context.get('issue_number', '')}\n"
+            f"PR number: {update_context.get('pr_number', '')}\n"
+            f"PR head branch: {update_context.get('pr_head_branch', '')}\n"
+            f"PR head SHA: {update_context.get('pr_head_sha', '')}\n"
+            f"Current tool: {update_context.get('tool_name', '')}\n"
+            f"Current tool path: {update_context.get('tool_path', '')}\n"
+            f"Current tool source excerpt:\n{(update_context.get('tool_source') or '')[:6000]}\n\n"
+            f"User update request: {description}\n"
+            f"Issue title: {title}\n"
+            f"Issue / PR context: {(update_context.get('issue_body') or '')[:2000]}\n{(update_context.get('pr_body') or '')[:2000]}\n\n"
+            f"Claude implementation summary: {(update_context.get('claude_summary') or '')[:3000]}\n\n"
+            f"Implementation summary fields: {implementation_summary_json}\n"
+            f"Implementation metadata JSON: {metadata_json}\n"
+            f"Sanitized action log:\n{(update_context.get('action_log') or '')[:8000]}\n"
+            f"Relevant PR diff:\n{(update_context.get('pr_diff') or '')[:6000]}"
+            f"{history_section}"
+            f"{existing_section}"
+            "\n\nYour task:\n"
+            "1. Generate exactly 3 new clarifying questions focused on gaps, edge cases, environmental conditions, failure behaviors, or compatibility constraints for the requested update.\n"
+            "2. Do not ask about tool UI, display, interface, or presentation.\n"
+            "3. Do not ask for information already available in the issue, PR, metadata, source, action log, or previous answers.\n"
+            "4. Preserve existing behavior unless the requested update explicitly changes it.\n"
+            "5. Combine these 3 new questions with any existing unasked questions listed above.\n"
+            "6. Rank ALL questions (new + existing) from MOST to LEAST relevant.\n"
+            f"7. Return the final ranked list as a plain numbered list (at most {max_queue_size} questions), one question per line, most relevant first. No explanations, no headings.\n\n"
+            "Format exactly:\n"
+            "1. [question]\n"
+            "2. [question]\n"
+            "..."
+        )
+    else:
+        prompt = (
+            "You are helping a blind or low-vision user design a camera-based assistive tool. "
+            "Here is everything known so far about the tool they want:\n\n"
+            f"Title: {title}\n"
+            f"Description: {description}\n"
+            f"Proposed solution: {solution}\n"
+            f"Example usage: {example_usage}"
+            f"{video_section}"
+            f"{history_section}"
+            f"{existing_section}"
+            "\n\nYour task:\n"
+            "1. Generate exactly 3 new clarifying questions focused on gaps, edge cases, "
+            "environmental conditions, or failure behaviors. "
+            "Do not ask about tool UI, display, interface, or presentation — those are handled by the app, not the tool. "
+            "Do not ask about anything already answered above.\n"
+            "2. Combine these 3 new questions with any existing unasked questions listed above.\n"
+            "3. Rank ALL questions (new + existing) from MOST to LEAST relevant, "
+            "considering what gaps remain most important given what is already known.\n"
+            f"4. Return the final ranked list as a plain numbered list (at most {max_queue_size} questions), "
+            "one question per line, most relevant first. No explanations, no headings.\n\n"
+            "Format exactly:\n"
+            "1. [question]\n"
+            "2. [question]\n"
+            "..."
+        )
 
     fallback = [
         "Is there anything specific about how the tool should behave in difficult conditions, "
@@ -6012,6 +6056,22 @@ async def generate_ranked_question_queue(
         logger.warning("generate_ranked_question_queue failed", exc_info=True)
 
     return fallback[:max_queue_size]
+
+
+def _build_update_issue_parsed_data(selected_issue_title: str, update_request: str, video_summary: str = '') -> Dict[str, str]:
+    additional_parts = [
+        "This is an update to an existing tool.",
+        update_request.strip(),
+    ]
+    if video_summary:
+        additional_parts.append(f"Video summary: {video_summary}")
+    return {
+        'title': selected_issue_title or 'Existing tool update',
+        'description': update_request.strip(),
+        'solution': '',
+        'example_usage': '',
+        'additional': '\n\n'.join(part for part in additional_parts if part),
+    }
 
 
 def _truncate_at_sentence_boundary(text: str, max_chars: int = 600) -> str:
@@ -7009,22 +7069,39 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     # Generate next question with brainstorm context
     parsed_data = entry['parsed_data']
     video_summary = entry['video_summary']
+    mode = entry.get('mode', 'create')
+    update_context = entry.get('update_context')
     await _broadcast_ws({'type': 'progress', 'message': 'Summarizing and generating the next question…'})
 
     existing_queue = entry.get('question_queue', [])
     latest_qa = brainstorm_history[-1] if brainstorm_history else None
     try:
         results = await asyncio.gather(
-            generate_ranked_question_queue(parsed_data, video_summary, brainstorm_history, existing_queue),
+            generate_ranked_question_queue(
+                parsed_data,
+                video_summary,
+                brainstorm_history,
+                existing_queue,
+                mode=mode,
+                update_context=update_context,
+            ),
             generate_understanding_summary(parsed_data, video_summary, brainstorm_history, latest_qa=latest_qa),
         )
         next_question_queue = results[0]
         summary, integration_note = results[1]
-        next_question = next_question_queue[0] if next_question_queue else "What other features or behaviors would be helpful for this tool?"
+        next_question = next_question_queue[0] if next_question_queue else (
+            "What existing behavior must stay the same while adding this update?"
+            if mode == 'update'
+            else "What other features or behaviors would be helpful for this tool?"
+        )
         entry['question_queue'] = next_question_queue[1:]
     except Exception:
         logger.warning("generate_ranked_question_queue failed in /brainstorm-next-question", exc_info=True)
-        next_question = "What other features or behaviors would be helpful for this tool?"
+        next_question = (
+            "What existing behavior must stay the same while adding this update?"
+            if mode == 'update'
+            else "What other features or behaviors would be helpful for this tool?"
+        )
         summary = ''
         integration_note = ''
         entry['question_queue'] = []
@@ -7055,7 +7132,8 @@ async def handle_update_submit(request: web.Request) -> web.Response:
       - 'video'     (bytes, optional): video whose Gemini summary is appended directly
                     to the comment text — no AI field-parsing, just concatenation.
 
-    Posts a comment to the GitHub issue and broadcasts issue_updated to clients.
+    Uses the same brainstorming round-trip as create mode when enabled, then
+    posts the clarified update request to GitHub and broadcasts issue_updated.
     """
     if not GITHUB_TOKEN:
         return web.json_response({'status': 'error', 'error': 'GitHub not configured'}, status=503)
@@ -7064,6 +7142,10 @@ async def handle_update_submit(request: web.Request) -> web.Response:
     issue_number = None
     video_bytes = None
     video_suffix = '.mp4'
+    ideation_answer = ''
+    token = ''
+    choice = ''
+    brainstormingEnabled = True
 
     try:
         reader = await request.multipart()
@@ -7074,6 +7156,10 @@ async def handle_update_submit(request: web.Request) -> web.Response:
                     meta = json.loads(raw)
                     text = meta.get('text', '')
                     issue_number = meta.get('issue_number')
+                    ideation_answer = meta.get('ideation_answer', '')
+                    token = meta.get('token', '')
+                    choice = meta.get('choice', '')
+                    brainstormingEnabled = meta.get('brainstormingEnabled', True)
                 except Exception:
                     text = raw.decode('utf-8', errors='replace')
             elif part.name == 'video':
@@ -7091,33 +7177,153 @@ async def handle_update_submit(request: web.Request) -> web.Response:
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
 
     if not text or not text.strip():
-        return web.json_response({'status': 'error', 'error': 'No text provided'}, status=400)
+        if choice != 'start_building':
+            return web.json_response({'status': 'error', 'error': 'No text provided'}, status=400)
     if not issue_number:
         return web.json_response({'status': 'error', 'error': 'No issue_number provided'}, status=400)
 
-    # --- Summarize video if present (best-effort) ---
-    video_summary = ''
-    if video_bytes:
-        tmp_path = None
-        try:
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=video_suffix, prefix='update_')
-            with os.fdopen(tmp_fd, 'wb') as fh:
-                fh.write(video_bytes)
-            logger.info("Saved update video to %s (%d bytes)", tmp_path, len(video_bytes))
-            video_summary = await summarize_video(tmp_path, prompt=ITERATION_PROMPT)
-        except Exception:
-            logger.error("Video summarization failed in /submit-update", exc_info=True)
-        finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+    if token and ideation_answer:
+        entry = pending_ideation_http.get(token)
+        if entry is None:
+            return web.json_response(
+                {'status': 'error', 'error': 'Ideation session expired or not found'},
+                status=400,
+            )
 
-    # --- Build comment: text + appended video summary ---
-    comment = text.strip()
-    if video_summary:
-        comment += f"\n\n---\n**Video Summary:**\n{video_summary}"
+        last_question = entry.get('last_question', '')
+        brainstorm_history = entry.get('brainstorm_history', [])
+        if last_question and ideation_answer.strip():
+            brainstorm_history.append({
+                'question': last_question,
+                'answer': ideation_answer.strip(),
+            })
+            entry['brainstorm_history'] = brainstorm_history
+
+        if choice != 'start_building':
+            await _broadcast_ws({'type': 'progress', 'message': 'Summarizing what I understood…'})
+            latest_qa = brainstorm_history[-1] if brainstorm_history else None
+            summary, integration_note = await generate_understanding_summary(
+                entry['parsed_data'],
+                entry.get('video_summary', ''),
+                brainstorm_history,
+                latest_qa=latest_qa,
+            )
+            if not summary:
+                summary = entry.get('last_summary', '')
+            entry['last_summary'] = summary
+            return web.json_response({
+                'status': 'brainstorm_choice',
+                'token': token,
+                'brainstorm_history': brainstorm_history,
+                'summary': summary,
+                'integration_note': integration_note,
+            })
+
+        pending_ideation_http.pop(token, None)
+        brainstorm_history = entry.get('brainstorm_history', [])
+        comment = build_clarified_update_request(
+            entry.get('original_request', ''),
+            [qa.get('question', '') for qa in brainstorm_history],
+            [qa.get('answer', '') for qa in brainstorm_history],
+        )
+        video_summary = entry.get('video_summary', '')
+    else:
+        video_summary = ''
+        if video_bytes:
+            tmp_path = None
+            try:
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=video_suffix, prefix='update_')
+                with os.fdopen(tmp_fd, 'wb') as fh:
+                    fh.write(video_bytes)
+                logger.info("Saved update video to %s (%d bytes)", tmp_path, len(video_bytes))
+                video_summary = await summarize_video(tmp_path, prompt=ITERATION_PROMPT)
+            except Exception:
+                logger.error("Video summarization failed in /submit-update", exc_info=True)
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        if brainstormingEnabled and not choice:
+            await _broadcast_ws({'type': 'progress', 'message': 'Fetching current implementation context…'})
+            try:
+                update_context = await asyncio.to_thread(
+                    resolve_update_brainstorm_context,
+                    repo_name=GITHUB_REPO,
+                    token=GITHUB_TOKEN,
+                    issue_number=int(issue_number),
+                )
+            except Exception:
+                logger.warning("Failed to resolve update brainstorming context for issue #%s", issue_number, exc_info=True)
+                update_context = {
+                    'repository': GITHUB_REPO,
+                    'issue_number': int(issue_number),
+                    'issue_title': f'Issue #{issue_number}',
+                    'issue_body': '',
+                    'pr_number': None,
+                    'pr_head_branch': '',
+                    'pr_head_sha': '',
+                    'tool_name': '',
+                    'tool_path': '',
+                    'tool_source': '',
+                    'claude_summary': '',
+                    'implementation_summary': {},
+                    'implementation_metadata': {},
+                    'action_log': '',
+                    'pr_diff': '',
+                }
+
+            parsed_data = _build_update_issue_parsed_data(update_context.get('issue_title', ''), text.strip(), video_summary)
+            await _broadcast_ws({'type': 'progress', 'message': 'Generating the next question…'})
+            try:
+                results = await asyncio.gather(
+                    generate_ranked_question_queue(
+                        parsed_data,
+                        video_summary,
+                        [],
+                        [],
+                        mode='update',
+                        update_context=update_context,
+                    ),
+                    generate_understanding_summary(parsed_data, video_summary),
+                )
+                question_queue = results[0]
+                summary, integration_note = results[1]
+                question = question_queue[0] if question_queue else "What existing behavior must stay the same while adding this update?"
+            except Exception:
+                logger.warning("Update brainstorming question generation failed", exc_info=True)
+                question = "What existing behavior must stay the same while adding this update?"
+                question_queue = []
+                summary = ''
+                integration_note = ''
+
+            new_token = secrets.token_urlsafe(12)
+            pending_ideation_http[new_token] = {
+                'mode': 'update',
+                'issue_number': int(issue_number),
+                'original_request': text.strip(),
+                'parsed_data': parsed_data,
+                'video_summary': video_summary,
+                'brainstorm_history': [],
+                'question_queue': question_queue[1:],
+                'last_question': question,
+                'last_summary': summary,
+                'update_context': update_context,
+                'created_at': datetime.now(),
+            }
+            return web.json_response({
+                'status': 'ideation',
+                'question': question,
+                'token': new_token,
+                'summary': summary,
+                'integration_note': integration_note,
+            })
+
+        comment = text.strip()
+        if video_summary:
+            comment += f"\n\n---\n**Video Summary:**\n{video_summary}"
 
     # --- Post to GitHub ---
     try:

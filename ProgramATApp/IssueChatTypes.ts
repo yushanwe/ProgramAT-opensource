@@ -7,9 +7,10 @@ export type RetryDescriptor =
   | { op: 'create-text'; text: string }
   | { op: 'create-video'; text: string; videoUri: string }
   | { op: 'update'; text: string; videoUri: string | null; issueNumber: number }
+  | { op: 'update-answer'; text: string; token: string; issueNumber: number }
   | { op: 'ideation-answer'; text: string; token: string }
   | { op: 'next-question'; token: string }
-  | { op: 'start-building'; token: string };
+  | { op: 'start-building'; token: string; mode?: 'create' | 'update'; issueNumber?: number };
 
 export type IssueChatItem =
   | { kind: 'user-text'; id: string; ts: Date; text: string }
@@ -30,6 +31,8 @@ export type CreationResponse =
 
 export type UpdateResponse =
   | { status: 'updated'; issue_number: number; issue_url: string; video_summary: string; pr_number?: number | null; comment_id?: number | null }
+  | { status: 'ideation'; question: string; token: string; summary?: string; integration_note?: string }
+  | { status: 'brainstorm_choice'; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string };
 
 export type NextQuestionResponse =

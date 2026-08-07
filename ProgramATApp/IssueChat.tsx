@@ -597,6 +597,38 @@ export default function IssueChat({
     }
   };
 
+  const sendUpdateIdeationAnswer = async (answer: string, token: string) => {
+    if (!selectedIssue) return;
+    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: answer });
+    setComposeText('');
+    Keyboard.dismiss();
+    setIsSending(true);
+    inFlightRef.current = true;
+    try {
+      const result = await submitUpdate({
+        text: answer,
+        issueNumber: selectedIssue.number,
+        ideationAnswer: answer,
+        token,
+      });
+      if (result.status === 'error' && result.error === 'Ideation session expired or not found') {
+        resetConversation();
+        append({
+          kind: 'assistant-error',
+          id: nextId('assistant-error'),
+          ts: new Date(),
+          text: 'That brainstorming session expired. Send your update again to start over.',
+        });
+        return;
+      }
+      handleUpdateResponse(result, { op: 'update-answer', text: answer, token, issueNumber: selectedIssue.number });
+    } finally {
+      inFlightRef.current = false;
+      setProgressText(null);
+      setIsSending(false);
+    }
+  };
+
   const handleCreationResponse = (
     result: Awaited<ReturnType<typeof submitCreation>>,
     retry: RetryDescriptor,
@@ -655,6 +687,61 @@ export default function IssueChat({
     append({ kind: 'assistant-error', id: nextId('assistant-error'), ts: new Date(), text: message, retry });
   };
 
+  const handleUpdateResponse = (
+    result: Awaited<ReturnType<typeof submitUpdate>>,
+    retry: RetryDescriptor,
+  ) => {
+    if (result.status === 'updated') {
+      const videoSummarySkipped = !result.video_summary;
+      append({
+        kind: 'assistant-updated',
+        id: nextId('assistant-updated'),
+        ts: new Date(),
+        issueNumber: result.issue_number,
+        issueUrl: result.issue_url,
+        videoSummarySkipped,
+      });
+      setProgressTarget({ mode: 'update', prNumber: result.pr_number ?? selectedIssue?.number, commentId: result.comment_id });
+      resetConversation();
+      return;
+    }
+
+    if (result.status === 'ideation' && brainstormingActive) {
+      setActiveToken(result.token);
+      setAwaiting('answer');
+      if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
+      append({
+        kind: 'assistant-question',
+        id: nextId('assistant-question'),
+        ts: new Date(),
+        question: result.question,
+        token: result.token,
+      });
+      return;
+    }
+
+    if (result.status === 'brainstorm_choice' && brainstormingActive) {
+      setActiveToken(result.token);
+      setAwaiting('choice');
+      if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
+      brainstormHistoryRef.current = result.brainstorm_history || [];
+      append({
+        kind: 'assistant-choice-prompt',
+        id: nextId('assistant-choice-prompt'),
+        ts: new Date(),
+        text: 'Thanks for that context! You can keep brainstorming or start building.',
+        token: result.token,
+        resolved: false,
+      });
+      return;
+    }
+
+    const message = result.status === 'error' ? result.error : 'Something went wrong. Please try again.';
+    append({ kind: 'assistant-error', id: nextId('assistant-error'), ts: new Date(), text: message, retry });
+  };
+
   const handleKeepBrainstorming = async () => {
     if (!activeToken) return;
     resolveLatestChoicePrompt();
@@ -699,6 +786,7 @@ export default function IssueChat({
 
   const handleStartBuilding = async () => {
     if (!activeToken) return;
+    if (!isCreateMode && !selectedIssue) return;
     resolveLatestChoicePrompt();
     append({
       kind: 'user-choice',
@@ -714,33 +802,65 @@ export default function IssueChat({
     setIsSending(true);
     inFlightRef.current = true;
     try {
-      const result = await submitCreation({
-        text: lastAnswer,
-        ideationAnswer: lastAnswer,
-        token: activeToken,
-        choice: 'start_building',
-      });
-      if (result.status === 'created') {
-        const videoSummarySkipped = !result.video_summary;
-        append({
-          kind: 'assistant-created',
-          id: nextId('assistant-created'),
-          ts: new Date(),
-          issueNumber: result.issue_number,
-          issueUrl: result.issue_url,
-          videoSummarySkipped,
+      if (isCreateMode) {
+        const result = await submitCreation({
+          text: lastAnswer,
+          ideationAnswer: lastAnswer,
+          token: activeToken,
+          choice: 'start_building',
         });
-        setProgressTarget({ mode: 'create', issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
-        resetConversation();
+        if (result.status === 'created') {
+          const videoSummarySkipped = !result.video_summary;
+          append({
+            kind: 'assistant-created',
+            id: nextId('assistant-created'),
+            ts: new Date(),
+            issueNumber: result.issue_number,
+            issueUrl: result.issue_url,
+            videoSummarySkipped,
+          });
+          setProgressTarget({ mode: 'create', issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
+          resetConversation();
+        } else {
+          const message = result.status === 'error' ? result.error : 'Failed to create issue';
+          append({
+            kind: 'assistant-error',
+            id: nextId('assistant-error'),
+            ts: new Date(),
+            text: message,
+            retry: { op: 'start-building', token: activeToken, mode: 'create' },
+          });
+        }
       } else {
-        const message = result.status === 'error' ? result.error : 'Failed to create issue';
-        append({
-          kind: 'assistant-error',
-          id: nextId('assistant-error'),
-          ts: new Date(),
-          text: message,
-          retry: { op: 'start-building', token: activeToken },
+        const result = await submitUpdate({
+          text: lastAnswer,
+          issueNumber: selectedIssue.number,
+          ideationAnswer: lastAnswer,
+          token: activeToken,
+          choice: 'start_building',
         });
+        if (result.status === 'updated') {
+          const videoSummarySkipped = !result.video_summary;
+          append({
+            kind: 'assistant-updated',
+            id: nextId('assistant-updated'),
+            ts: new Date(),
+            issueNumber: result.issue_number,
+            issueUrl: result.issue_url,
+            videoSummarySkipped,
+          });
+          setProgressTarget({ mode: 'update', prNumber: result.pr_number ?? selectedIssue.number, commentId: result.comment_id });
+          resetConversation();
+        } else {
+          const message = result.status === 'error' ? result.error : 'Failed to send update';
+          append({
+            kind: 'assistant-error',
+            id: nextId('assistant-error'),
+            ts: new Date(),
+            text: message,
+            retry: { op: 'start-building', token: activeToken, mode: 'update', issueNumber: selectedIssue.number },
+          });
+        }
       }
     } finally {
       inFlightRef.current = false;
@@ -762,27 +882,8 @@ export default function IssueChat({
     setIsSending(true);
     inFlightRef.current = true;
     try {
-      const result = await submitUpdate({ text, issueNumber: selectedIssue.number, videoUri });
-      if (result.status === 'updated') {
-        const videoSummarySkipped = !!videoUri && !result.video_summary;
-        append({
-          kind: 'assistant-updated',
-          id: nextId('assistant-updated'),
-          ts: new Date(),
-          issueNumber: result.issue_number,
-          issueUrl: result.issue_url,
-          videoSummarySkipped,
-        });
-        setProgressTarget({ mode: 'update', prNumber: result.pr_number ?? selectedIssue.number, commentId: result.comment_id });
-      } else {
-        append({
-          kind: 'assistant-error',
-          id: nextId('assistant-error'),
-          ts: new Date(),
-          text: result.error,
-          retry: { op: 'update', text, videoUri, issueNumber: selectedIssue.number },
-        });
-      }
+      const result = await submitUpdate({ text, issueNumber: selectedIssue.number, videoUri, brainstormingEnabled: brainstormingActive });
+      handleUpdateResponse(result, { op: 'update', text, videoUri, issueNumber: selectedIssue.number });
     } finally {
       inFlightRef.current = false;
       setProgressText(null);
@@ -801,6 +902,9 @@ export default function IssueChat({
       case 'update':
         sendUpdate(retry.text, retry.videoUri);
         return;
+      case 'update-answer':
+        sendUpdateIdeationAnswer(retry.text, retry.token);
+        return;
       case 'ideation-answer':
         sendIdeationAnswer(retry.text, retry.token);
         return;
@@ -818,7 +922,11 @@ export default function IssueChat({
     if (!text && !stagedVideoUri) return;
 
     if (awaiting === 'answer' && activeToken) {
-      sendIdeationAnswer(text, activeToken);
+      if (isCreateMode) {
+        sendIdeationAnswer(text, activeToken);
+      } else {
+        sendUpdateIdeationAnswer(text, activeToken);
+      }
       return;
     }
 

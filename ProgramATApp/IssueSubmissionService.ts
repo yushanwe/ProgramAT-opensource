@@ -102,6 +102,10 @@ export interface SubmitUpdateArgs {
   text: string;
   issueNumber: number;
   videoUri?: string | null;
+  brainstormingEnabled?: boolean;
+  ideationAnswer?: string;
+  token?: string;
+  choice?: 'keep_brainstorming' | 'start_building';
 }
 
 export async function submitUpdate(args: SubmitUpdateArgs): Promise<UpdateResponse> {
@@ -114,6 +118,10 @@ export async function submitUpdate(args: SubmitUpdateArgs): Promise<UpdateRespon
   formData.append('metadata', JSON.stringify({
     text: args.text,
     issue_number: args.issueNumber,
+    ideation_answer: args.ideationAnswer,
+    token: args.token,
+    choice: args.choice,
+    brainstormingEnabled: args.brainstormingEnabled,
   }));
   if (args.videoUri) {
     formData.append('video', buildVideoPart(args.videoUri));
@@ -166,17 +174,17 @@ export interface FetchClaudeProgressArgs {
 export async function fetchClaudeProgress(args: FetchClaudeProgressArgs): Promise<ClaudeProgressResponse> {
   const baseUrl = getHttpBaseUrl();
   if (!baseUrl) {
-    return { status: 'error', steps: [], error: 'Server URL not configured' };
+    return { status: 'unavailable', steps: [], error: 'Server URL not configured' };
   }
   const issueNumber = args.mode === 'update' ? args.prNumber : args.issueNumber;
   if (!issueNumber) {
-    return { status: 'error', steps: [], error: 'No issue number available for progress lookup' };
+    return { status: 'unavailable', steps: [], error: 'No issue number available for progress lookup' };
   }
 
   const query = new URLSearchParams();
-  query.set(args.mode === 'update' ? 'pr_number' : 'issue_number', String(issueNumber));
-  query.set('mode', args.mode);
-  if (args.commentId) query.set('comment_id', String(args.commentId));
+  query.append(args.mode === 'update' ? 'pr_number' : 'issue_number', String(issueNumber));
+  query.append('mode', args.mode);
+  if (args.commentId) query.append('comment_id', String(args.commentId));
 
   try {
     const response = await fetch(`${baseUrl}/claude-progress?${query.toString()}`);

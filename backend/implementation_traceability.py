@@ -53,6 +53,8 @@ SECRET_PATTERNS = (
 )
 CLAUDE_WORKFLOW_NAME = 'Claude VAT Implementation'
 CLAUDE_WORKFLOW_JOB_HINT = 'claude-vat'
+IMPLEMENTATION_CONTEXT_PATH = '.programat/implementation_context.json'
+DEFAULT_ACTION_LOG_PATH = '.programat/claude_action_log.txt'
 
 
 def _get_conn():
@@ -480,6 +482,126 @@ def build_traceability_response(
         'tool_source': pr_snapshot.get('tool_source', ''),
         'implementation_summary': record.get('implementation_summary') or {},
         'action_logs': workflow.get('logs', '') if include_logs else '',
+    }
+
+
+def resolve_update_brainstorm_context(
+    *,
+    repo_name: str,
+    token: str,
+    issue_number: int,
+    pr_number: Optional[int] = None,
+) -> Dict[str, Any]:
+    from github import Github
+
+    gh = Github(token)
+    repo = gh.get_repo(repo_name)
+    issue = repo.get_issue(int(issue_number))
+
+    resolved_pr = repo.get_pull(int(pr_number)) if pr_number else None
+    if resolved_pr is None:
+        pulls = repo.get_pulls(state='all', sort='updated', direction='desc')
+        for candidate in pulls:
+            text = f'{candidate.title}\n{candidate.body or ""}'
+            if f'#{issue_number}' in text or f'issue {issue_number}' in text.lower():
+                resolved_pr = candidate
+                break
+            if str(issue_number) in (candidate.head.ref or ''):
+                resolved_pr = candidate
+                break
+
+    pr_metadata: Dict[str, Any] = {}
+    saved_metadata: Dict[str, Any] = {}
+    saved_action_log = ''
+    saved_tool_source = ''
+    pr_comments: List[str] = []
+    issue_comments: List[str] = []
+
+    if resolved_pr is not None:
+        pr_metadata = {
+            'pr_number': resolved_pr.number,
+            'pr_title': resolved_pr.title,
+            'pr_body': resolved_pr.body or '',
+            'pr_head_branch': resolved_pr.head.ref,
+            'pr_head_sha': resolved_pr.head.sha,
+        }
+        try:
+            metadata_file = repo.get_contents(IMPLEMENTATION_CONTEXT_PATH, ref=resolved_pr.head.sha)
+            saved_metadata = json.loads(metadata_file.decoded_content.decode('utf-8', errors='replace'))
+        except Exception:
+            saved_metadata = {}
+
+        action_log_path = str(saved_metadata.get('action_log_path') or DEFAULT_ACTION_LOG_PATH).strip() or DEFAULT_ACTION_LOG_PATH
+        try:
+            action_log_file = repo.get_contents(action_log_path, ref=resolved_pr.head.sha)
+            saved_action_log = sanitize_action_logs(action_log_file.decoded_content.decode('utf-8', errors='replace'))
+        except Exception:
+            saved_action_log = ''
+
+        tool_path = saved_metadata.get('tool_path')
+        if isinstance(tool_path, str) and tool_path:
+            try:
+                tool_file = repo.get_contents(tool_path, ref=resolved_pr.head.sha)
+                saved_tool_source = tool_file.decoded_content.decode('utf-8', errors='replace')
+            except Exception:
+                saved_tool_source = ''
+
+        try:
+            pr_comments = [
+                (comment.body or '').strip()
+                for comment in resolved_pr.get_issue_comments()
+                if (comment.body or '').strip()
+            ]
+        except Exception:
+            pr_comments = []
+
+    try:
+        issue_comments = [
+            (comment.body or '').strip()
+            for comment in issue.get_comments()
+            if (comment.body or '').strip()
+        ]
+    except Exception:
+        issue_comments = []
+
+    trace_record = get_traceability_record(issue_number=int(issue_number), pr_number=pr_metadata.get('pr_number'))
+    fallback_traceability = {}
+    if trace_record:
+        try:
+            fallback_traceability = build_traceability_response(
+                repo_name=repo_name,
+                token=token,
+                record=trace_record,
+                include_logs=True,
+            )
+        except Exception:
+            fallback_traceability = {}
+
+    metadata = saved_metadata or fallback_traceability.get('metadata') or {}
+    implementation_summary = metadata.get('implementation_summary') or fallback_traceability.get('implementation_summary') or {}
+    action_logs = saved_action_log or fallback_traceability.get('action_logs') or ''
+    tool_source = saved_tool_source or fallback_traceability.get('tool_source') or ''
+
+    return {
+        'repository': repo_name,
+        'issue_number': int(issue_number),
+        'issue_title': issue.title,
+        'issue_body': issue.body or '',
+        'issue_comments': issue_comments,
+        'pr_number': pr_metadata.get('pr_number') or pr_number,
+        'pr_title': pr_metadata.get('pr_title') or '',
+        'pr_body': pr_metadata.get('pr_body') or '',
+        'pr_comments': pr_comments,
+        'pr_head_branch': pr_metadata.get('pr_head_branch') or metadata.get('branch') or '',
+        'pr_head_sha': pr_metadata.get('pr_head_sha') or metadata.get('commit_sha') or '',
+        'tool_name': metadata.get('tool_name') or trace_record.get('tool_name') if trace_record else None,
+        'tool_path': metadata.get('tool_path') or trace_record.get('tool_path') if trace_record else None,
+        'tool_source': tool_source,
+        'claude_summary': metadata.get('claude_summary') or '',
+        'implementation_summary': implementation_summary,
+        'implementation_metadata': metadata,
+        'action_log': action_logs,
+        'pr_diff': fallback_traceability.get('pr_diff') or '',
     }
 
 
