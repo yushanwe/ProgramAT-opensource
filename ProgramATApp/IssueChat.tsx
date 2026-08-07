@@ -79,6 +79,18 @@ function summarizeClaudeAnnouncement(progress: ClaudeProgressResponse): string {
   return 'Claude updated progress.';
 }
 
+function hasClaudeCompletionLikeText(progress: ClaudeProgressResponse | null): boolean {
+  if (!progress) return false;
+  const body = sanitizeClaudeCommentBody(progress.body).toLowerCase();
+  const message = (progress.message || '').toLowerCase();
+  const combined = `${body}\n${message}`;
+  return combined.includes('implementation summary')
+    || combined.includes('summary')
+    || combined.includes('finished')
+    || combined.includes('completed')
+    || combined.includes('done');
+}
+
 function formatClaudeBody(body: string | undefined): string {
   const value = sanitizeClaudeCommentBody(body);
   return value || 'Claude has not posted a progress comment yet.';
@@ -187,7 +199,8 @@ export default function IssueChat({
     && claudeProgress.status !== 'unavailable'
     && claudeProgress.status !== 'completed'
     && claudeProgress.status !== 'failed'
-    && claudeProgress.status !== 'cancelled';
+    && claudeProgress.status !== 'cancelled'
+    && !hasClaudeCompletionLikeText(claudeProgress);
 
   const stopClaudeLoadingSound = () => {
     claudeLoadingLoopTokenRef.current += 1;

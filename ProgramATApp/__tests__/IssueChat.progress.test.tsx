@@ -558,7 +558,7 @@ describe('IssueChat progress', () => {
     expect(messageScrollView!.props.importantForAccessibility).toBeUndefined();
   });
 
-  test('keeps polling after completed-looking text but stops loading sound on terminal backend status', async () => {
+  test('keeps polling after completion-like Claude text but stops loading sound', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 21,
@@ -571,12 +571,15 @@ describe('IssueChat progress', () => {
         status: 'available',
         issue_number: 21,
         comment_id: 401,
-        body: '### Progress\n- [x] Build tool\n\n### Implementation summary\nCompleted summary while Claude is still reviewing.',
+        body: '### Progress\n- [x] Build tool\n- [ ] Run validation\n\n### Recent work\nValidation is still running.',
         message: 'Claude comment available.',
-        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
+        steps: [
+          { id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' },
+          { id: 'step_2', label: 'Run validation', raw_label: 'Run validation', status: 'in_progress' },
+        ],
       })
       .mockResolvedValueOnce({
-        status: 'completed',
+        status: 'available',
         issue_number: 21,
         comment_id: 401,
         body: 'Done\n- [x] Build tool',
@@ -604,6 +607,8 @@ describe('IssueChat progress', () => {
       await Promise.resolve();
     });
 
+    expect(mockStopLoadingSound).toHaveBeenCalled();
+
     await act(async () => {
       await Promise.resolve();
     });
@@ -612,7 +617,6 @@ describe('IssueChat progress', () => {
       await Promise.resolve();
     });
     expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(mockStopLoadingSound).toHaveBeenCalled();
     await act(async () => {
       renderer!.unmount();
     });
