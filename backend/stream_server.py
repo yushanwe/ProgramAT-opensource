@@ -5804,18 +5804,21 @@ async def answer_brainstorm_question(
     parsed_data: dict, video_summary: str, brainstorm_context: list, user_question: str,
 ) -> str:
     """
-    Ask the system LLM to directly answer a free-form clarifying question the
-    user asked mid-brainstorming, using only what's already known about the
-    tool. Unlike generate_ideation_question (which asks the user a question),
-    this answers one the user asked.
+    Ask the system LLM to directly respond to a free-form message the user
+    sent mid-brainstorming — either a clarifying question, answered using
+    only what's already known about the tool, or a correction/change to a
+    previously stated detail (e.g. "use a VLM instead of YOLO"), confirmed
+    back so the change reads as a replacement rather than an addition. Unlike
+    generate_ideation_question (which asks the user a question), this
+    responds to one the user sent.
 
     Args:
         parsed_data: The parsed issue data
         video_summary: Optional video summary
         brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
-        user_question: The free-form question the user just asked
+        user_question: The free-form question or correction the user just sent
 
-    Returns a plain answer string, or a sensible fallback on any error.
+    Returns a plain answer/confirmation string, or a sensible fallback on any error.
     """
     title = parsed_data.get('title', '')
     description = parsed_data.get('description', '')
@@ -5839,10 +5842,16 @@ async def answer_brainstorm_question(
 
     prompt = (
         "You are helping a blind or low-vision user design a camera-based assistive tool. "
-        "Below is everything known about the tool they want so far. The user has a specific "
-        "question — answer it directly and concisely using only the information below. "
-        "If the answer isn't covered by what's known, say so rather than inventing details. "
-        "Return only the answer itself, nothing else.\n\n"
+        "Below is everything known about the tool they want so far. The user has sent a "
+        "free-form message, which may be a question OR a correction/change to something "
+        "already decided (e.g. \"no, use a VLM instead of YOLO\"). "
+        "If it is a question, answer it directly and concisely using only the information "
+        "below; if the answer isn't covered by what's known, say so rather than inventing "
+        "details. "
+        "If it is a correction or change, briefly confirm the change back to them in plain "
+        "language (e.g. \"Got it — I'll use a VLM instead of YOLO.\") so it's clear the new "
+        "instruction replaces the earlier one, not adds to it. "
+        "Return only the answer/confirmation itself, nothing else.\n\n"
         f"Tool title: {title}\n"
         f"Description: {description}\n"
         f"Proposed solution: {solution}\n"
@@ -6056,9 +6065,16 @@ async def generate_understanding_summary(
             "SUMMARY must be 1-3 sentences of plain conversational language starting with "
             "\"Got it —\" or \"So you want\", restating the FULL understanding so far. "
             "Fold in every detail they have given.\n"
-            "NOTE must be a single sentence starting with \"Added:\" that describes the "
-            "specific detail just incorporated from their most recent answer — not the "
-            "answer verbatim, but what you now understand because of it.\n"
+            "IMPORTANT: if the most recent exchange below contradicts, corrects, or changes "
+            "something stated earlier (e.g. an earlier detail said one approach or value, and "
+            "the most recent exchange says to use a different one instead), the most recent "
+            "exchange is authoritative — REPLACE the earlier detail with it in SUMMARY rather "
+            "than mentioning both as if they coexist. Only keep earlier details that the most "
+            "recent exchange does not contradict.\n"
+            "NOTE must be a single sentence describing what just changed because of the most "
+            "recent answer — start with \"Corrected:\" if it replaced an earlier detail, or "
+            "\"Added:\" if it was new information — not the answer verbatim, but what you now "
+            "understand because of it.\n"
             "Do NOT ask a question. Do NOT add suggestions. Plain language only. No bullet points.\n\n"
             f"Tool title: {title}\n"
             f"Description: {description}\n"
@@ -6078,6 +6094,10 @@ async def generate_understanding_summary(
             "the way you would briefly restate someone's request back to them before asking a "
             "follow-up question. Start with something like \"Got it —\" or \"So you want\". "
             "Fold in every detail they have given, including their follow-up answers. "
+            "IMPORTANT: if a later detail contradicts or corrects an earlier one (e.g. an "
+            "earlier detail said one approach or value, and a later one says to use a "
+            "different one instead), treat the later detail as authoritative and REPLACE the "
+            "earlier one rather than mentioning both as if they coexist. "
             "Do NOT ask a question. Do NOT add suggestions, caveats, or ideas of your own. "
             "Do NOT use bullet points, headings, or field labels. "
             "Return only the restatement, nothing else.\n\n"
