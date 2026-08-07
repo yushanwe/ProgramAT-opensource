@@ -8,6 +8,7 @@ const RAW_URL_RE = /https?:\/\/\S+/gi;
 const CHECKLIST_LINE_RE = /^\s*[-*]\s*\[(x| |)\]\s+(.+?)\s*$/i;
 const CHECKLIST_LINE_COMPACT_RE = /^\s*[-*]\s*\[\]\s+(.+?)\s*$/i;
 const HEADING_RE = /^#{1,6}\s+(.+?)\s*$/;
+const STATUS_LINE_RE = /^\s*(\d{1,3})%\s+(.+?)\s*$/;
 
 function decodeHtmlEntities(text: string): string {
   return text
@@ -96,7 +97,6 @@ export interface ClaudeAccessibilitySection {
 }
 
 const SECTION_HEADINGS = new Set([
-  'progress',
   'current analysis',
   'implementation decisions',
   'recent work',
@@ -163,6 +163,15 @@ export function parseClaudeRenderLines(body: string | undefined | null): ClaudeR
       });
       continue;
     }
+    const statusMatch = line.match(STATUS_LINE_RE);
+    if (statusMatch) {
+      renderLines.push({
+        kind: 'paragraph',
+        text: `${Math.min(100, Math.max(0, Number(statusMatch[1])))}% ${statusMatch[2].trim()}`,
+        accessibilityLabel: `${Math.min(100, Math.max(0, Number(statusMatch[1])))}% ${stripInlineMarkdownPunctuation(statusMatch[2])}`,
+      });
+      continue;
+    }
     const compactMatch = line.match(CHECKLIST_LINE_COMPACT_RE);
     const standardMatch = line.match(CHECKLIST_LINE_RE);
     const task = compactMatch?.[1] || standardMatch?.[2];
@@ -225,6 +234,10 @@ function buildSectionLabel(heading: string | null, lines: string[]): string | nu
   const parts = [normalizedHeading, ...normalizedLines].filter(Boolean);
   if (parts.length === 0) return null;
   return parts.join('. ').trim();
+}
+
+function isStatusLine(line: string): boolean {
+  return STATUS_LINE_RE.test(line.trim());
 }
 
 export function buildClaudeAccessibilityBlocks(body: string | undefined | null): ClaudeAccessibilityBlock[] {
@@ -339,6 +352,13 @@ export function buildClaudeAccessibilitySections(body: string | undefined | null
       currentHeading = headingMatch[1];
       currentLabelLines = [];
       currentRenderLines = [lineRender];
+      continue;
+    }
+
+    if (isStatusLine(trimmed) && currentRenderLines.length > 0) {
+      flush();
+      currentRenderLines = [lineRender];
+      currentLabelLines = [trimmed];
       continue;
     }
 

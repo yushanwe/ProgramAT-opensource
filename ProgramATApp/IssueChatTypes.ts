@@ -22,7 +22,7 @@ export type IssueChatItem =
   | { kind: 'assistant-clarification-answer'; id: string; ts: Date; question: string; answer: string; token: string }
   | { kind: 'assistant-created'; id: string; ts: Date; issueNumber: number; issueUrl: string; videoSummarySkipped: boolean }
   | { kind: 'assistant-updated'; id: string; ts: Date; issueNumber: number; issueUrl: string; videoSummarySkipped: boolean }
-  | { kind: 'assistant-claude-progress'; id: string; ts: Date; status: string; body: string; commentId?: number | null; updatedAt?: string | null; message?: string }
+  | { kind: 'assistant-claude-progress'; id: string; ts: Date; status: string; body: string; versionKey: string; commentId?: number | null; updatedAt?: string | null; message?: string }
   | { kind: 'assistant-error'; id: string; ts: Date; text: string; retry?: RetryDescriptor };
 
 export type CreationResponse =
@@ -57,6 +57,11 @@ export interface ClaudeProgressResponse {
   comment_id?: number | null;
   body?: string;
   steps: ClaudeProgressStep[];
+  status_line?: {
+    percent: number;
+    label: string;
+    text: string;
+  } | null;
   updated_at?: string | null;
   message?: string;
   error?: string;

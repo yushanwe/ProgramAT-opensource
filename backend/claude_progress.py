@@ -4,6 +4,7 @@ from typing import Optional
 
 
 CHECKLIST_LINE_RE = re.compile(r'^\s*[-*]\s+\[(?P<checked>[ xX])\]\s+(?P<label>.+?)\s*$', re.MULTILINE)
+STATUS_LINE_RE = re.compile(r'^\s*(?P<percent>\d{1,3})%\s+(?P<label>[^\n]+?)\s*$')
 FAILURE_PATTERNS = (
     re.compile(r'\b(failed|failure|error|exception|traceback|unable to|could not|blocked)\b', re.IGNORECASE),
     re.compile(r'(^|\n)\s*status\s*:\s*failed\b', re.IGNORECASE),
@@ -51,6 +52,7 @@ def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = No
                                   updated_at: Optional[str] = None) -> dict:
     lines = body.splitlines()
     title = None
+    status_line = None
     steps = []
     first_pending_index = None
 
@@ -59,6 +61,15 @@ def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = No
             title_match = CLAUDE_PROGRESS_TITLE_RE.match(line)
             if title_match:
                 title = title_match.group(1).strip()
+        if status_line is None:
+            status_match = STATUS_LINE_RE.match(line.strip())
+            if status_match:
+                percent = max(0, min(100, int(status_match.group('percent'))))
+                status_line = {
+                    'percent': percent,
+                    'label': status_match.group('label').strip(),
+                    'text': f"{percent}% {status_match.group('label').strip()}",
+                }
         match = CHECKLIST_LINE_RE.match(line)
         if not match:
             continue
@@ -100,6 +111,7 @@ def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = No
         'comment_id': comment_id,
         'body': body,
         'steps': normalized_steps,
+        'status_line': status_line,
         'updated_at': updated_at,
     }
 
@@ -110,7 +122,7 @@ def looks_like_claude_progress_comment(comment) -> bool:
     if user.lower() not in CLAUDE_PROGRESS_COMMENT_USERNAMES:
         return False
     lowered = body.lower()
-    return bool(CHECKLIST_LINE_RE.search(body)) or any(marker in lowered for marker in CLAUDE_PROGRESS_MARKERS)
+    return bool(CHECKLIST_LINE_RE.search(body)) or bool(STATUS_LINE_RE.search(body)) or any(marker in lowered for marker in CLAUDE_PROGRESS_MARKERS)
 
 
 def _parse_comment_timestamp(comment) -> Optional[datetime]:
