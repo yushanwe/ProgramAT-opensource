@@ -35,10 +35,9 @@ import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
 import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
 import {
-  buildClaudeAccessibilityBlocks,
+  buildClaudeAccessibilitySections,
   buildClaudeAccessibilityLabel,
   getChangedClaudeAnnouncement,
-  parseClaudeRenderLines,
   sanitizeClaudeCommentBody,
 } from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
@@ -167,6 +166,7 @@ export default function IssueChat({
   const latestClaudePollRequestIdRef = useRef(0);
   const latestClaudeAppliedRequestIdRef = useRef(0);
   const latestClaudeAppliedUpdatedAtRef = useRef<number | null>(null);
+  const claudeMessageAppearedRef = useRef(false);
   const lastAutoScrollStateRef = useRef<{ itemCount: number; lastItemId: string | null }>({
     itemCount: 0,
     lastItemId: null,
@@ -206,7 +206,7 @@ export default function IssueChat({
     const previousState = lastAutoScrollStateRef.current;
     const appendedMessage = shouldAutoScrollForNewItems(previousState, nextState);
 
-    if (scrollViewRef.current && appendedMessage) {
+    if (scrollViewRef.current && appendedMessage && !claudeMessageAppearedRef.current) {
       setTimeout(() => {
         scrollViewRef.current?.scrollToEnd({ animated: true });
       }, 100);
@@ -410,6 +410,7 @@ export default function IssueChat({
         || prev.find((item) => item.kind === 'assistant-claude-progress')?.id
         || null;
       if (!existingId) {
+        claudeMessageAppearedRef.current = true;
         const id = nextId('assistant-claude-progress');
         claudeProgressItemIdRef.current = id;
         return [...prev, {
@@ -806,9 +807,24 @@ export default function IssueChat({
     latestClaudePollRequestIdRef.current = 0;
     latestClaudeAppliedRequestIdRef.current = 0;
     latestClaudeAppliedUpdatedAtRef.current = null;
+    claudeMessageAppearedRef.current = false;
+    lastAutoScrollStateRef.current = { itemCount: 0, lastItemId: null };
     resetConversation();
     Keyboard.dismiss();
   };
+
+  useEffect(() => {
+    claudeMessageAppearedRef.current = false;
+    claudeProgressItemIdRef.current = null;
+    previousClaudeBodyRef.current = '';
+    latestClaudePollRequestIdRef.current = 0;
+    latestClaudeAppliedRequestIdRef.current = 0;
+    latestClaudeAppliedUpdatedAtRef.current = null;
+    lastAutoScrollStateRef.current = {
+      itemCount: items.length,
+      lastItemId: items[items.length - 1]?.id || null,
+    };
+  }, [isCreateMode, selectedIssue?.number]);
 
   // A staged video needs a caption — an empty/placeholder caption feeds
   // parse_transcript_with_ai garbage to build the issue title from.
@@ -982,8 +998,7 @@ export default function IssueChat({
       }
       case 'assistant-claude-progress': {
         const accessibilityLabel = buildClaudeAccessibilityLabel(item.body, item.message);
-        const accessibilityBlocks = buildClaudeAccessibilityBlocks(item.body);
-        const renderLines = parseClaudeRenderLines(item.body);
+        const accessibilitySections = buildClaudeAccessibilitySections(item.body);
         return (
           <View
             key={item.id}
@@ -997,35 +1012,36 @@ export default function IssueChat({
               accessibilityLabel="Claude">
               Claude
             </Text>
-            {accessibilityBlocks.map((block, index) => (
+            {accessibilitySections.map((section, sectionIndex) => (
               <View
-                key={`${item.id}_a11y_${index}`}
+                key={`${item.id}_section_${sectionIndex}`}
                 accessible={true}
                 accessibilityRole="text"
-                accessibilityLabel={block.label}
-                style={styles.claudeAccessibilityOnly}
-              />
+                accessibilityLabel={section.label}
+                accessibilityElementsHidden={true}
+                importantForAccessibility="no-hide-descendants">
+                {section.lines.map((line, lineIndex) => {
+                  if (line.kind === 'blank') {
+                    return <View key={`${item.id}_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
+                  }
+                  return (
+                    <Text
+                      key={`${item.id}_${sectionIndex}_${lineIndex}`}
+                      style={[
+                        line.kind === 'heading'
+                          ? [styles.claudeHeadingText, { color: theme.text }]
+                          : [styles.messageText, { color: theme.text }],
+                      ]}
+                      selectable={true}
+                      accessible={false}
+                      accessibilityRole="text"
+                      accessibilityLabel={accessibilityLabel}>
+                      {line.text}
+                    </Text>
+                  );
+                })}
+              </View>
             ))}
-            {renderLines.map((line, index) => {
-              if (line.kind === 'blank') {
-                return <View key={`${item.id}_blank_${index}`} style={styles.claudeLineSpacer} />;
-              }
-              return (
-                <Text
-                  key={`${item.id}_${index}`}
-                  style={[
-                    line.kind === 'heading'
-                      ? [styles.claudeHeadingText, { color: theme.text }]
-                      : [styles.messageText, { color: theme.text }],
-                  ]}
-                  selectable={true}
-                  accessible={false}
-                  accessibilityRole="text"
-                  accessibilityLabel={line.accessibilityLabel || accessibilityLabel}>
-                  {line.text}
-                </Text>
-              );
-            })}
             <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
               {item.ts.toLocaleTimeString()}
             </Text>

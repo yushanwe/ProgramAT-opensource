@@ -83,6 +83,12 @@ export interface ClaudeAccessibilityBlock {
   label: string;
 }
 
+export interface ClaudeAccessibilitySection {
+  heading: string | null;
+  label: string;
+  lines: ClaudeRenderLine[];
+}
+
 const SECTION_HEADINGS = new Set([
   'progress',
   'current analysis',
@@ -176,6 +182,12 @@ export function parseClaudeRenderLines(body: string | undefined | null): ClaudeR
 }
 
 function normalizeSectionText(line: string): string {
+  const compactMatch = line.match(CHECKLIST_LINE_COMPACT_RE);
+  const standardMatch = line.match(CHECKLIST_LINE_RE);
+  const task = compactMatch?.[1] || standardMatch?.[2];
+  if (task) {
+    return stripInlineMarkdownPunctuation(task);
+  }
   return stripInlineMarkdownPunctuation(line)
     .replace(/^\s*[-*]\s*/, '')
     .replace(/\s+/g, ' ')
@@ -197,6 +209,16 @@ function flushSectionBlock(
     kind: 'section',
     label: parts.join('. ').trim(),
   });
+}
+
+function buildSectionLabel(heading: string | null, lines: string[]): string | null {
+  const normalizedHeading = heading ? stripInlineMarkdownPunctuation(heading) : '';
+  const normalizedLines = lines
+    .map(normalizeSectionText)
+    .filter(Boolean);
+  const parts = [normalizedHeading, ...normalizedLines].filter(Boolean);
+  if (parts.length === 0) return null;
+  return parts.join('. ').trim();
 }
 
 export function buildClaudeAccessibilityBlocks(body: string | undefined | null): ClaudeAccessibilityBlock[] {
@@ -256,6 +278,90 @@ export function buildClaudeAccessibilityBlocks(body: string | undefined | null):
 
   flush();
   return blocks;
+}
+
+export function buildClaudeAccessibilitySections(body: string | undefined | null): ClaudeAccessibilitySection[] {
+  const sanitized = sanitizeClaudeCommentBody(body);
+  if (!sanitized) return [];
+
+  const sourceLines = sanitized.split('\n');
+  const renderLines = parseClaudeRenderLines(body);
+  const sections: ClaudeAccessibilitySection[] = [];
+  let renderIndex = 0;
+  let currentHeading: string | null = null;
+  let currentLabelLines: string[] = [];
+  let currentRenderLines: ClaudeRenderLine[] = [];
+  let uncheckedSeen = 0;
+
+  const flush = () => {
+    const label = buildSectionLabel(currentHeading, currentLabelLines);
+    if (!label || currentRenderLines.length === 0) {
+      currentHeading = null;
+      currentLabelLines = [];
+      currentRenderLines = [];
+      return;
+    }
+    sections.push({
+      heading: currentHeading,
+      label,
+      lines: currentRenderLines,
+    });
+    currentHeading = null;
+    currentLabelLines = [];
+    currentRenderLines = [];
+  };
+
+  for (const rawLine of sourceLines) {
+    const trimmedEnd = rawLine.trimEnd();
+    const trimmed = trimmedEnd.trim();
+    const lineRender = renderLines[renderIndex];
+    if (!lineRender) break;
+    renderIndex += 1;
+
+    if (!trimmed) {
+      if (currentRenderLines.length > 0) {
+        currentRenderLines.push(lineRender);
+      }
+      continue;
+    }
+
+    const headingMatch = trimmed.match(HEADING_RE);
+    if (headingMatch) {
+      if (currentRenderLines.length > 0) {
+        flush();
+      }
+      currentHeading = headingMatch[1];
+      currentLabelLines = [];
+      currentRenderLines = [lineRender];
+      continue;
+    }
+
+    const compactMatch = trimmed.match(CHECKLIST_LINE_COMPACT_RE);
+    const standardMatch = trimmed.match(CHECKLIST_LINE_RE);
+    const task = compactMatch?.[1] || standardMatch?.[2];
+    if (task) {
+      const checked = compactMatch ? false : (standardMatch?.[1] || '').toLowerCase() === 'x';
+      if (!checked) uncheckedSeen += 1;
+      const prefix = checked ? 'Finished' : uncheckedSeen === 1 ? 'Ongoing' : 'To do';
+      if (currentRenderLines.length === 0) {
+        currentRenderLines = [lineRender];
+      } else {
+        currentRenderLines.push(lineRender);
+      }
+      currentLabelLines.push(`${prefix}: ${stripInlineMarkdownPunctuation(task)}`);
+      continue;
+    }
+
+    if (currentRenderLines.length === 0) {
+      currentRenderLines = [lineRender];
+    } else {
+      currentRenderLines.push(lineRender);
+    }
+    currentLabelLines.push(trimmed);
+  }
+
+  flush();
+  return sections;
 }
 
 function sectionBodyMap(body: string | undefined | null): Record<string, string> {
