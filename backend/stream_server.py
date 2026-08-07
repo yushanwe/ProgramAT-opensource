@@ -5800,6 +5800,81 @@ async def generate_ideation_question(parsed_data: dict, video_summary: str, brai
     return "Is there anything specific about how the tool should behave in difficult conditions, like low lighting or a cluttered background?"
 
 
+async def answer_brainstorm_question(
+    parsed_data: dict, video_summary: str, brainstorm_context: list, user_question: str,
+) -> str:
+    """
+    Ask the system LLM to directly respond to a free-form message the user
+    sent mid-brainstorming — either a clarifying question, answered using
+    only what's already known about the tool, or a correction/change to a
+    previously stated detail (e.g. "use a VLM instead of YOLO"), confirmed
+    back so the change reads as a replacement rather than an addition. Unlike
+    generate_ideation_question (which asks the user a question), this
+    responds to one the user sent.
+
+    Args:
+        parsed_data: The parsed issue data
+        video_summary: Optional video summary
+        brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
+        user_question: The free-form question or correction the user just sent
+
+    Returns a plain answer/confirmation string, or a sensible fallback on any error.
+    """
+    title = parsed_data.get('title', '')
+    description = parsed_data.get('description', '')
+    solution = parsed_data.get('solution', '')
+    example_usage = parsed_data.get('example_usage', '')
+
+    video_section = ''
+    if video_summary:
+        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
+
+    brainstorm_section = ''
+    if brainstorm_context:
+        brainstorm_pairs = []
+        for qa_pair in brainstorm_context:
+            q = qa_pair.get('question', '').strip()
+            a = qa_pair.get('answer', '').strip()
+            if q and a:
+                brainstorm_pairs.append(f"Q: {q}\nA: {a}")
+        if brainstorm_pairs:
+            brainstorm_section = "\n\nPrevious brainstorming rounds:\n" + "\n\n".join(brainstorm_pairs)
+
+    prompt = (
+        "You are helping a blind or low-vision user design a camera-based assistive tool. "
+        "Below is everything known about the tool they want so far. The user has sent a "
+        "free-form message, which may be a question OR a correction/change to something "
+        "already decided (e.g. \"no, use a VLM instead of YOLO\"). "
+        "If it is a question, answer it directly and concisely using only the information "
+        "below; if the answer isn't covered by what's known, say so rather than inventing "
+        "details. "
+        "If it is a correction or change, briefly confirm the change back to them in plain "
+        "language (e.g. \"Got it — I'll use a VLM instead of YOLO.\") so it's clear the new "
+        "instruction replaces the earlier one, not adds to it. "
+        "Return only the answer/confirmation itself, nothing else.\n\n"
+        f"Tool title: {title}\n"
+        f"Description: {description}\n"
+        f"Proposed solution: {solution}\n"
+        f"Example usage: {example_usage}"
+        f"{video_section}"
+        f"{brainstorm_section}"
+        f"\n\nUser's question:\n{user_question}"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            system_llm_call,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        answer = extract_text(response).strip()
+        if answer:
+            return answer
+    except Exception:
+        logger.warning("answer_brainstorm_question failed", exc_info=True)
+
+    return "Sorry, I wasn't able to answer that just now. Feel free to try rephrasing, or continue brainstorming."
+
+
 async def generate_ranked_question_queue(
     parsed_data: dict,
     video_summary: str,
@@ -5928,6 +6003,7 @@ async def generate_understanding_summary(
     video_summary: str,
     brainstorm_context: list = None,
     latest_qa: dict = None,
+    latest_qa_role: str = 'assistant_question',
 ) -> tuple:
     """
     Ask the system LLM for a brief, conversational restatement of what the
@@ -5943,6 +6019,11 @@ async def generate_understanding_summary(
         brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
         latest_qa: Optional {"question": str, "answer": str} for the most recent exchange;
                    when provided, the LLM also generates a one-sentence integration note.
+        latest_qa_role: Who asked latest_qa's question — 'assistant_question' (default,
+                         the structured brainstorming flow) or 'user_question' (a
+                         free-form question the user asked and the agent answered).
+                         Only affects the internal phrasing of the most-recent-exchange
+                         section of the prompt.
 
     Returns (summary, integration_note) where summary is a plain 1-3 sentence string
     and integration_note is a single sentence describing what was just learned
@@ -5971,7 +6052,10 @@ async def generate_understanding_summary(
     if latest_qa:
         lq = latest_qa.get('question', '').strip()
         la = latest_qa.get('answer', '').strip()
-        latest_section = f"\n\nMost recent exchange (just now):\nYou asked: {lq}\nThey answered: {la}"
+        if latest_qa_role == 'user_question':
+            latest_section = f"\n\nMost recent exchange (just now):\nThey asked: {lq}\nYou answered: {la}"
+        else:
+            latest_section = f"\n\nMost recent exchange (just now):\nYou asked: {lq}\nThey answered: {la}"
         prompt = (
             "You are helping a blind or low-vision user design a camera-based assistive tool. "
             "Below is everything they have told you so far about the tool they want. "
@@ -5981,9 +6065,16 @@ async def generate_understanding_summary(
             "SUMMARY must be 1-3 sentences of plain conversational language starting with "
             "\"Got it —\" or \"So you want\", restating the FULL understanding so far. "
             "Fold in every detail they have given.\n"
-            "NOTE must be a single sentence starting with \"Added:\" that describes the "
-            "specific detail just incorporated from their most recent answer — not the "
-            "answer verbatim, but what you now understand because of it.\n"
+            "IMPORTANT: if the most recent exchange below contradicts, corrects, or changes "
+            "something stated earlier (e.g. an earlier detail said one approach or value, and "
+            "the most recent exchange says to use a different one instead), the most recent "
+            "exchange is authoritative — REPLACE the earlier detail with it in SUMMARY rather "
+            "than mentioning both as if they coexist. Only keep earlier details that the most "
+            "recent exchange does not contradict.\n"
+            "NOTE must be a single sentence describing what just changed because of the most "
+            "recent answer — start with \"Corrected:\" if it replaced an earlier detail, or "
+            "\"Added:\" if it was new information — not the answer verbatim, but what you now "
+            "understand because of it.\n"
             "Do NOT ask a question. Do NOT add suggestions. Plain language only. No bullet points.\n\n"
             f"Tool title: {title}\n"
             f"Description: {description}\n"
@@ -6003,6 +6094,10 @@ async def generate_understanding_summary(
             "the way you would briefly restate someone's request back to them before asking a "
             "follow-up question. Start with something like \"Got it —\" or \"So you want\". "
             "Fold in every detail they have given, including their follow-up answers. "
+            "IMPORTANT: if a later detail contradicts or corrects an earlier one (e.g. an "
+            "earlier detail said one approach or value, and a later one says to use a "
+            "different one instead), treat the later detail as authoritative and REPLACE the "
+            "earlier one rather than mentioning both as if they coexist. "
             "Do NOT ask a question. Do NOT add suggestions, caveats, or ideas of your own. "
             "Do NOT use bullet points, headings, or field labels. "
             "Return only the restatement, nothing else.\n\n"
@@ -6929,6 +7024,77 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
         'status': 'ideation',
         'question': next_question,
         'token': token,
+        'brainstorm_history': brainstorm_history,
+        'summary': summary,
+        'integration_note': integration_note,
+    })
+
+
+async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
+    """
+    POST /brainstorm-ask-agent
+    Accepts JSON with:
+      - 'token': the ideation session token
+      - 'question': a free-form clarifying question from the user
+
+    One question in, one answer out — not a sub-chat. Answers the question
+    using everything already known about the tool, appends the exchange to
+    the same brainstorm_history the structured questions use, and returns an
+    updated understanding summary (see handle_creation_submit's docstring).
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({'status': 'error', 'error': 'Invalid JSON'}, status=400)
+
+    token = data.get('token', '')
+    user_question = data.get('question', '').strip()
+
+    if not token:
+        return web.json_response({'status': 'error', 'error': 'Missing token'}, status=400)
+    if not user_question:
+        return web.json_response({'status': 'error', 'error': 'Missing question'}, status=400)
+
+    entry = pending_ideation_http.get(token)
+    if entry is None:
+        return web.json_response(
+            {'status': 'error', 'error': 'Brainstorm session expired or not found'},
+            status=400,
+        )
+
+    brainstorm_history = entry.get('brainstorm_history', [])
+    parsed_data = entry['parsed_data']
+    video_summary = entry['video_summary']
+    await _broadcast_ws({'type': 'progress', 'message': 'Answering your question…'})
+
+    try:
+        answer = await answer_brainstorm_question(parsed_data, video_summary, brainstorm_history, user_question)
+    except Exception:
+        logger.warning("answer_brainstorm_question failed in /brainstorm-ask-agent", exc_info=True)
+        answer = "Sorry, I wasn't able to answer that just now."
+
+    new_qa = {'question': user_question, 'answer': answer}
+    brainstorm_history = brainstorm_history + [new_qa]
+    entry['brainstorm_history'] = brainstorm_history
+
+    try:
+        summary, integration_note = await generate_understanding_summary(
+            parsed_data, video_summary, brainstorm_history,
+            latest_qa=new_qa, latest_qa_role='user_question',
+        )
+    except Exception:
+        logger.warning("generate_understanding_summary failed in /brainstorm-ask-agent", exc_info=True)
+        summary, integration_note = '', ''
+
+    if not summary:
+        summary = entry.get('last_summary', '')
+    entry['last_summary'] = summary
+
+    logger.info("Answered free-form brainstorm question (token=%s, history size=%d)", token, len(brainstorm_history))
+    return web.json_response({
+        'status': 'clarification',
+        'token': token,
+        'answer': answer,
         'brainstorm_history': brainstorm_history,
         'summary': summary,
         'integration_note': integration_note,
@@ -8706,6 +8872,7 @@ async def main():
     app.router.add_post('/test-door-recognition', test_door_recognition)
     app.router.add_post('/submit-creation', handle_creation_submit)
     app.router.add_post('/brainstorm-next-question', handle_brainstorm_next_question)
+    app.router.add_post('/brainstorm-ask-agent', handle_brainstorm_ask_agent)
     app.router.add_post('/submit-update', handle_update_submit)
     app.router.add_post('/test-video-summary', handle_test_video_summary)
     app.router.add_post('/offer', webrtc_offer_handler)  # WebRTC signaling
