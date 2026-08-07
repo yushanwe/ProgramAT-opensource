@@ -53,7 +53,7 @@ interface IssueChatProps {
 
 type Awaiting = 'answer' | 'choice' | null;
 type ProgressTarget = { mode: 'create' | 'update'; issueNumber?: number | null; prNumber?: number | null; commentId?: number | null };
-const CLAUDE_POLL_INTERVAL_MS = 6000;
+const CLAUDE_POLL_INTERVAL_MS = 5000;
 const CLAUDE_LOADING_AUDIO_INTERVAL_MS = 6000;
 export interface AutoScrollState {
   itemCount: number;

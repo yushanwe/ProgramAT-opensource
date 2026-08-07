@@ -122,7 +122,7 @@ describe('IssueChat progress', () => {
   const count100msTimeouts = () => setTimeoutSpy.mock.calls.filter((call) => call[1] === 100).length;
   const count6000msTimeouts = () => setTimeoutSpy.mock.calls.filter((call) => call[1] === 6000).length;
 
-  test('polls for Claude progress every 6 seconds and cleans up on unmount', async () => {
+  test('polls for Claude progress every 5 seconds and cleans up on unmount', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 42,
@@ -160,7 +160,7 @@ describe('IssueChat progress', () => {
     expect(initialCallCount).toBeGreaterThanOrEqual(1);
 
     await act(async () => {
-      jest.advanceTimersByTime(5999);
+      jest.advanceTimersByTime(4999);
     });
     expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(initialCallCount);
 
@@ -175,7 +175,7 @@ describe('IssueChat progress', () => {
       renderer!.unmount();
     });
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
     });
 
     expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(callCountBeforeUnmount);
@@ -245,7 +245,7 @@ describe('IssueChat progress', () => {
     expect(announceSpy).toHaveBeenCalledWith('Recent Work: Inspected runtime input handling.');
 
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
     });
     expect(announceSpy.mock.calls.filter((call) => call[0] === 'In progress: Building the tool')).toHaveLength(1);
   });
@@ -320,11 +320,11 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
 
@@ -395,7 +395,7 @@ describe('IssueChat progress', () => {
     const timeoutCountAfterFirstClaudeInsert = timeoutCountBeforeClaudePolling;
 
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
 
@@ -458,7 +458,7 @@ describe('IssueChat progress', () => {
     const stableTestId = firstContainer.props.testID;
 
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
 
@@ -600,7 +600,7 @@ describe('IssueChat progress', () => {
     expect(mockPlayLoadingSound).toHaveBeenCalled();
 
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
 
@@ -608,7 +608,7 @@ describe('IssueChat progress', () => {
       await Promise.resolve();
     });
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
     expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
@@ -660,7 +660,7 @@ describe('IssueChat progress', () => {
     });
 
     await act(async () => {
-      jest.advanceTimersByTime(6000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
 
