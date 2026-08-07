@@ -201,26 +201,6 @@ Before finishing, verify:
 
 When Claude is working through the repository workflow, maintain the same single GitHub progress comment that the workflow already updates in place. Do not create a growing thread of separate status comments.
 
-Keep in-progress updates very short and user-readable. Prefer a compact checklist for major done/current steps, followed by a brief plain-language note about what Claude found or why the current change is being made. Update the comment after events such as:
-
-- reading the issue, PR, or `CLAUDE.md`
-- inspecting relevant runtime interfaces or existing tool patterns
-- choosing a model, detector, execution mode, frame strategy, or runtime input shape
-- rejecting a nontrivial alternative and deciding why
-- discovering uncertainty, a bug, or a validation failure worth surfacing
-- completing the main implementation
-- running validation or focused tests
-- fixing a failure
-- committing and pushing
-
-Use short sections such as:
-
-- `### Progress`
-- `### Current analysis`
-- `### Implementation decisions`
-
-Overwrite the evolving sections instead of appending unlimited history. Preserve durable decisions in `Implementation decisions`, updating them only when the design changes materially.
-
-Explain observable work and decisions only. Do not expose raw command logs, token details, long internal traces, exhaustive file lists, or low-level implementation detail. Keep each update readable for a non-developer or blind/low-vision user with short paragraphs and concise bullets.
+Keep each in-progress update very short and end-user readable. Start with a simple current-action line such as `Reading files`, `Applying changes`, or `Running tests`, then add a brief plain-language explanation of what Claude found and what it is doing next. Explain only the current work and immediate reason for it. Do not include structured progress sections, changed-file lists, technical breakdowns, checklists, raw command logs, token details, long internal traces, or low-level implementation detail.
 
 When finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
