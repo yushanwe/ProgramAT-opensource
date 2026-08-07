@@ -33,8 +33,14 @@ import { useTheme } from './ThemeContext';
 import WebSocketService from './WebSocketService';
 import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
-import { IssueChatItem, RetryDescriptor } from './IssueChatTypes';
-import { submitCreation, submitUpdate, nextBrainstormQuestion, askBrainstormAgent } from './IssueSubmissionService';
+import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
+import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion, askBrainstormAgent } from './IssueSubmissionService';
+import {
+  buildClaudeAccessibilitySections,
+  buildClaudeAccessibilityLabel,
+  getChangedClaudeAnnouncement,
+  sanitizeClaudeCommentBody,
+} from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
 import RayBanRecorderModal from './RayBanRecorderModal';
@@ -48,6 +54,56 @@ interface IssueChatProps {
 }
 
 type Awaiting = 'answer' | 'choice' | 'clarification' | null;
+type ProgressTarget = {
+  mode: 'create' | 'update';
+  issueNumber?: number | null;
+  prNumber?: number | null;
+  commentId?: number | null;
+  afterCommentId?: number | null;
+  afterTimestamp?: string | null;
+};
+const CLAUDE_POLL_INTERVAL_MS = 5000;
+const CLAUDE_LOADING_AUDIO_INTERVAL_MS = 6000;
+export interface AutoScrollState {
+  itemCount: number;
+  lastItemId: string | null;
+}
+
+export function shouldAutoScrollForNewItems(previousState: AutoScrollState, nextState: AutoScrollState): boolean {
+  return nextState.itemCount > previousState.itemCount
+    || (nextState.lastItemId !== null && nextState.lastItemId !== previousState.lastItemId);
+}
+
+function buildProgressAnnouncement(status: string, label: string): string {
+  if (status === 'completed') return `Completed: ${label}`;
+  if (status === 'in_progress') return `In progress: ${label}`;
+  if (status === 'failed') return `Failed: ${label}`;
+  return `Pending: ${label}`;
+}
+
+function summarizeClaudeAnnouncement(progress: ClaudeProgressResponse): string {
+  if (progress.status === 'waiting_for_comment') return 'Claude has not posted a progress comment yet.';
+  if (progress.status === 'failed') return 'Claude posted a failed status update.';
+  if (progress.status === 'completed') return 'Claude posted a completed status update.';
+  return 'Claude updated progress.';
+}
+
+function hasClaudeCompletionLikeText(progress: ClaudeProgressResponse | null): boolean {
+  if (!progress) return false;
+  const body = sanitizeClaudeCommentBody(progress.body).toLowerCase();
+  const message = (progress.message || '').toLowerCase();
+  const combined = `${body}\n${message}`;
+  return combined.includes('implementation summary')
+    || combined.includes('summary')
+    || combined.includes('finished')
+    || combined.includes('completed')
+    || combined.includes('done');
+}
+
+function formatClaudeBody(body: string | undefined): string {
+  const value = sanitizeClaudeCommentBody(body);
+  return value || 'Claude has not posted a progress comment yet.';
+}
 
 function extractCreateToolName(summary: string | null): string | null {
   if (!summary) return null;
@@ -109,6 +165,8 @@ export default function IssueChat({
   const [isPickingFromLibrary, setIsPickingFromLibrary] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [progressText, setProgressText] = useState<string | null>(null);
+  const [claudeProgress, setClaudeProgress] = useState<ClaudeProgressResponse | null>(null);
+  const [progressTarget, setProgressTarget] = useState<ProgressTarget | null>(null);
 
   const [activeToken, setActiveToken] = useState<string | null>(null);
   const [awaiting, setAwaiting] = useState<Awaiting>(null);
@@ -126,6 +184,21 @@ export default function IssueChat({
   const scrollViewRef = useRef<ScrollView>(null);
   const composeInputRef = useRef<RNTextInput>(null);
   const lastAnnouncedIdRef = useRef<string | null>(null);
+  const lastAnnouncedProgressStepRef = useRef<string | null>(null);
+  const progressPollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const claudeLoadingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const claudeLoadingLoopTokenRef = useRef(0);
+  const claudeProgressItemIdRef = useRef<string | null>(null);
+  const previousClaudeBodyRef = useRef<string>('');
+  const latestClaudePollRequestIdRef = useRef(0);
+  const latestClaudeAppliedRequestIdRef = useRef(0);
+  const latestClaudeAppliedUpdatedAtRef = useRef<number | null>(null);
+  const hasClaudeMessageRef = useRef(false);
+  const allowNextClaudeAutoFollowRef = useRef(false);
+  const lastAutoScrollStateRef = useRef<{ itemCount: number; lastItemId: string | null }>({
+    itemCount: 0,
+    lastItemId: null,
+  });
   const createToolName = extractCreateToolName(understandingSummary);
   const modeBannerText = isCreateMode
     ? createToolName
@@ -134,6 +207,22 @@ export default function IssueChat({
     : selectedIssue?.title
     ? `Mode: Updating ${selectedIssue.title}`
     : null;
+  const isClaudeWaitingActive = !!claudeProgress
+    && claudeProgress.status !== 'waiting_for_comment'
+    && claudeProgress.status !== 'unavailable'
+    && claudeProgress.status !== 'completed'
+    && claudeProgress.status !== 'failed'
+    && claudeProgress.status !== 'cancelled'
+    && !hasClaudeCompletionLikeText(claudeProgress);
+
+  const stopClaudeLoadingSound = () => {
+    claudeLoadingLoopTokenRef.current += 1;
+    if (claudeLoadingTimeoutRef.current) {
+      clearTimeout(claudeLoadingTimeoutRef.current);
+      claudeLoadingTimeoutRef.current = null;
+    }
+    BeepService.stopLoadingSound();
+  };
 
   useEffect(() => {
     isBrainstormingEnabled().then(setBrainstormingEnabled).catch(() => setBrainstormingEnabled(true));
@@ -150,13 +239,28 @@ export default function IssueChat({
     return () => clearTimeout(timeout);
   }, [isCreateMode, selectedIssue?.title]);
 
-  // Auto-scroll to the newest message.
+  // Auto-scroll to the newest message only when a new chat item is appended.
+  // In-place Claude progress updates intentionally preserve the user's position.
   useEffect(() => {
-    if (scrollViewRef.current) {
+    const lastItem = items[items.length - 1];
+    const nextState = {
+      itemCount: items.length,
+      lastItemId: lastItem?.id || null,
+    };
+    const previousState = lastAutoScrollStateRef.current;
+    const appendedMessage = shouldAutoScrollForNewItems(previousState, nextState);
+
+    const shouldAutoFollow = appendedMessage
+      && scrollViewRef.current
+      && (!hasClaudeMessageRef.current || allowNextClaudeAutoFollowRef.current);
+
+    if (shouldAutoFollow) {
       setTimeout(() => {
         scrollViewRef.current?.scrollToEnd({ animated: true });
       }, 100);
+      allowNextClaudeAutoFollowRef.current = false;
     }
+    lastAutoScrollStateRef.current = nextState;
   }, [items, progressText, isSending]);
 
   // Loading sound while a request is in flight — video uploads can take
@@ -233,6 +337,125 @@ export default function IssueChat({
     }
   }, [progressText]);
 
+  useEffect(() => {
+    if (!claudeProgress) return;
+    const changedSectionAnnouncement = getChangedClaudeAnnouncement(previousClaudeBodyRef.current, claudeProgress.body);
+    const activeStep = claudeProgress.steps.find((step) => step.status === 'in_progress' || step.status === 'failed');
+    const announcement = changedSectionAnnouncement
+      || (activeStep ? buildProgressAnnouncement(activeStep.status, activeStep.label) : summarizeClaudeAnnouncement(claudeProgress));
+    const announcementKey = `${claudeProgress.comment_id || 'none'}:${claudeProgress.updated_at || claudeProgress.status}:${announcement}`;
+    if (lastAnnouncedProgressStepRef.current === announcementKey) return;
+    lastAnnouncedProgressStepRef.current = announcementKey;
+    previousClaudeBodyRef.current = claudeProgress.body || '';
+    AccessibilityInfo.announceForAccessibility(announcement);
+  }, [claudeProgress]);
+
+  useEffect(() => {
+    if (!isClaudeWaitingActive) {
+      stopClaudeLoadingSound();
+      return;
+    }
+
+    const loopToken = claudeLoadingLoopTokenRef.current + 1;
+    claudeLoadingLoopTokenRef.current = loopToken;
+
+    const playAndScheduleNext = async () => {
+      await BeepService.playLoadingSound();
+      if (claudeLoadingLoopTokenRef.current !== loopToken) return;
+      claudeLoadingTimeoutRef.current = setTimeout(() => {
+        claudeLoadingTimeoutRef.current = null;
+        if (claudeLoadingLoopTokenRef.current !== loopToken) return;
+        void playAndScheduleNext();
+      }, CLAUDE_LOADING_AUDIO_INTERVAL_MS);
+    };
+
+    void playAndScheduleNext();
+    return () => {
+      if (claudeLoadingLoopTokenRef.current === loopToken) {
+        stopClaudeLoadingSound();
+      }
+    };
+  }, [isClaudeWaitingActive]);
+
+  useEffect(() => () => {
+    stopClaudeLoadingSound();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const clearPoll = () => {
+      if (progressPollIntervalRef.current) {
+        clearInterval(progressPollIntervalRef.current);
+        progressPollIntervalRef.current = null;
+      }
+    };
+
+    const poll = async () => {
+      if (!progressTarget || cancelled) return;
+      latestClaudePollRequestIdRef.current += 1;
+      const requestId = latestClaudePollRequestIdRef.current;
+      const result = await fetchClaudeProgress(progressTarget);
+      if (cancelled || requestId < latestClaudeAppliedRequestIdRef.current) return;
+      if (!result) return;
+      const resultUpdatedAt = result.updated_at ? new Date(result.updated_at).getTime() : null;
+      if (
+        resultUpdatedAt !== null
+        && latestClaudeAppliedUpdatedAtRef.current !== null
+        && resultUpdatedAt < latestClaudeAppliedUpdatedAtRef.current
+      ) {
+        return;
+      }
+      latestClaudeAppliedRequestIdRef.current = requestId;
+      if (resultUpdatedAt !== null) {
+        latestClaudeAppliedUpdatedAtRef.current = resultUpdatedAt;
+      }
+      setClaudeProgress((prev) => {
+        if (
+          prev
+          && prev.updated_at
+          && result.updated_at
+          && new Date(result.updated_at).getTime() < new Date(prev.updated_at).getTime()
+        ) {
+          return prev;
+        }
+        if (result.status === 'unavailable' && prev && prev.comment_id) {
+          return {
+            ...prev,
+            message: result.message || prev.message,
+            error: result.error || prev.error,
+          };
+        }
+        return result;
+      });
+    };
+
+    clearPoll();
+    setClaudeProgress(null);
+    lastAnnouncedProgressStepRef.current = null;
+    latestClaudePollRequestIdRef.current = 0;
+    latestClaudeAppliedRequestIdRef.current = 0;
+    latestClaudeAppliedUpdatedAtRef.current = null;
+
+    if (progressTarget) {
+      poll();
+      progressPollIntervalRef.current = setInterval(() => {
+        poll();
+      }, CLAUDE_POLL_INTERVAL_MS);
+    }
+
+    return () => {
+      cancelled = true;
+      clearPoll();
+      console.log('[Claude Progress] polling=stopped reason=page_exit');
+    };
+  }, [progressTarget]);
+
+  useEffect(() => {
+    if (!claudeProgress || !progressTarget) return;
+    upsertClaudeProgressItem(claudeProgress);
+  }, [claudeProgress, progressTarget]);
+
   // Listen for WS 'progress' broadcasts fired by the backend while an HTTP
   // request from this screen is in flight (e.g. "Summarizing video…"). This
   // is the only channel carrying them; _broadcast_ws has no per-request id,
@@ -258,6 +481,44 @@ export default function IssueChat({
   };
 
   const append = (item: IssueChatItem) => setItems((prev) => [...prev, item]);
+
+  const upsertClaudeProgressItem = (progress: ClaudeProgressResponse) => {
+    const body = formatClaudeBody(progress.body);
+    setItems((prev) => {
+      const existingId = claudeProgressItemIdRef.current
+        || prev.find((item) => item.kind === 'assistant-claude-progress')?.id
+        || null;
+      if (!existingId) {
+        hasClaudeMessageRef.current = true;
+        allowNextClaudeAutoFollowRef.current = true;
+        const id = nextId('assistant-claude-progress');
+        claudeProgressItemIdRef.current = id;
+        return [...prev, {
+          kind: 'assistant-claude-progress',
+          id,
+          ts: new Date(),
+          status: progress.status,
+          body,
+          commentId: progress.comment_id,
+          updatedAt: progress.updated_at,
+          message: progress.message,
+        }];
+      }
+      return prev.map((item) => {
+        if (item.kind !== 'assistant-claude-progress' || item.id !== existingId) return item;
+        claudeProgressItemIdRef.current = existingId;
+        return {
+          ...item,
+          ts: new Date(),
+          status: progress.status,
+          body,
+          commentId: progress.comment_id,
+          updatedAt: progress.updated_at,
+          message: progress.message,
+        };
+      });
+    });
+  };
 
   const resolveLatestChoicePrompt = () => {
     setItems((prev) => {
@@ -396,6 +657,38 @@ export default function IssueChat({
     }
   };
 
+  const sendUpdateIdeationAnswer = async (answer: string, token: string) => {
+    if (!selectedIssue) return;
+    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: answer });
+    setComposeText('');
+    Keyboard.dismiss();
+    setIsSending(true);
+    inFlightRef.current = true;
+    try {
+      const result = await submitUpdate({
+        text: answer,
+        issueNumber: selectedIssue.number,
+        ideationAnswer: answer,
+        token,
+      });
+      if (result.status === 'error' && result.error === 'Ideation session expired or not found') {
+        resetConversation();
+        append({
+          kind: 'assistant-error',
+          id: nextId('assistant-error'),
+          ts: new Date(),
+          text: 'That brainstorming session expired. Send your update again to start over.',
+        });
+        return;
+      }
+      handleUpdateResponse(result, { op: 'update-answer', text: answer, token, issueNumber: selectedIssue.number });
+    } finally {
+      inFlightRef.current = false;
+      setProgressText(null);
+      setIsSending(false);
+    }
+  };
+
   const handleCreationResponse = (
     result: Awaited<ReturnType<typeof submitCreation>>,
     retry: RetryDescriptor,
@@ -410,6 +703,7 @@ export default function IssueChat({
         issueUrl: result.issue_url,
         videoSummarySkipped,
       });
+      setProgressTarget({ mode: 'create', issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
       resetConversation();
       return;
     }
@@ -449,6 +743,67 @@ export default function IssueChat({
     // Either an explicit error, or a question/choice arriving while
     // brainstorming is off — treat both as an error since the compose bar
     // won't offer a way to answer it.
+    const message = result.status === 'error' ? result.error : 'Something went wrong. Please try again.';
+    append({ kind: 'assistant-error', id: nextId('assistant-error'), ts: new Date(), text: message, retry });
+  };
+
+  const handleUpdateResponse = (
+    result: Awaited<ReturnType<typeof submitUpdate>>,
+    retry: RetryDescriptor,
+  ) => {
+    if (result.status === 'updated') {
+      const videoSummarySkipped = !result.video_summary;
+      append({
+        kind: 'assistant-updated',
+        id: nextId('assistant-updated'),
+        ts: new Date(),
+        issueNumber: result.issue_number,
+        issueUrl: result.issue_url,
+        videoSummarySkipped,
+      });
+      setProgressTarget({
+        mode: 'update',
+        prNumber: result.pr_number ?? selectedIssue?.number,
+        commentId: null,
+        afterCommentId: result.comment_id,
+        afterTimestamp: result.comment_created_at ?? null,
+      });
+      resetConversation();
+      return;
+    }
+
+    if (result.status === 'ideation' && brainstormingActive) {
+      setActiveToken(result.token);
+      setAwaiting('answer');
+      if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
+      append({
+        kind: 'assistant-question',
+        id: nextId('assistant-question'),
+        ts: new Date(),
+        question: result.question,
+        token: result.token,
+      });
+      return;
+    }
+
+    if (result.status === 'brainstorm_choice' && brainstormingActive) {
+      setActiveToken(result.token);
+      setAwaiting('choice');
+      if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
+      brainstormHistoryRef.current = result.brainstorm_history || [];
+      append({
+        kind: 'assistant-choice-prompt',
+        id: nextId('assistant-choice-prompt'),
+        ts: new Date(),
+        text: 'Thanks for that context! You can keep brainstorming or start building.',
+        token: result.token,
+        resolved: false,
+      });
+      return;
+    }
+
     const message = result.status === 'error' ? result.error : 'Something went wrong. Please try again.';
     append({ kind: 'assistant-error', id: nextId('assistant-error'), ts: new Date(), text: message, retry });
   };
@@ -497,6 +852,7 @@ export default function IssueChat({
 
   const handleStartBuilding = async () => {
     if (!activeToken) return;
+    if (!isCreateMode && !selectedIssue) return;
     resolveLatestChoicePrompt();
     append({
       kind: 'user-choice',
@@ -512,32 +868,71 @@ export default function IssueChat({
     setIsSending(true);
     inFlightRef.current = true;
     try {
-      const result = await submitCreation({
-        text: lastAnswer,
-        ideationAnswer: lastAnswer,
-        token: activeToken,
-        choice: 'start_building',
-      });
-      if (result.status === 'created') {
-        const videoSummarySkipped = !result.video_summary;
-        append({
-          kind: 'assistant-created',
-          id: nextId('assistant-created'),
-          ts: new Date(),
-          issueNumber: result.issue_number,
-          issueUrl: result.issue_url,
-          videoSummarySkipped,
+      if (isCreateMode) {
+        const result = await submitCreation({
+          text: lastAnswer,
+          ideationAnswer: lastAnswer,
+          token: activeToken,
+          choice: 'start_building',
         });
-        resetConversation();
+        if (result.status === 'created') {
+          const videoSummarySkipped = !result.video_summary;
+          append({
+            kind: 'assistant-created',
+            id: nextId('assistant-created'),
+            ts: new Date(),
+            issueNumber: result.issue_number,
+            issueUrl: result.issue_url,
+            videoSummarySkipped,
+          });
+          setProgressTarget({ mode: 'create', issueNumber: result.issue_number, prNumber: result.pr_number, commentId: result.comment_id });
+          resetConversation();
+        } else {
+          const message = result.status === 'error' ? result.error : 'Failed to create issue';
+          append({
+            kind: 'assistant-error',
+            id: nextId('assistant-error'),
+            ts: new Date(),
+            text: message,
+            retry: { op: 'start-building', token: activeToken, mode: 'create' },
+          });
+        }
       } else {
-        const message = result.status === 'error' ? result.error : 'Failed to create issue';
-        append({
-          kind: 'assistant-error',
-          id: nextId('assistant-error'),
-          ts: new Date(),
-          text: message,
-          retry: { op: 'start-building', token: activeToken },
+        const result = await submitUpdate({
+          text: lastAnswer,
+          issueNumber: selectedIssue.number,
+          ideationAnswer: lastAnswer,
+          token: activeToken,
+          choice: 'start_building',
         });
+        if (result.status === 'updated') {
+          const videoSummarySkipped = !result.video_summary;
+          append({
+            kind: 'assistant-updated',
+            id: nextId('assistant-updated'),
+            ts: new Date(),
+            issueNumber: result.issue_number,
+            issueUrl: result.issue_url,
+            videoSummarySkipped,
+          });
+          setProgressTarget({
+            mode: 'update',
+            prNumber: result.pr_number ?? selectedIssue.number,
+            commentId: null,
+            afterCommentId: result.comment_id,
+            afterTimestamp: result.comment_created_at ?? null,
+          });
+          resetConversation();
+        } else {
+          const message = result.status === 'error' ? result.error : 'Failed to send update';
+          append({
+            kind: 'assistant-error',
+            id: nextId('assistant-error'),
+            ts: new Date(),
+            text: message,
+            retry: { op: 'start-building', token: activeToken, mode: 'update', issueNumber: selectedIssue.number },
+          });
+        }
       }
     } finally {
       inFlightRef.current = false;
@@ -607,20 +1002,30 @@ export default function IssueChat({
     }
   };
 
-  const sendUpdate = async (text: string, videoUri: string | null) => {
-    if (!selectedIssue) return;
-    if (videoUri) {
-      append({ kind: 'user-video', id: nextId('user-video'), ts: new Date(), videoUri, caption: text });
-    } else {
-      append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text });
-    }
+  const handleTalkToAgent = () => {
+    if (!activeToken) return;
+    resolveLatestChoicePrompt();
+    append({
+      kind: 'user-choice',
+      id: nextId('user-choice'),
+      ts: new Date(),
+      choice: 'ask_agent',
+      label: '💬 Talk to Agent',
+    });
+    setAwaiting('clarification');
+  };
+
+  const sendAgentQuestion = async (question: string, token: string) => {
+    const trimmed = question.trim();
+    if (!trimmed) return;
+    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
     setComposeText('');
-    setStagedVideoUri(null);
     Keyboard.dismiss();
+    setAwaiting(null);
     setIsSending(true);
     inFlightRef.current = true;
     try {
-      const result = await submitUpdate({ text, issueNumber: selectedIssue.number, videoUri });
+      const result = await submitUpdate({ text, issueNumber: selectedIssue.number, videoUri, brainstormingEnabled: brainstormingActive });
       if (result.status === 'updated') {
         const videoSummarySkipped = !!videoUri && !result.video_summary;
         append({
@@ -640,6 +1045,29 @@ export default function IssueChat({
           retry: { op: 'update', text, videoUri, issueNumber: selectedIssue.number },
         });
       }
+      handleUpdateResponse(result, { op: 'update', text, videoUri, issueNumber: selectedIssue.number });
+    } finally {
+      inFlightRef.current = false;
+      setProgressText(null);
+      setIsSending(false);
+    }
+  };
+
+  const sendUpdate = async (text: string, videoUri: string | null) => {
+    if (!selectedIssue) return;
+    if (videoUri) {
+      append({ kind: 'user-video', id: nextId('user-video'), ts: new Date(), videoUri, caption: text });
+    } else {
+      append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text });
+    }
+    setComposeText('');
+    setStagedVideoUri(null);
+    Keyboard.dismiss();
+    setIsSending(true);
+    inFlightRef.current = true;
+    try {
+      const result = await submitUpdate({ text, issueNumber: selectedIssue.number, videoUri, brainstormingEnabled: brainstormingActive });
+      handleUpdateResponse(result, { op: 'update', text, videoUri, issueNumber: selectedIssue.number });
     } finally {
       inFlightRef.current = false;
       setProgressText(null);
@@ -657,6 +1085,9 @@ export default function IssueChat({
         return;
       case 'update':
         sendUpdate(retry.text, retry.videoUri);
+        return;
+      case 'update-answer':
+        sendUpdateIdeationAnswer(retry.text, retry.token);
         return;
       case 'ideation-answer':
         sendIdeationAnswer(retry.text, retry.token);
@@ -683,7 +1114,11 @@ export default function IssueChat({
     }
 
     if (awaiting === 'answer' && activeToken) {
-      sendIdeationAnswer(text, activeToken);
+      if (isCreateMode) {
+        sendIdeationAnswer(text, activeToken);
+      } else {
+        sendUpdateIdeationAnswer(text, activeToken);
+      }
       return;
     }
 
@@ -704,9 +1139,33 @@ export default function IssueChat({
     setComposeText('');
     setStagedVideoUri(null);
     setStagedVideoSource(null);
+    setClaudeProgress(null);
+    setProgressTarget(null);
+    claudeProgressItemIdRef.current = null;
+    previousClaudeBodyRef.current = '';
+    latestClaudePollRequestIdRef.current = 0;
+    latestClaudeAppliedRequestIdRef.current = 0;
+    latestClaudeAppliedUpdatedAtRef.current = null;
+    hasClaudeMessageRef.current = false;
+    allowNextClaudeAutoFollowRef.current = false;
+    lastAutoScrollStateRef.current = { itemCount: 0, lastItemId: null };
     resetConversation();
     Keyboard.dismiss();
   };
+
+  useEffect(() => {
+    hasClaudeMessageRef.current = false;
+    allowNextClaudeAutoFollowRef.current = false;
+    claudeProgressItemIdRef.current = null;
+    previousClaudeBodyRef.current = '';
+    latestClaudePollRequestIdRef.current = 0;
+    latestClaudeAppliedRequestIdRef.current = 0;
+    latestClaudeAppliedUpdatedAtRef.current = null;
+    lastAutoScrollStateRef.current = {
+      itemCount: items.length,
+      lastItemId: items[items.length - 1]?.id || null,
+    };
+  }, [isCreateMode, selectedIssue?.number]);
 
   // A staged video needs a caption — an empty/placeholder caption feeds
   // parse_transcript_with_ai garbage to build the issue title from.
@@ -908,6 +1367,56 @@ export default function IssueChat({
             <Text style={[styles.messageText, { color: theme.text }]} selectable={true} accessible={false}>
               {`Issue #${item.issueNumber} ${verb}.${note}`}
             </Text>
+            <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
+              {item.ts.toLocaleTimeString()}
+            </Text>
+          </View>
+        );
+      }
+      case 'assistant-claude-progress': {
+        const accessibilityLabel = buildClaudeAccessibilityLabel(item.body, item.message);
+        const accessibilitySections = buildClaudeAccessibilitySections(item.body);
+        return (
+          <View
+            key={item.id}
+            testID={`claude-progress-${item.id}`}
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
+            accessible={false}>
+            <Text
+              style={[styles.progressMessageLabel, { color: theme.primary }]}
+              accessible={true}
+              accessibilityRole="header"
+              accessibilityLabel="Claude">
+              Claude
+            </Text>
+            {accessibilitySections.map((section, sectionIndex) => (
+              <View
+                key={`${item.id}_section_${sectionIndex}`}
+                accessible={true}
+                accessibilityRole="text"
+                accessibilityLabel={section.label}>
+                {section.lines.map((line, lineIndex) => {
+                  if (line.kind === 'blank') {
+                    return <View key={`${item.id}_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
+                  }
+                  return (
+                    <Text
+                      key={`${item.id}_${sectionIndex}_${lineIndex}`}
+                      style={[
+                        line.kind === 'heading'
+                          ? [styles.claudeHeadingText, { color: theme.text }]
+                          : [styles.messageText, { color: theme.text }],
+                      ]}
+                      selectable={true}
+                      accessible={false}
+                      accessibilityRole="text"
+                      accessibilityLabel={accessibilityLabel}>
+                      {line.text}
+                    </Text>
+                  );
+                })}
+              </View>
+            ))}
             <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
               {item.ts.toLocaleTimeString()}
             </Text>
@@ -1332,6 +1841,45 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
   },
+  progressCard: {
+    marginTop: 12,
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    maxHeight: 180,
+  },
+  progressTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  progressMessage: {
+    fontSize: 12,
+    marginTop: 2,
+    marginBottom: 8,
+  },
+  progressSteps: {
+    maxHeight: 120,
+  },
+  progressStepRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 8,
+    gap: 8,
+  },
+  progressMarker: {
+    width: 16,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  progressStepLabel: {
+    flex: 1,
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  progressEmpty: {
+    fontSize: 13,
+    fontStyle: 'italic',
+  },
   messagesContainer: {
     flex: 1,
   },
@@ -1407,6 +1955,27 @@ const styles = StyleSheet.create({
   retryButtonText: {
     fontSize: 13,
     fontWeight: '600',
+  },
+  progressMessageLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    marginBottom: 6,
+  },
+  claudeAccessibilityOnly: {
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    opacity: 0,
+  },
+  claudeHeadingText: {
+    fontSize: 15,
+    fontWeight: '700',
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  claudeLineSpacer: {
+    height: 8,
   },
   summaryCard: {
     marginHorizontal: 12,

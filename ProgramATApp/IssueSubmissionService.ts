@@ -7,7 +7,7 @@
  */
 
 import WebSocketService from './WebSocketService';
-import { AskAgentResponse, CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
+import { AskAgentResponse, ClaudeProgressResponse, CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
 
 const REQUEST_TIMEOUT_MS = 120_000; // text-only requests: brainstorm question, no video
 const VIDEO_REQUEST_TIMEOUT_MS = 300_000; // video upload + summarization + two Gemini calls; uploads over a tunnel (e.g. ngrok) can be slow
@@ -103,6 +103,10 @@ export interface SubmitUpdateArgs {
   text: string;
   issueNumber: number;
   videoUri?: string | null;
+  brainstormingEnabled?: boolean;
+  ideationAnswer?: string;
+  token?: string;
+  choice?: 'keep_brainstorming' | 'start_building';
 }
 
 export async function submitUpdate(args: SubmitUpdateArgs): Promise<UpdateResponse> {
@@ -115,6 +119,10 @@ export async function submitUpdate(args: SubmitUpdateArgs): Promise<UpdateRespon
   formData.append('metadata', JSON.stringify({
     text: args.text,
     issue_number: args.issueNumber,
+    ideation_answer: args.ideationAnswer,
+    token: args.token,
+    choice: args.choice,
+    brainstormingEnabled: args.brainstormingEnabled,
   }));
   if (args.videoUri) {
     formData.append('video', buildVideoPart(args.videoUri));
@@ -175,5 +183,41 @@ export async function askBrainstormAgent(token: string, question: string): Promi
   } catch (e) {
     console.log('[IssueSubmissionService] brainstorm-ask-agent threw:', String(e));
     return { status: 'error', error: 'Network error. Please try again.' };
+  }
+}
+
+export interface FetchClaudeProgressArgs {
+  mode: 'create' | 'update';
+  issueNumber?: number | null;
+  prNumber?: number | null;
+  commentId?: number | null;
+  afterCommentId?: number | null;
+  afterTimestamp?: string | null;
+}
+
+export async function fetchClaudeProgress(args: FetchClaudeProgressArgs): Promise<ClaudeProgressResponse> {
+  const baseUrl = getHttpBaseUrl();
+  if (!baseUrl) {
+    return { status: 'unavailable', steps: [], error: 'Server URL not configured' };
+  }
+  const issueNumber = args.mode === 'update' ? args.prNumber : args.issueNumber;
+  if (!issueNumber) {
+    return { status: 'unavailable', steps: [], error: 'No issue number available for progress lookup' };
+  }
+
+  const query = new URLSearchParams();
+  query.append(args.mode === 'update' ? 'pr_number' : 'issue_number', String(issueNumber));
+  query.append('mode', args.mode);
+  if (args.commentId) query.append('comment_id', String(args.commentId));
+  if (args.afterCommentId) query.append('after_comment_id', String(args.afterCommentId));
+  if (args.afterTimestamp) query.append('after_timestamp', args.afterTimestamp);
+
+  try {
+    const response = await fetch(`${baseUrl}/claude-progress?${query.toString()}`);
+    const result = await response.json();
+    return result as ClaudeProgressResponse;
+  } catch (e) {
+    console.log('[IssueSubmissionService] claude-progress threw:', String(e));
+    return { status: 'unavailable', steps: [], message: 'Could not load Claude progress. Retrying…' };
   }
 }

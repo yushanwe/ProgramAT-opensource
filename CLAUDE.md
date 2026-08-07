@@ -196,3 +196,17 @@ Before finishing, verify:
 - State, tracked work, and cancellation are cleaned up correctly.
 - No unsupported import, provider call, direct networking code, transport change, or stray background task was added.
 - The implementation is no more complex than the task requires.
+
+## GitHub Progress Comment
+
+## GitHub Progress Comment
+
+Maintain the same single GitHub progress comment and update it in place.
+
+During work, keep a detailed progress checklist at the top. Break the work into concrete, meaningful steps so the checklist reflects what Claude has inspected, verified, changed, and tested, rather than only a few high-level phases. Update it frequently as work progresses.
+
+Below the checklist, write 1–4 short first-person progress sentences such as “I found…”, “I’m fixing…”, “I’m checking…”, or “I’m trying… next.” Briefly explain what Claude has just learned, why it matters, what it is doing now, and what it plans to check next. Prefer frequent incremental updates over long explanations.
+
+Do not add headings like `Current analysis` or `Working on...`. Avoid raw command logs, token details, exhaustive implementation dumps, or raw chain-of-thought.
+
+When finished and only when finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
