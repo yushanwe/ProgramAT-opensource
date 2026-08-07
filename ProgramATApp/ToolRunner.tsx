@@ -11,11 +11,11 @@ import {
   TouchableOpacity,
   TextInput,
   ScrollView,
-  Keyboard,
-  TouchableWithoutFeedback,
   Platform,
   AccessibilityInfo,
+  useWindowDimensions,
   findNodeHandle,
+  NativeModules,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -28,12 +28,35 @@ import Voice, {
   SpeechResultsEvent,
   SpeechErrorEvent,
 } from '@react-native-voice/voice';
+import {
+  acceptsProgressiveResult,
+  acceptsStreamingProgressEvent,
+  formatProgressiveResult,
+  progressiveInvocationIsRunning,
+  progressiveResultModel,
+} from './progressiveResults';
+import {
+  buildRuntimeInputsPayload,
+  normalizeRuntimeInputValue,
+  RuntimeInputDefinition,
+} from './runtimeInput';
+import { isRecordSessionArmed } from './Settings';
 
 // Configuration for text similarity filtering
 const SIMILARITY_THRESHOLDS = {
-  STREAMING: 0.8,   // 80% similarity threshold for streaming updates 
-  CONSERVATIVE: 0.95, // 95% for very chatty streams  
+  STREAMING: 0.8,   // 80% similarity threshold for streaming updates
+  CONSERVATIVE: 0.95, // 95% for very chatty streams
   AGGRESSIVE: 0.75,   // 75% for fewer updates
+};
+
+const TAKE_PHOTO_RECORDING_DURATION_MS = 30000;
+
+const { ScreenRecordingModule } = NativeModules as {
+  ScreenRecordingModule?: {
+    startScreenRecording?: () => Promise<boolean>;
+    stopScreenRecordingAndSave?: () => Promise<boolean>;
+    isScreenRecordingActive?: () => Promise<boolean>;
+  };
 };
 
 interface Tool {
@@ -50,6 +73,8 @@ interface Tool {
   gpt_query?: string;
   system_instruction?: string;
   query_interval?: number;
+  source?: string;
+  runtime_input?: RuntimeInputDefinition;
 }
 
 interface ToolRunnerProps {
@@ -67,10 +92,18 @@ export default function ToolRunner({
   onNavigateToChat,
   isActive = true,
 }: ToolRunnerProps) {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const [toolOutput, setToolOutput] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [, setIsStreamProcessing] = useState(false);
   const isStreamingRef = useRef(false); // Ref to avoid stale closures in cleanup effects
+  const wasStreamingRef = useRef(false); // Tracks isStreaming transitions for screen-recording stop
+  const [recordSessionArmed, setRecordSessionArmed] = useState(false); // "Record this usage session" — set in Settings
+  const [isRecordingScreen, setIsRecordingScreen] = useState(false);
+  const isRecordingScreenRef = useRef(false);
+  const recordingDesiredRef = useRef(false);
+  const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Take Photo's 30s auto-stop
   const [audioEnabled, setAudioEnabled] = useState(true); // Toggle audio output
   const [conversationMode, setConversationMode] = useState(false); // Toggle conversation mode
   const conversationModeRef = useRef(false); // Ref to track conversation mode for WebSocket handler
@@ -80,17 +113,84 @@ export default function ToolRunner({
   const [lastStreamingText, setLastStreamingText] = useState(''); // Track last streaming text for similarity
   const lastStreamingTextRef = useRef(''); // Backup ref to persist across re-renders
   const lastStreamingExecutionRef = useRef(0);
+  const activeProgressiveInvocationRef = useRef<string | null>(null);
+  const lastProgressiveResultIndexRef = useRef(0);
   
   // Custom GPT follow-up state
   const [isCustomGptStreaming, setIsCustomGptStreaming] = useState(false);
   const [isListeningFollowup, setIsListeningFollowup] = useState(false);
   const [followupTranscript, setFollowupTranscript] = useState('');
   const [isProcessingFollowup, setIsProcessingFollowup] = useState(false);
+  const [runtimeInputDraft, setRuntimeInputDraft] = useState('');
+  const [committedRuntimeInput, setCommittedRuntimeInput] = useState('');
+  const lowerScrollRef = useRef<ScrollView | null>(null);
   
   // Keep isStreamingRef in sync with isStreaming state
   useEffect(() => {
     isStreamingRef.current = isStreaming;
   }, [isStreaming]);
+
+  useEffect(() => {
+    setRuntimeInputDraft('');
+    setCommittedRuntimeInput('');
+  }, [selectedTool?.name, selectedTool?.path]);
+
+  useEffect(() => {
+    if (!selectedTool) {
+      return;
+    }
+    const visible = Boolean(selectedTool.runtime_input);
+    console.log(
+      `[Runtime Input Render] tool=${selectedTool.path || selectedTool.name} schema=${
+        selectedTool.runtime_input
+          ? JSON.stringify(selectedTool.runtime_input)
+          : 'none'
+      } visible=${visible ? 'true' : 'false'}`,
+    );
+  }, [selectedTool?.name, selectedTool?.path, selectedTool?.runtime_input]);
+  // Load the "Record this usage session" setting from Settings. Re-checked
+  // whenever this tab becomes active so a change made in Settings while this
+  // screen was backgrounded takes effect without an app restart.
+  useEffect(() => {
+    if (isActive) {
+      isRecordSessionArmed().then(setRecordSessionArmed).catch(() => setRecordSessionArmed(false));
+    }
+  }, [isActive]);
+
+  // Keep isRecordingScreenRef in sync with isRecordingScreen state
+  useEffect(() => {
+    isRecordingScreenRef.current = isRecordingScreen;
+  }, [isRecordingScreen]);
+
+  // Stop any in-flight screen recording whenever streaming ends, regardless
+  // of which code path (manual stop, WS error, tab-inactive, unmount) flipped
+  // isStreaming to false.
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) {
+      stopScreenRecordingIfActive();
+    }
+    wasStreamingRef.current = isStreaming;
+  }, [isStreaming]);
+
+  // Clear the Take Photo recording timer on unmount so it never fires after
+  // the component is gone, and stop any active recording when leaving.
+  useEffect(() => {
+    return () => {
+      if (recordingTimeoutRef.current) {
+        clearTimeout(recordingTimeoutRef.current);
+        recordingTimeoutRef.current = null;
+      }
+      recordingDesiredRef.current = false;
+      stopScreenRecordingIfActive();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isActive) {
+      recordingDesiredRef.current = false;
+      stopScreenRecordingIfActive();
+    }
+  }, [isActive]);
 
   // Voice event listeners for follow-up speech-to-text
   useEffect(() => {
@@ -509,20 +609,14 @@ export default function ToolRunner({
       console.log('[ToolRunner] Skipping announcement (text too similar, similarity:', similarity.toFixed(3), ')');
     }
   };
-  const toolNameRef = useRef<Text>(null);
   const cameraViewRef = useRef<CameraViewHandle>(null);
 
-  // Set accessibility focus to tool name when component mounts or tool changes
+  // Announce the selected tool name when entering the runner.
   useEffect(() => {
     if (!selectedTool) return;
     
     const timeout = setTimeout(() => {
-      if (toolNameRef.current) {
-        const reactTag = findNodeHandle(toolNameRef.current);
-        if (reactTag) {
-          AccessibilityInfo.setAccessibilityFocus(reactTag);
-        }
-      }
+      AccessibilityInfo.announceForAccessibility(`Tool: ${selectedTool.name}`);
     }, 100);
     
     return () => clearTimeout(timeout);
@@ -544,7 +638,7 @@ export default function ToolRunner({
   // Loading sound effect - play when running one-shot tools, but NOT when streaming (too much noise)
   useEffect(() => {
     let beepTimer: ReturnType<typeof setTimeout> | null = null;
-    const isLoading = isRunning; // Only beep for one-shot tools, not streaming
+    const isLoading = isRunning && !isStreaming;
     
     if (isLoading) {
       console.log('[ToolRunner] Tool running, will beep after 3 seconds if still processing');
@@ -574,7 +668,83 @@ export default function ToolRunner({
         const message = JSON.parse(event.data);
         console.log('[ToolRunner] Received message type:', message.type);
         
-        if (message.type === 'tool_result') {
+        if (message.type === 'tool_progress_started') {
+          if (!acceptsStreamingProgressEvent(isStreamingRef.current, message)) {
+            console.log('[ToolProgress] late streaming start ignored:', message.invocation_id);
+            return;
+          }
+          console.log(
+            '[Progressive] event_received_frontend',
+            'invocation_id=', message.invocation_id,
+            'model=none result_index=0 final=false stale=false cancelled=false',
+          );
+          activeProgressiveInvocationRef.current = message.invocation_id;
+          lastProgressiveResultIndexRef.current = 0;
+          if (message.mode === 'streaming') {
+            setIsStreamProcessing(true);
+          } else {
+            setIsRunning(true);
+          }
+          setToolOutput('Waiting for model results...');
+        } else if (message.type === 'tool_progress_result') {
+          if (!acceptsStreamingProgressEvent(isStreamingRef.current, message)) {
+            console.log('[ToolProgress] late streaming result ignored:', message.invocation_id);
+            return;
+          }
+          const accepted = acceptsProgressiveResult(
+            activeProgressiveInvocationRef.current,
+            lastProgressiveResultIndexRef.current,
+            message,
+          );
+          console.log(
+            '[Progressive] event_received_frontend',
+            'invocation_id=', message.invocation_id,
+            'model=', progressiveResultModel(message) || 'none',
+            'result_index=', message.result_index,
+            'final=', Boolean(message.final),
+            'stale=', !accepted,
+            'cancelled=', Boolean(message.cancelled),
+          );
+          if (!accepted) {
+            console.log('[ToolProgress] obsolete or duplicate result ignored:', message.invocation_id);
+            return;
+          }
+          lastProgressiveResultIndexRef.current = message.result_index;
+          const labeledText = formatProgressiveResult(message);
+          console.log(
+            '[ToolProgress] render_candidate',
+            'invocation_id=', message.invocation_id,
+            'mode=', message.mode || 'unknown',
+            'final=', Boolean(message.final),
+            'partial=', Boolean(message.partial),
+            'replace=', Boolean(message.replace),
+            'text_length=', typeof message.text === 'string' ? message.text.length : 0,
+            'renderable=', Boolean(labeledText),
+          );
+          if (labeledText) {
+            setToolOutput(labeledText);
+            if (audioEnabled) {
+              AudioOutputService.play({
+                type: 'speech',
+                text: labeledText,
+                rate: 1.0,
+                interrupt: false,
+              });
+              AccessibilityInfo.announceForAccessibilityWithOptions(
+                labeledText,
+                {queue: true},
+              );
+            }
+          }
+          if (message.final) {
+            if (message.mode === 'streaming') {
+              setIsStreamProcessing(false);
+            } else {
+              setIsRunning(progressiveInvocationIsRunning(message));
+            }
+            return;
+          }
+        } else if (message.type === 'tool_result') {
           console.log('[ToolRunner] Tool result received:', message.status);
           console.log('[ToolRunner] Raw message.result length:', message.result?.length);
           console.log('[ToolRunner] Result/Error:', message.result || message.error);
@@ -680,6 +850,10 @@ export default function ToolRunner({
             }
           }
         } else if (message.type === 'tool_stream_result') {
+          if (!isStreamingRef.current) {
+            console.log('[Streaming UI] result ignored because streaming is inactive');
+            return;
+          }
           // Streaming result - update continuously
           console.log('[Streaming UI] websocket result received, execution:', message.execution_id);
           if (
@@ -729,10 +903,17 @@ export default function ToolRunner({
             console.log('[ToolRunner] NOT checking similarity - audioEnabled:', audioEnabled, 'result exists:', !!result);
           }
         } else if (message.type === 'streaming_started') {
+          if (!isStreamingRef.current) {
+            console.log('[ToolRunner] Late streaming_started ignored');
+            return;
+          }
           console.log('[ToolRunner] Server confirmed streaming started');
           const mode = message.mode || 'code_execution';
           console.log('[ToolRunner] Streaming mode:', mode);
           setIsStreaming(true);
+          setIsStreamProcessing(false);
+          setIsRunning(false);
+          BeepService.stopLoadingSound();
           lastStreamingExecutionRef.current = 0;
           setIsCustomGptStreaming(mode === 'gemini_live');
           setToolOutput(`Streaming started: ${message.tool_name || 'tool'}${mode === 'gemini_live' ? ' (Gemini Live)' : ''}`);
@@ -744,6 +925,10 @@ export default function ToolRunner({
             });
           }
         } else if (message.type === 'live_followup_response') {
+          if (!isStreamingRef.current) {
+            console.log('[ToolRunner] Late live follow-up response ignored');
+            return;
+          }
           // Handle Gemini Live follow-up responses
           console.log('[ToolRunner] Live follow-up response:', message.text?.substring(0, 100));
           setIsProcessingFollowup(false);
@@ -764,7 +949,12 @@ export default function ToolRunner({
           }
         } else if (message.type === 'streaming_stopped') {
           console.log('[ToolRunner] Server confirmed streaming stopped');
+          isStreamingRef.current = false;
           setIsStreaming(false);
+          setIsStreamProcessing(false);
+          setIsRunning(false);
+          activeProgressiveInvocationRef.current = null;
+          BeepService.stopLoadingSound();
           setIsCustomGptStreaming(false);
           setIsListeningFollowup(false);
           setFollowupTranscript('');
@@ -788,12 +978,19 @@ export default function ToolRunner({
             // Don't update streaming text tracking for status messages
           }
         } else if (message.type === 'tool_stream_error') {
+          if (!isStreamingRef.current) {
+            console.log('[ToolRunner] Late stream error ignored');
+            return;
+          }
           console.log('[ToolRunner] Stream error:', message.error);
           const error = `Stream Error: ${message.error}`;
           setToolOutput(error);
           
           // Stop streaming on error
+          isStreamingRef.current = false;
           setIsStreaming(false);
+          setIsStreamProcessing(false);
+          BeepService.stopLoadingSound();
           
           if (cameraViewRef.current) {
             cameraViewRef.current.stopStreaming();
@@ -861,8 +1058,113 @@ export default function ToolRunner({
     };
   }, []);
 
+  // Speaks a failure both through VoiceOver and audio output, since a blind
+  // user cannot see a silently failed recording indicator.
+  const announceRecordingFailure = (text: string) => {
+    AccessibilityInfo.announceForAccessibility(text);
+    AudioOutputService.play({
+      type: 'error' as any,
+      text,
+      interrupt: false,
+    });
+  };
+
+  const announceRecordingSuccess = (text: string) => {
+    AccessibilityInfo.announceForAccessibility(text);
+    AudioOutputService.play({
+      type: 'success' as any,
+      text,
+      interrupt: false,
+    });
+  };
+
+  const startScreenRecordingIfArmed = async () => {
+    if (!recordSessionArmed || isRecordingScreenRef.current) {
+      return;
+    }
+    recordingDesiredRef.current = true;
+    try {
+      await ScreenRecordingModule?.startScreenRecording?.();
+      setIsRecordingScreen(true);
+      isRecordingScreenRef.current = true;
+      if (!recordingDesiredRef.current) {
+        stopScreenRecordingIfActive();
+        return;
+      }
+      AccessibilityInfo.announceForAccessibility('Recording started');
+    } catch (error: any) {
+      console.error('[ToolRunner] Failed to start screen recording:', error);
+      recordingDesiredRef.current = false;
+      const code = error?.code;
+      if (code === 'already_recording') {
+        return;
+      }
+      const message =
+        code === 'recording_permission_denied'
+          ? 'Screen recording or microphone permission was denied. This session will not be recorded.'
+          : code === 'recorder_unavailable'
+          ? 'Screen recording is not available on this device.'
+          : 'Could not start screen recording.';
+      announceRecordingFailure(message);
+    }
+  };
+
+  const stopScreenRecordingIfActive = async () => {
+    recordingDesiredRef.current = false;
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    try {
+      const nativeActive = await ScreenRecordingModule?.isScreenRecordingActive?.();
+      if (!isRecordingScreenRef.current && !nativeActive) {
+        setIsRecordingScreen(false);
+        isRecordingScreenRef.current = false;
+        return;
+      }
+      setIsRecordingScreen(false);
+      isRecordingScreenRef.current = false;
+      await ScreenRecordingModule?.stopScreenRecordingAndSave?.();
+      announceRecordingSuccess('Recording saved to Photos');
+    } catch (error: any) {
+      console.error('[ToolRunner] Failed to stop/save screen recording:', error);
+      const code = error?.code;
+      if (code === 'not_recording') {
+        return;
+      }
+      const message =
+        code === 'photos_permission_denied'
+          ? 'Recording finished but could not be saved. Photos access was denied.'
+          : 'Recording finished but could not be saved.';
+      announceRecordingFailure(message);
+    }
+  };
+
+  const armTakePhotoRecordingIfNeeded = () => {
+    if (!recordSessionArmed) {
+      return;
+    }
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    if (!isRecordingScreenRef.current) {
+      startScreenRecordingIfArmed();
+    }
+    recordingTimeoutRef.current = setTimeout(() => {
+      recordingTimeoutRef.current = null;
+      // If streaming has taken over this recording in the meantime, let the
+      // isStreaming transition effect own stopping it instead.
+      if (!isStreamingRef.current) {
+        stopScreenRecordingIfActive();
+      }
+    }, TAKE_PHOTO_RECORDING_DURATION_MS);
+  };
+
   const handleRunTool = async (isConversation: boolean = false) => {
     if (!selectedTool) return;
+
+    armTakePhotoRecordingIfNeeded();
 
     console.log('[ToolRunner] Starting tool execution, isConversation:', isConversation);
     console.log('[ToolRunner] Tool:', selectedTool.name);
@@ -928,6 +1230,8 @@ export default function ToolRunner({
     }
 
     setToolOutput('Running tool...');
+    activeProgressiveInvocationRef.current = null;
+    lastProgressiveResultIndexRef.current = 0;
 
     // Generate conversation ID if this is a conversation run
     const conversationId = isConversation ? `conv_${Date.now()}` : undefined;
@@ -939,12 +1243,20 @@ export default function ToolRunner({
     }
 
     // Send tool execution request to backend with captured frame
+    const runtimeInputs = buildRuntimeInputsPayload(
+      selectedTool.runtime_input,
+      committedRuntimeInput,
+    );
+    console.log(
+      `[Runtime Input Trace] stage=frontend_take_photo tool=${selectedTool.name} keys=${JSON.stringify(Object.keys(runtimeInputs))} value_present=${runtimeInputs ? 'true' : 'false'}`,
+    );
     const message = {
       type: 'run_tool',
       tool_name: selectedTool.name,
       tool_path: selectedTool.path,
       tool_code: selectedTool.code,
       tool_language: selectedTool.language,
+      tool_source: selectedTool.source,
       input: '',
       task: selectedTool.description || selectedTool.name,
       frame: {
@@ -953,6 +1265,7 @@ export default function ToolRunner({
         height: frameData.height,
       },
       conversation_id: conversationId, // Include conversation ID if in conversation mode
+      runtime_inputs: runtimeInputs,
       timestamp: Date.now(),
     };
 
@@ -986,19 +1299,38 @@ export default function ToolRunner({
     } else {
       console.warn('[ToolRunner] Camera ref not available');
     }
-    
-    // Set state optimistically for immediate UI feedback
+
+    // Fire-and-forget: streaming must not wait on the OS recording permission dialog.
+    startScreenRecordingIfArmed();
+
+    // Start a fresh session optimistically for immediate UI feedback.
+    isStreamingRef.current = true;
     setIsStreaming(true);
+    setIsStreamProcessing(false);
+    setIsRunning(false);
+    activeProgressiveInvocationRef.current = null;
+    lastProgressiveResultIndexRef.current = 0;
+    lastStreamingExecutionRef.current = 0;
+    BeepService.stopLoadingSound();
     setToolOutput('Starting stream...');
     
+    const runtimeInputs = buildRuntimeInputsPayload(
+      selectedTool.runtime_input,
+      committedRuntimeInput,
+    );
+    console.log(
+      `[Runtime Input Trace] stage=frontend_stream_start tool=${selectedTool.name} keys=${JSON.stringify(Object.keys(runtimeInputs))} value_present=${runtimeInputs ? 'true' : 'false'}`,
+    );
     const message: any = {
       type: 'start_streaming_tool',
       tool_name: selectedTool.name,
       tool_path: selectedTool.path,
       tool_code: selectedTool.code,
       tool_language: selectedTool.language,
+      tool_source: selectedTool.source,
       input: '',
       task: selectedTool.description || selectedTool.name,
+      runtime_inputs: runtimeInputs,
       throttle_ms: 1000, // Process 1 frame per second
     };
 
@@ -1026,7 +1358,9 @@ export default function ToolRunner({
       console.error('[ToolRunner] WebSocket not open');
       const errorMsg = 'Error: Not connected to server';
       setToolOutput(errorMsg);
+      isStreamingRef.current = false;
       setIsStreaming(false);  // Revert state on failure
+      setIsStreamProcessing(false);
       
       // Announce error via VoiceOver
       AccessibilityInfo.announceForAccessibility('Not connected to server. Please connect first.');
@@ -1040,6 +1374,16 @@ export default function ToolRunner({
 
   const stopStreamingTool = () => {
     console.log('[ToolRunner] Stopping streaming mode');
+
+    // Invalidate the session before any asynchronous cleanup so late events cannot
+    // update the UI or trigger speech.
+    isStreamingRef.current = false;
+    activeProgressiveInvocationRef.current = null;
+    lastProgressiveResultIndexRef.current = 0;
+    lastStreamingExecutionRef.current = 0;
+    setIsStreamProcessing(false);
+    setIsRunning(false);
+    BeepService.stopLoadingSound();
     
     // Stop camera frame streaming automatically
     if (cameraViewRef.current) {
@@ -1070,6 +1414,28 @@ export default function ToolRunner({
     }
   };
 
+  const commitRuntimeInput = () => {
+    const normalized = normalizeRuntimeInputValue(runtimeInputDraft);
+    setRuntimeInputDraft(normalized);
+    setCommittedRuntimeInput(normalized);
+    if (selectedTool?.runtime_input?.label) {
+      const announcement = normalized
+        ? `${selectedTool.runtime_input.label} set to ${normalized}`
+        : `${selectedTool.runtime_input.label} cleared`;
+      AccessibilityInfo.announceForAccessibility(announcement);
+    }
+  };
+
+  const clearRuntimeInput = () => {
+    setRuntimeInputDraft('');
+    setCommittedRuntimeInput('');
+    if (selectedTool?.runtime_input?.label) {
+      AccessibilityInfo.announceForAccessibility(
+        `${selectedTool.runtime_input.label} cleared`,
+      );
+    }
+  };
+
   // Cleanup streaming on unmount or tool change
   useEffect(() => {
     return () => {
@@ -1086,6 +1452,11 @@ export default function ToolRunner({
       stopStreamingTool();
     }
   }, [isActive]);
+
+  const cameraSectionHeight = Math.min(
+    windowWidth,
+    windowHeight * 0.58,
+  );
   
   const renderTool = () => {
     if (!selectedTool) {
@@ -1105,41 +1476,30 @@ export default function ToolRunner({
     return (
       <View style={styles.toolContainer}>
         {/* Camera View - Takes up most of screen */}
-        <View style={styles.cameraSection}>
+        <View style={[styles.cameraSection, { height: cameraSectionHeight }]}>
           <CameraView ref={cameraViewRef} />
         </View>
 
         {/* Tool Controls - Fixed bottom section */}
         {selectedTool.path !== 'camera' && (
-          <View style={styles.controlsSection}>
+          <View
+            style={styles.controlsSection}
+            accessible={false}>
             {/* Fixed controls - always visible */}
             <View style={styles.fixedControls}>
-              {/* Tool name */}
-              <View style={styles.toolHeader}>
-                <Text 
-                  ref={toolNameRef}
-                  style={styles.toolNameCompact} 
-                  numberOfLines={1}
-                  accessible={true}
-                  accessibilityRole="header"
-                  accessibilityLabel={`Tool: ${selectedTool.name}`}>
-                  {selectedTool.name}
-                </Text>
-              </View>
-
               {/* Main action buttons - Full width, readable */}
               <View style={styles.buttonRow}>
                 <TouchableOpacity
-                  style={[styles.button, isStreaming ? styles.stopButton : styles.streamButton, isRunning && styles.buttonDisabled]}
+                  style={[styles.button, isStreaming ? styles.stopButton : styles.streamButton, (!isStreaming && isRunning) && styles.buttonDisabled]}
                   onPress={isStreaming ? stopStreamingTool : startStreamingTool}
-                  disabled={isRunning}
+                  disabled={!isStreaming && isRunning}
                   accessible={true}
                   accessibilityLabel={isStreaming ? "Stop streaming" : "Start streaming"}
                   accessibilityHint={isStreaming ? "Stops continuous tool execution" : "Starts continuous tool execution on camera frames"}
                   accessibilityRole="button"
-                  accessibilityState={{ disabled: isRunning }}>
+                  accessibilityState={{ disabled: !isStreaming && isRunning }}>
                   <Text style={styles.buttonText}>
-                    {isStreaming ? 'Stop' : 'Stream'}
+                    {isStreaming ? 'Stop Streaming' : 'Start Streaming'}
                   </Text>
                 </TouchableOpacity>
 
@@ -1207,7 +1567,6 @@ export default function ToolRunner({
                   </Text>
                 </TouchableOpacity>
               </View>
-
               {/* Follow-up mic button - shown during custom GPT streaming */}
               {isCustomGptStreaming && isStreaming && (
                 <View style={styles.followupSection}>
@@ -1250,101 +1609,158 @@ export default function ToolRunner({
                   ) : null}
                 </View>
               )}
-
-              {/* Output section - visible but compact with accessibility live region */}
-              {toolOutput && (
-                <View 
-                  style={styles.outputSection}
-                  accessible={true}
-                  accessibilityLiveRegion="polite"
-                  accessibilityRole="text"
-                  accessibilityLabel={`Tool output: ${toolOutput}`}
-                  accessibilityHint="Long press to copy text">
-                  <Text 
-                    style={styles.outputText} 
-                    numberOfLines={2}
-                    selectable={true}
-                    accessible={false}>
-                    {toolOutput}
-                  </Text>
-                </View>
-              )}
             </View>
 
-            {/* Scrollable details - takes remaining space */}
+            {/* Scrollable lower content */}
             <ScrollView 
-              style={styles.detailsScroll}
-              contentContainerStyle={styles.detailsContent}
-              keyboardShouldPersistTaps="handled"
+              ref={lowerScrollRef}
+              style={styles.lowerScrollArea}
+              contentContainerStyle={styles.lowerScrollContent}
+              keyboardShouldPersistTaps="always"
+              keyboardDismissMode="none"
+              accessible={false}
               showsVerticalScrollIndicator={true}>
-              <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-                <View>
-                  {selectedTool.description && (
-                    <View style={styles.detailSection}>
-                      <Text style={styles.detailTitle}>Description</Text>
+              <View>
+                {/* Output section - reachable in lower scrolling region */}
+                {toolOutput && (
+                  <View 
+                    style={styles.outputSection}
+                    accessible={false}>
+                    <Text 
+                      style={styles.outputText}
+                      selectable={true}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLiveRegion="polite"
+                      accessibilityLabel={`Tool output: ${toolOutput}`}
+                      accessibilityHint="Long press to copy text">
+                      {toolOutput}
+                    </Text>
+                  </View>
+                )}
+
+                {selectedTool.runtime_input && (
+                  <View style={styles.runtimeInputSection}>
+                    <Text
+                      style={styles.runtimeInputLabel}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLabel={selectedTool.runtime_input.label}>
+                      {selectedTool.runtime_input.label}
+                    </Text>
+                    <TextInput
+                      style={styles.runtimeInputField}
+                      value={runtimeInputDraft}
+                      onChangeText={setRuntimeInputDraft}
+                      placeholder={selectedTool.runtime_input.placeholder}
+                      placeholderTextColor="#8a8a8a"
+                      returnKeyType="done"
+                      onSubmitEditing={commitRuntimeInput}
+                      accessible={true}
+                      accessibilityLabel={selectedTool.runtime_input.label}
+                      accessibilityHint="Enter an optional value to customize this tool."
+                    />
+                    <View style={styles.runtimeInputButtons}>
+                      <TouchableOpacity
+                        style={[styles.runtimeInputButton, styles.runtimeCommitButton]}
+                        onPress={commitRuntimeInput}
+                        accessible={true}
+                        accessibilityRole="button"
+                        accessibilityLabel="Enter"
+                        accessibilityHint="Commits the current text for subsequent Take Photo and Start Streaming requests">
+                        <Text style={styles.runtimeInputButtonText}>Enter</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.runtimeInputButton, styles.runtimeClearButton]}
+                        onPress={clearRuntimeInput}
+                        accessible={true}
+                        accessibilityRole="button"
+                        accessibilityLabel="Clear"
+                        accessibilityHint="Removes both the typed and active target and restores the tool default behavior">
+                        <Text style={styles.runtimeInputButtonText}>Clear</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <Text
+                      style={styles.runtimeInputStatus}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLabel={
+                        committedRuntimeInput
+                          ? `Active target: ${committedRuntimeInput}`
+                          : 'No active target'
+                      }>
+                      {committedRuntimeInput
+                        ? `Active target: ${committedRuntimeInput}`
+                        : 'Active target: none'}
+                    </Text>
+                  </View>
+                )}
+
+                {selectedTool.description && (
+                  <View style={styles.detailSection}>
+                    <Text style={styles.detailTitle}>Description</Text>
+                    <Text 
+                      style={styles.toolDescription}
+                      selectable={true}
+                      accessible={true}
+                      accessibilityRole="text"
+                      accessibilityLabel={`Description: ${selectedTool.description}`}
+                      accessibilityHint="Long press to copy text">
+                      {selectedTool.description}
+                    </Text>
+                  </View>
+                )}
+                
+                {(selectedTool.branch_name || selectedTool.language || selectedTool.pr_title) && (
+                  <View style={styles.detailSection}>
+                    <Text style={styles.detailTitle}>Details</Text>
+                    {selectedTool.pr_title && (
                       <Text 
-                        style={styles.toolDescription}
+                        style={styles.toolMeta}
+                        selectable={true}
+                        accessible={true}
+                        accessibilityRole="text">
+                        PR: {selectedTool.pr_title}
+                      </Text>
+                    )}
+                    {selectedTool.branch_name && (
+                      <Text 
+                        style={styles.toolMeta}
+                        selectable={true}
+                        accessible={true}
+                        accessibilityRole="text">
+                        Branch: {selectedTool.branch_name}
+                      </Text>
+                    )}
+                    {selectedTool.language && (
+                      <Text 
+                        style={styles.toolMeta}
+                        selectable={true}
+                        accessible={true}
+                        accessibilityRole="text">
+                        Language: {selectedTool.language}
+                      </Text>
+                    )}
+                  </View>
+                )}
+
+                {selectedTool.source_code && (
+                  <View style={styles.detailSection}>
+                    <Text style={styles.detailTitle}>Source Code</Text>
+                    <View style={styles.codeScroll}>
+                      <Text 
+                        style={styles.codeText}
                         selectable={true}
                         accessible={true}
                         accessibilityRole="text"
-                        accessibilityLabel={`Description: ${selectedTool.description}`}
-                        accessibilityHint="Long press to copy text">
-                        {selectedTool.description}
+                        accessibilityLabel="Source code"
+                        accessibilityHint="Long press to copy code">
+                        {selectedTool.source_code}
                       </Text>
                     </View>
-                  )}
-                  
-                  {(selectedTool.branch_name || selectedTool.language || selectedTool.pr_title) && (
-                    <View style={styles.detailSection}>
-                      <Text style={styles.detailTitle}>Details</Text>
-                      {selectedTool.pr_title && (
-                        <Text 
-                          style={styles.toolMeta}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text">
-                          PR: {selectedTool.pr_title}
-                        </Text>
-                      )}
-                      {selectedTool.branch_name && (
-                        <Text 
-                          style={styles.toolMeta}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text">
-                          Branch: {selectedTool.branch_name}
-                        </Text>
-                      )}
-                      {selectedTool.language && (
-                        <Text 
-                          style={styles.toolMeta}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text">
-                          Language: {selectedTool.language}
-                        </Text>
-                      )}
-                    </View>
-                  )}
-
-                  {selectedTool.source_code && (
-                    <View style={styles.detailSection}>
-                      <Text style={styles.detailTitle}>Source Code</Text>
-                      <View style={styles.codeScroll}>
-                        <Text 
-                          style={styles.codeText}
-                          selectable={true}
-                          accessible={true}
-                          accessibilityRole="text"
-                          accessibilityLabel="Source code"
-                          accessibilityHint="Long press to copy code">
-                          {selectedTool.source_code}
-                        </Text>
-                      </View>
-                    </View>
-                  )}
-                </View>
-              </TouchableWithoutFeedback>
+                  </View>
+                )}
+              </View>
             </ScrollView>
           </View>
         )}
@@ -1366,14 +1782,20 @@ export default function ToolRunner({
             accessibilityHint="Double tap to return to tool selection">
             <Text style={styles.backButtonText}>← Back to Tools</Text>
           </TouchableOpacity>
+          {selectedTool && (
+            <Text
+              style={styles.toolHeaderTitle}
+              numberOfLines={1}
+              ellipsizeMode="tail"
+              accessible={true}
+              accessibilityRole="header"
+              accessibilityLabel={`Tool: ${selectedTool.name}`}>
+              {selectedTool.name}
+            </Text>
+          )}
         </View>
       )}
       
-      {selectedTool && (
-        <View style={styles.header}>
-          <Text style={styles.headerText}>Running: {selectedTool.name}</Text>
-        </View>
-      )}
       <View style={styles.content}>
         {renderTool()}
       </View>
@@ -1387,6 +1809,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f5',
   },
   backButtonContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
     paddingHorizontal: 16,
     paddingVertical: 8,
     backgroundColor: '#fff',
@@ -1405,17 +1830,11 @@ const styles = StyleSheet.create({
     color: '#2563eb',
     fontWeight: '600',
   },
-  header: {
-    backgroundColor: '#2196F3',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1976D2',
-  },
-  headerText: {
-    fontSize: 16,
+  toolHeaderTitle: {
+    flex: 1,
+    fontSize: 15,
     fontWeight: '600',
-    color: '#fff',
+    color: '#333',
   },
   content: {
     flex: 1,
@@ -1446,30 +1865,19 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   cameraSection: {
-    flex: 1, // Camera takes ALL available space
+    width: '100%',
+    flexShrink: 0,
     backgroundColor: '#000',
   },
   controlsSection: {
+    flex: 1,
+    minHeight: 0,
     backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#e0e0e0',
-    maxHeight: '30%', // Controls limited to 30% max
   },
   fixedControls: {
-    // Controls that are always visible (buttons, output)
     backgroundColor: '#fff',
-  },
-  toolHeader: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: '#f9f9f9',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e0e0e0',
-  },
-  toolNameCompact: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#333',
   },
   buttonRow: {
     flexDirection: 'row',
@@ -1503,12 +1911,65 @@ const styles = StyleSheet.create({
     color: '#333',
     lineHeight: 18,
   },
-  detailsScroll: {
-    maxHeight: 200, // Constrain height to force scrolling
+  runtimeInputSection: {
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 10,
+    backgroundColor: '#fff',
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+  },
+  runtimeInputLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 6,
+  },
+  runtimeInputField: {
+    borderWidth: 1,
+    borderColor: '#d0d0d0',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: Platform.OS === 'ios' ? 10 : 8,
+    fontSize: 14,
+    color: '#222',
     backgroundColor: '#fafafa',
   },
-  detailsContent: {
-    paddingBottom: 20, // Ensure content can scroll fully
+  runtimeInputButtons: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  runtimeInputButton: {
+    flex: 1,
+    borderRadius: 6,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  runtimeCommitButton: {
+    backgroundColor: '#2563eb',
+  },
+  runtimeClearButton: {
+    backgroundColor: '#6b7280',
+  },
+  runtimeInputButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  runtimeInputStatus: {
+    marginTop: 8,
+    fontSize: 12,
+    color: '#555',
+  },
+  lowerScrollArea: {
+    flex: 1,
+    backgroundColor: '#fafafa',
+  },
+  lowerScrollContent: {
+    flexGrow: 1,
+    paddingBottom: Platform.OS === 'ios' ? 28 : 20,
   },
   detailSection: {
     backgroundColor: '#fff',

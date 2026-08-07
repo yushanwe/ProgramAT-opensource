@@ -44,10 +44,7 @@ def pil_image_to_data_uri(pil_image: Image.Image, quality: int = 85) -> str:
     return f'data:image/jpeg;base64,{image_base64}'
 
 
-def resolve_api_key(model_name: str = "", explicit_api_key: str = "") -> str:
-    if explicit_api_key:
-        return explicit_api_key
-
+def resolve_api_key(model_name: str = "") -> str:
     normalized = (model_name or "").lower()
     if normalized.startswith("gemini"):
         return os.environ.get("GEMINI_API_KEY", "")
@@ -133,9 +130,12 @@ def _completion_kwargs(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     if not isinstance(metadata, dict):
         return kwargs
-    for key in ("temperature", "max_tokens", "top_p", "stop", "timeout", "response_format", "stream", "api_base", "base_url"):
+    for key in (
+        "temperature", "max_tokens", "top_p", "stop", "timeout",
+        "num_retries", "response_format", "stream",
+    ):
         if key in metadata and metadata[key] is not None:
-            kwargs["api_base" if key == "base_url" else key] = metadata[key]
+            kwargs[key] = metadata[key]
     return kwargs
 
 
@@ -149,13 +149,62 @@ def call_model(
     if litellm is None:
         raise ImportError("litellm is required for call_model")
 
-    explicit_key = ""
-    if isinstance(metadata, dict):
-        explicit_key = metadata.get("api_key") or metadata.get("explicit_api_key") or ""
-
     return litellm.completion(
         model=model_name,
         messages=_merge_images(messages or [], images),
-        api_key=resolve_api_key(model_name, explicit_key if isinstance(explicit_key, str) else ""),
+        api_key=resolve_api_key(model_name),
         **_completion_kwargs(metadata),
     )
+
+
+def _extract_responses_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str):
+        return output_text.strip()
+    parts: List[str] = []
+    for item in getattr(response, "output", None) or []:
+        for content in getattr(item, "content", None) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts).strip()
+
+
+def call_openai_responses_model(
+    model_name: str,
+    prompt: str,
+    image: Any,
+    *,
+    reasoning_effort: str = "medium",
+    timeout: Optional[float] = None,
+) -> str:
+    """Call one OpenAI Responses API model with one fresh multimodal request."""
+    from openai import OpenAI
+
+    client_kwargs = {
+        "api_key": resolve_api_key(model_name),
+        "max_retries": 0,
+    }
+    if timeout is not None:
+        client_kwargs["timeout"] = timeout
+    client = OpenAI(**client_kwargs)
+    response = client.responses.create(
+        model=model_name,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": str(prompt).strip()},
+                {"type": "input_image", "image_url": _image_to_data_uri(image)},
+            ],
+        }],
+        reasoning={"effort": reasoning_effort},
+    )
+    return _extract_responses_text(response)
+
+
+__all__ = [
+    "call_model",
+    "call_openai_responses_model",
+    "extract_text",
+    "pil_image_to_data_uri",
+]

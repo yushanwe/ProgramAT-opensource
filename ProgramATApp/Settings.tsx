@@ -26,6 +26,42 @@ import ModelPickerScreen from './ModelPickerScreen';
 import VideoSummaryTestScreen from './VideoSummaryTestScreen';
 
 const SERVER_URL_KEY = '@server_url';
+const BRAINSTORMING_ENABLED_KEY = '@brainstorming_enabled';
+const BASIC_MODE_ENABLED_KEY = '@basic_mode_enabled';
+const RECORD_SESSION_ARMED_KEY = '@record_session_armed';
+
+export function isBrainstormingEnabled(): Promise<boolean> {
+  return (async () => {
+    try {
+      const saved = await AsyncStorage.getItem(BRAINSTORMING_ENABLED_KEY);
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  })();
+}
+
+export function isBasicModeEnabled(): Promise<boolean> {
+  return (async () => {
+    try {
+      const saved = await AsyncStorage.getItem(BASIC_MODE_ENABLED_KEY);
+      return saved === 'true';
+    } catch {
+      return false;
+    }
+  })();
+}
+
+export function isRecordSessionArmed(): Promise<boolean> {
+  return (async () => {
+    try {
+      const saved = await AsyncStorage.getItem(RECORD_SESSION_ARMED_KEY);
+      return saved === 'true';
+    } catch {
+      return false;
+    }
+  })();
+}
 
 interface SettingsProps {
   appMode: AppMode;
@@ -47,6 +83,16 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
   // Loading state for the Register Device button.
   const [isRegistering, setIsRegistering] = useState(false);
 
+  // Brainstorming setting
+  const [brainstormingEnabled, setBrainstormingEnabled] = useState(true);
+
+  // Basic mode: hides video-attach and brainstorming features for a simplified experience
+  const [basicModeEnabled, setBasicModeEnabled] = useState(false);
+
+  // Record this usage session: arms screen recording for the next Start
+  // Streaming / Take Photo run in the Tools screen.
+  const [recordSessionArmed, setRecordSessionArmed] = useState(false);
+
   // Meta / Ray-Ban (DAT) native iOS bridge. Only one-time device registration
   // is exposed here; the live camera pipeline is driven from the Tools screen.
   const { MetaWearablesModule } = NativeModules as {
@@ -59,6 +105,9 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     setIsConnected(WebSocketService.isConnected());
     setCurrentServerUrl(WebSocketService.getServerUrl());
     loadSavedServerUrl();
+    loadBrainstormingSetting();
+    loadBasicModeSetting();
+    loadRecordSessionArmedSetting();
     const checkConnection = setInterval(() => {
       setIsConnected(WebSocketService.isConnected());
       setCurrentServerUrl(WebSocketService.getServerUrl());
@@ -83,6 +132,54 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     } catch (error) {
       console.error('[Settings] Error loading saved server URL:', error);
     }
+  };
+
+  const loadBrainstormingSetting = async () => {
+    try {
+      const saved = await AsyncStorage.getItem(BRAINSTORMING_ENABLED_KEY);
+      if (saved !== null) {
+        setBrainstormingEnabled(saved === 'true');
+      }
+    } catch (error) {
+      console.error('[Settings] Error loading brainstorming setting:', error);
+    }
+  };
+
+  const handleBrainstormingToggle = async (value: boolean) => {
+    setBrainstormingEnabled(value);
+    await AsyncStorage.setItem(BRAINSTORMING_ENABLED_KEY, value ? 'true' : 'false');
+  };
+
+  const loadBasicModeSetting = async () => {
+    try {
+      const saved = await AsyncStorage.getItem(BASIC_MODE_ENABLED_KEY);
+      if (saved !== null) {
+        setBasicModeEnabled(saved === 'true');
+      }
+    } catch (error) {
+      console.error('[Settings] Error loading basic mode setting:', error);
+    }
+  };
+
+  const handleBasicModeToggle = async (value: boolean) => {
+    setBasicModeEnabled(value);
+    await AsyncStorage.setItem(BASIC_MODE_ENABLED_KEY, value ? 'true' : 'false');
+  };
+
+  const loadRecordSessionArmedSetting = async () => {
+    try {
+      const saved = await AsyncStorage.getItem(RECORD_SESSION_ARMED_KEY);
+      if (saved !== null) {
+        setRecordSessionArmed(saved === 'true');
+      }
+    } catch (error) {
+      console.error('[Settings] Error loading record session setting:', error);
+    }
+  };
+
+  const handleRecordSessionToggle = async (value: boolean) => {
+    setRecordSessionArmed(value);
+    await AsyncStorage.setItem(RECORD_SESSION_ARMED_KEY, value ? 'true' : 'false');
   };
 
   const handleSaveServerUrl = async () => {
@@ -246,7 +343,7 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
     );
   }
 
-  if (showVideoTest) {
+  if (showVideoTest && !basicModeEnabled) {
     return <VideoSummaryTestScreen onBack={() => setShowVideoTest(false)} />;
   }
 
@@ -290,6 +387,104 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
                 accessibilityHint="Double tap to toggle between light and dark themes"
               />
             </View>
+          </View>
+
+          <View style={[
+            styles.settingCard,
+            { backgroundColor: theme.card, borderColor: theme.border },
+            basicModeEnabled && styles.disabledSettingCard,
+          ]}>
+            <View style={styles.settingRow}>
+              <View style={styles.settingInfo}>
+                <Text style={[styles.settingLabel, { color: theme.text }]}>Brainstorming</Text>
+                <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
+                  {basicModeEnabled
+                    ? 'Unavailable in Basic mode'
+                    : brainstormingEnabled ? 'Ask follow-up questions' : 'Direct issue creation'}
+                </Text>
+              </View>
+              <Switch
+                value={brainstormingEnabled && !basicModeEnabled}
+                onValueChange={handleBrainstormingToggle}
+                disabled={basicModeEnabled}
+                trackColor={{ false: theme.border, true: theme.primary }}
+                thumbColor={brainstormingEnabled && !basicModeEnabled ? '#ffffff' : '#f4f3f4'}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Brainstorming toggle"
+                accessibilityHint={basicModeEnabled
+                  ? 'Brainstorming is controlled by Basic mode and cannot be changed here'
+                  : 'Double tap to toggle brainstorming questions'}
+                accessibilityState={{ disabled: basicModeEnabled }}
+              />
+            </View>
+          </View>
+        </View>
+
+        {/* Session Recording Section */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Session Recording</Text>
+
+          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <View style={styles.settingRow}>
+              <View style={styles.settingInfo}>
+                <Text style={[styles.settingLabel, { color: theme.text }]}>Record This Usage Session</Text>
+                <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
+                  {recordSessionArmed
+                    ? 'Armed — tool runs will record your screen'
+                    : 'Off — tool runs will not be recorded'}
+                </Text>
+              </View>
+              <Switch
+                value={recordSessionArmed}
+                onValueChange={handleRecordSessionToggle}
+                trackColor={{ false: theme.border, true: theme.primary }}
+                thumbColor={recordSessionArmed ? '#ffffff' : '#f4f3f4'}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Record this usage session toggle"
+                accessibilityHint="Double tap to arm or disarm screen recording for the next Start Streaming or Take Photo run in Tools"
+              />
+            </View>
+          </View>
+        </View>
+
+        {/* Feature Set Section */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Feature Set</Text>
+
+          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <View style={styles.settingRow}>
+              <View style={styles.settingInfo}>
+                <Text style={[styles.settingLabel, { color: theme.text }]}>
+                  {basicModeEnabled ? 'Basic Mode' : 'Full Mode'}
+                </Text>
+                <Text style={[styles.settingDescription, { color: theme.textSecondary }]}>
+                  {basicModeEnabled ? 'Core features only' : 'All features enabled'}
+                </Text>
+              </View>
+              <Switch
+                value={basicModeEnabled}
+                onValueChange={handleBasicModeToggle}
+                trackColor={{ false: theme.border, true: theme.primary }}
+                thumbColor={basicModeEnabled ? '#ffffff' : '#f4f3f4'}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Basic mode toggle"
+                accessibilityHint="Double tap to switch between the full feature set and a simplified basic feature set"
+              />
+            </View>
+          </View>
+
+          <View style={[styles.modeDescription, { backgroundColor: theme.backgroundSecondary }]}>
+            <Text style={[styles.modeDescriptionTitle, { color: theme.text }]}>
+              {basicModeEnabled ? 'Basic Mode' : 'Full Mode'}
+            </Text>
+            <Text style={[styles.modeDescriptionText, { color: theme.textSecondary }]}>
+              {basicModeEnabled
+                ? '• Video recording and attachment hidden\n• Brainstorming questions disabled'
+                : '• Video recording and attachment available\n• Brainstorming questions available'}
+            </Text>
           </View>
         </View>
 
@@ -540,23 +735,25 @@ export default function Settings({ appMode, onModeChange }: SettingsProps) {
         </View>
 
         {/* Developer Tools Section */}
-        <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Developer Tools</Text>
-          <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-            <Text style={[styles.settingDescription, styles.debugDescription, { color: theme.textSecondary }]}>
-              Test video recording and Gemini summarization without creating a GitHub issue.
-            </Text>
-            <TouchableOpacity
-              style={[styles.debugButton, styles.debugButtonLast, { backgroundColor: theme.primary }]}
-              onPress={() => setShowVideoTest(true)}
-              accessible={true}
-              accessibilityRole="button"
-              accessibilityLabel="Test video summary"
-              accessibilityHint="Opens a screen to record a video and see the Gemini summary">
-              <Text style={styles.debugButtonText}>Test Video Summary</Text>
-            </TouchableOpacity>
+        {!basicModeEnabled && (
+          <View style={styles.section}>
+            <Text style={[styles.sectionTitle, { color: theme.text }]} accessibilityRole="header">Developer Tools</Text>
+            <View style={[styles.settingCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+              <Text style={[styles.settingDescription, styles.debugDescription, { color: theme.textSecondary }]}>
+                Test video recording and Gemini summarization without creating a GitHub issue.
+              </Text>
+              <TouchableOpacity
+                style={[styles.debugButton, styles.debugButtonLast, { backgroundColor: theme.primary }]}
+                onPress={() => setShowVideoTest(true)}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel="Test video summary"
+                accessibilityHint="Opens a screen to record a video and see the Gemini summary">
+                <Text style={styles.debugButtonText}>Test Video Summary</Text>
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
+        )}
 
         {/* App Info Section */}
         <View style={styles.section}>
@@ -636,6 +833,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   settingInfo: {
+    flex: 1,
+    marginRight: 12,
     marginBottom: 12,
   },
   settingLabel: {

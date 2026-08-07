@@ -18,6 +18,7 @@ import {
   Alert,
   AccessibilityInfo,
   NativeModules,
+  Image,
 } from 'react-native';
 import {
   Camera,
@@ -58,11 +59,14 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
   const [isLoading, setIsLoading] = useState(false);
   const [frameCount, setFrameCount] = useState(0);
   const [cameraSource, setCameraSource] = useState<CameraSource>(CameraSource.Phone);
+  const [rayBanPreviewUri, setRayBanPreviewUri] = useState<string | null>(null);
   const cameraRef = useRef<Camera>(null);
   const frameIntervalRef = useRef<any>(null);
+  const rayBanPreviewIntervalRef = useRef<any>(null);
   const errorCountRef = useRef<number>(0);
   const lastErrorTime = useRef<number>(0);
   const frameSkipCounterRef = useRef<number>(0);
+  const captureInFlightRef = useRef<boolean>(false);
   // Mirror of cameraSource so interval/handle closures read the live value.
   const cameraSourceRef = useRef<CameraSource>(CameraSource.Phone);
 
@@ -113,6 +117,10 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
         clearInterval(frameIntervalRef.current);
         frameIntervalRef.current = null;
       }
+      if (rayBanPreviewIntervalRef.current) {
+        clearInterval(rayBanPreviewIntervalRef.current);
+        rayBanPreviewIntervalRef.current = null;
+      }
       if (cameraSourceRef.current === CameraSource.RayBan) {
         // Fire-and-forget on unmount; native still tears down to STOPPED.
         MetaWearablesModule?.stopRayBanStream?.().catch(() => {});
@@ -135,6 +143,37 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
       return null;
     }
   };
+
+  // Poll the latest Ray-Ban frame independently of tool frame streaming, so
+  // there is a visible preview the moment the glasses camera is active —
+  // vision-camera renders the phone preview natively, but Ray-Ban frames only
+  // exist as still snapshots pulled from the native module.
+  useEffect(() => {
+    const isRayBanActive = isCameraActive && cameraSource === CameraSource.RayBan;
+
+    if (!isRayBanActive) {
+      setRayBanPreviewUri(null);
+      if (rayBanPreviewIntervalRef.current) {
+        clearInterval(rayBanPreviewIntervalRef.current);
+        rayBanPreviewIntervalRef.current = null;
+      }
+      return;
+    }
+
+    rayBanPreviewIntervalRef.current = setInterval(async () => {
+      const frame = await captureRayBanFrameJS();
+      if (frame) {
+        setRayBanPreviewUri(frame.base64);
+      }
+    }, 200);
+
+    return () => {
+      if (rayBanPreviewIntervalRef.current) {
+        clearInterval(rayBanPreviewIntervalRef.current);
+        rayBanPreviewIntervalRef.current = null;
+      }
+    };
+  }, [isCameraActive, cameraSource]);
 
   // Loading sound effect for camera operations
   useEffect(() => {
@@ -206,10 +245,20 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
     frameSkipCounterRef.current = 0; // Reset frame skip counter when starting
     setError('');
     
+    // The hosted multiframe experiment needs enough source frames to populate
+    // its short rolling window. Other modes retain the existing cadence.
+    const hostedVideo = ['hosted_multiframe', 'hosted_video'].includes(
+      WebSocketService.getNvidiaStreamingMode(),
+    );
+    const captureIntervalMs =
+      hostedVideo
+        ? WebSocketService.getStreamingFrameIntervalMs() || Config.FRAME_CAPTURE_INTERVAL_MS
+        : Config.FRAME_CAPTURE_INTERVAL_MS;
+
     // Capture frames using configured interval
     frameIntervalRef.current = setInterval(() => {
       captureAndSendFrame();
-    }, Config.FRAME_CAPTURE_INTERVAL_MS);
+    }, captureIntervalMs);
   };
 
   const stopFrameStreaming = () => {
@@ -236,11 +285,24 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
     // Increment frame skip counter
     frameSkipCounterRef.current += 1;
 
-    // Only process every 3rd frame to reduce API calls and prevent disconnects
-    if (frameSkipCounterRef.current % 3 !== 0) {
+    const hostedMultiframe =
+      !inReviewMode && ['hosted_multiframe', 'hosted_video'].includes(
+        WebSocketService.getNvidiaStreamingMode(),
+      );
+
+    // Preserve the existing every-third-frame behavior outside the isolated
+    // hosted experiment. hosted_multiframe sends each capture into its buffer.
+    if (!hostedMultiframe && frameSkipCounterRef.current % 3 !== 0) {
       console.log(`[CameraView] Skipping frame ${frameSkipCounterRef.current} (only sending every 3rd frame)`);
       return;
     }
+
+    // setInterval does not await an async capture. Never overlap takePhoto/read
+    // operations or count concurrent callbacks as additional visual evidence.
+    if (captureInFlightRef.current) {
+      return;
+    }
+    captureInFlightRef.current = true;
 
     try {
       // Acquire the frame from the active source, then send it through the
@@ -259,9 +321,16 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
         width = frame.width;
         height = frame.height;
       } else {
-        const photo = await cameraRef.current!.takePhoto({
-          enableShutterSound: false,
-        });
+        // Hosted video needs temporal coverage, not a 10 MP still every tick.
+        // A preview snapshot avoids the expensive full-resolution photo
+        // capture and produces a much smaller JPEG for the WebSocket.
+        const photo = hostedMultiframe
+          ? await cameraRef.current!.takeSnapshot({
+              quality: Config.HOSTED_VIDEO_SNAPSHOT_QUALITY,
+            })
+          : await cameraRef.current!.takePhoto({
+              enableShutterSound: false,
+            });
 
         // Read the file and convert to base64 using react-native-fs
         const base64Image = await RNFS.readFile(photo.path, 'base64');
@@ -310,6 +379,8 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
         stopFrameStreaming();
         setError('Streaming stopped due to repeated errors. Please try again.');
       }
+    } finally {
+      captureInFlightRef.current = false;
     }
   };
 
@@ -511,9 +582,19 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
               isActive={isCameraActive}
               photo={true}
               video={true}
+              photoQualityBalance="speed"
               accessible={true}
               accessibilityLabel="Camera preview"
               accessibilityHint="Live camera feed displaying what the camera sees"
+            />
+          ) : rayBanPreviewUri ? (
+            <Image
+              source={{ uri: rayBanPreviewUri }}
+              style={styles.camera}
+              resizeMode="cover"
+              accessible={true}
+              accessibilityLabel="Meta Ray-Ban camera preview"
+              accessibilityHint="Live camera feed from your Ray-Ban glasses"
             />
           ) : (
             <View style={styles.cameraPlaceholder}>
@@ -527,7 +608,7 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({ onFrameCaptu
                 style={styles.placeholderSubtext}
                 accessible={true}
                 accessibilityRole="text">
-                Frames stream from your glasses to this tool
+                Waiting for frames from your glasses…
               </Text>
             </View>
           )

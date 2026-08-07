@@ -50,6 +50,24 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
 
+TOOL_NAME = "object_recognition"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = (
+    "For a blind or low-vision user, identify useful visible objects and give a concise spoken "
+    "list with counts and accessible relative positions such as left, center, right, or clock "
+    "direction when helpful. Do not locate objects only by color or nearby people. If no objects "
+    "can be identified clearly, say so."
+)
+TOOL_RUNTIME_INPUT = {
+    "key": "target_object",
+    "label": "Object to find",
+    "placeholder": "Enter an object, such as a water cup",
+    "prompt_instruction": (
+        "The user is specifically looking for: {value}. Focus only on locating that target and "
+        "report whether and where it is visible."
+    ),
+}
+
 # Detection constants
 DEFAULT_CONFIDENCE = 0.5
 MAX_OBJECTS_TO_REPORT = 10

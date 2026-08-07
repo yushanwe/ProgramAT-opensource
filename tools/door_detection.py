@@ -31,6 +31,15 @@ import cv2
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 
+TOOL_NAME = "door_detection"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = (
+    "For a blind or low-vision user, locate the nearest visible door or doorway and give concise "
+    "spoken guidance using clock direction or left/right, approximate distance when supportable, "
+    "and a short movement instruction. Do not rely on color-only or person-based landmarks. "
+    "If no door or doorway is visible, say so."
+)
+
 # Detection constants
 # Balanced threshold for door detection - YoloWorld may produce lower confidence
 # scores for non-COCO objects, and doors can have highly variable appearances

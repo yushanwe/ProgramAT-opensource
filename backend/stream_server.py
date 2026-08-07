@@ -13,10 +13,12 @@ python stream_server.py
 import asyncio
 import ast
 import websockets
+from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 import json
 import base64
 import io
 import logging
+import queue
 import sys
 import threading
 import time
@@ -25,12 +27,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from aiohttp import web, WSMsgType
 from google.cloud import secretmanager
 from github import Github
 import os
-import yaml
 from dotenv import load_dotenv
 
 # Load .env before importing modules that read routing/provider settings at import time.
@@ -63,42 +64,80 @@ STREAMING_MIN_STABLE_CONFIRMATIONS = max(
     1, int(os.getenv('STREAMING_MIN_STABLE_CONFIRMATIONS', '2'))
 )
 
-from model_router import (
+from tool_policy_runtime import (
     STREAMING_EXECUTION_CONTEXT,
     StreamingExecutionCancelled,
     TOOL_EXECUTION_IMAGES,
-    load_capability_profiles,
-    load_global_execution_config,
-    single_stage_llm_call,
+    execute_resolved_tool_policy,
     system_llm_call,
+    transcript_llm_call,
 )
-from litellm_utils import (
-    extract_text,
-)
-from stage_decomposition import build_stage_decomposition_prompt, normalize_stage_plan
+from litellm_utils import extract_text, call_model
+from model_execution import execute_tool_policy
 from module_manager import get_module_manager
 import copilot_db
+from claude_progress import (
+    CHECKLIST_LINE_RE,
+    looks_like_claude_progress_comment,
+    parse_claude_progress_comment,
+    select_claude_progress_comment,
+)
+from implementation_traceability import (
+    build_traceability_response,
+    extract_implementation_summary,
+    get_traceability_record,
+    infer_tool_path,
+    upsert_traceability_record,
+)
 from gemini_summarizer import summarize_entries_sync
 from gemini_live import GeminiLiveManager
 from webrtc_handler import webrtc_offer_handler, cleanup_webrtc_peers
-from video_summarizer import summarize_video
+from video_summarizer import infer_images_with_gemini, summarize_video, ITERATION_PROMPT
+from nvidia_hosted_client import (
+    NvidiaHostedClient,
+    NvidiaHostedError,
+    RollingFrameBuffer,
+    TimedFrame,
+    build_multi_image_request,
+    build_video_request,
+    encode_frames_to_mp4,
+    encode_frames_as_mp4,
+    normalize_image_data_uri,
+    parse_structured_video_result,
+    probe_mp4,
+    uniformly_sample_frames,
+    video_file_data_uri,
+    validate_played_card_event,
+)
 from brainstorming import (
     build_update_brainstorm_context,
     generate_brainstorming_question,
 )
 import re
 import tempfile
+import shutil
 import secrets
 import traceback
+import hashlib
 from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor
+from generated_tool_runtime import (
+    FrameStore,
+    ToolFrame,
+    ToolRuntime,
+    cancel_tasks as cancel_generated_tool_tasks,
+    has_executable_lifecycle,
+    invoke_tool_hook,
+    load_generated_tool,
+)
+from validate_generated_tools import validate_generated_tool_source
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / 'tools'
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from door_detection import main as door_recognition_main
-from model_router_client import copilot_llm_call as tool_copilot_llm_call
+from tool_policy_client import copilot_llm_call as tool_copilot_llm_call
 
 # Configure logging
 logging.basicConfig(
@@ -106,7 +145,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 
 def _normalize_custom_gpt_value(value) -> str:
     """Normalize custom_gpt answers into 'yes', 'no', or ''."""
@@ -193,33 +231,6 @@ def _parse_llm_json_object(raw_text: str) -> Dict[str, Any]:
     return parsed
 
 
-
-def _build_task_stages_markdown(stage_plan: Dict[str, Any]) -> str:
-    lines = [
-        "## Task Stages",
-        "",
-    ]
-
-    stages = stage_plan.get('stages') or []
-    for index, stage in enumerate(stages, start=1):
-        lines.extend([
-            f"### Stage {index}",
-            "",
-            f"- **Goal:** {stage.get('goal') or 'Not specified'}",
-            f"- **Capability:** {stage.get('capability') or 'Not specified'}",
-            "",
-        ])
-
-    return "\n".join(lines).rstrip()
-
-
-def _append_task_stages_to_issue_body(
-    body: str,
-    stage_plan: Dict[str, Any],
-) -> str:
-    stages_section = _build_task_stages_markdown(stage_plan)
-    base = (body or '').rstrip()
-    return f"{base}\n\n{stages_section}\n"
 
 # Configuration
 HOST = os.environ.get('HOST', '127.0.0.1')
@@ -506,6 +517,7 @@ SERVER_CAPABILITIES = _validate_config()
 GITHUB_TOKEN = _fetch_github_token()
 GITHUB_REPO = os.environ.get('GITHUB_REPO', '')  # Format: owner/repo
 PAUSE_DURATION = float(os.environ.get('PAUSE_DURATION', '5.0'))  # seconds to wait before creating issue
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # LiteLLM / Gemini Configuration
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
@@ -555,7 +567,7 @@ pending_ideation = {'active': False, 'parsed_data': None, 'video_summary': ''}
 pending_ideation_http: dict = {}
 
 # Issue iteration tracking - for updating existing issues
-selected_issue = {'number': None, 'title': None, 'mode': 'create'}  # mode can be 'create' or 'update'
+selected_issue = {'number': None, 'title': None, 'mode': 'create', 'brainstorming_enabled': True}  # mode can be 'create' or 'update'
 issue_cache = {'issues': [], 'last_fetch': None, 'cache_duration': 300}  # Cache for 5 minutes
 
 # Store the last received frame for tool execution
@@ -578,31 +590,1442 @@ active_streaming_tools = {}
 # after the tool has been swapped out.
 active_streaming_tasks: dict = {}
 
-EXECUTION_POLICY_PATH = Path(__file__).resolve().parent / 'execution_policy.yaml'
+
+def _tool_source_version(tool_code: str) -> str:
+    return hashlib.sha256((tool_code or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _generated_input_data(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"value": value}
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
+    return {}
+
+
+def _tool_frame(
+    frame_id: int, image, image_base64: str = "", timestamp: Optional[float] = None
+) -> ToolFrame:
+    height, width = image.shape[:2] if image is not None else (0, 0)
+    return ToolFrame(
+        frame_id=frame_id,
+        timestamp=float(timestamp if timestamp is not None else time.time()),
+        image=image,
+        width=int(width),
+        height=int(height),
+        image_base64=image_base64 or "",
+    )
+
+
+def _generated_emit_callback(websocket, client_id: str, owner: Dict[str, Any], mode: str):
+    async def emit(event: Dict[str, Any]) -> bool:
+        if owner.get("cancelled"):
+            logger.info(
+                "[GeneratedToolTransport] emit_rejected client=%s tool=%s session=%s "
+                "request=%s index=%s reason=cancelled mode=%s",
+                client_id,
+                event.get("tool_name"),
+                event.get("session_id"),
+                event.get("request_id"),
+                event.get("result_index"),
+                mode,
+            )
+            return False
+        if mode == "streaming" and active_streaming_tools.get(client_id) is not owner:
+            logger.info(
+                "[GeneratedToolTransport] emit_rejected client=%s tool=%s session=%s "
+                "request=%s index=%s reason=stale_owner mode=%s",
+                client_id,
+                event.get("tool_name"),
+                event.get("session_id"),
+                event.get("request_id"),
+                event.get("result_index"),
+                mode,
+            )
+            return False
+        if mode == "streaming":
+            payload = {
+                "type": "tool_stream_result",
+                "tool_name": event["tool_name"],
+                "result": event["text"],
+                "execution_id": event["result_index"],
+                "partial": event["partial"],
+                "final": event["final"],
+                "replace": event["replace"],
+                "request_id": event["request_id"],
+                "session_id": event["session_id"],
+                "metadata": event["metadata"],
+                "audio": {
+                    "type": "speech",
+                    "text": event["text"],
+                    "rate": 1.0,
+                    "interrupt": False,
+                } if event["text"] else None,
+                "timestamp": datetime.now().isoformat(),
+            }
+            logger.info(
+                "[GeneratedToolTransport] payload_ready client=%s tool=%s session=%s "
+                "request=%s index=%s type=%s partial=%s final=%s replace=%s "
+                "text_length=%s mode=%s frontend_type=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                event["result_index"],
+                "tool_stream_result",
+                event["partial"],
+                event["final"],
+                event["replace"],
+                len(event["text"] or ""),
+                mode,
+                payload["type"],
+            )
+            logger.info(
+                "[GeneratedToolTransport] send_result client=%s tool=%s session=%s "
+                "request=%s index=%s partial=%s final=%s replace=%s text_length=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                event["result_index"],
+                event["partial"],
+                event["final"],
+                event["replace"],
+                len(event["text"] or ""),
+                mode,
+            )
+            await websocket.send(json.dumps(payload))
+            logger.info(
+                "[GeneratedToolTransport] send_result_complete client=%s tool=%s session=%s "
+                "request=%s index=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                event["result_index"],
+                mode,
+            )
+            return True
+        payload = {
+            "type": "tool_progress_result",
+            "invocation_id": event["invocation_id"],
+            "request_id": event["request_id"],
+            "tool_name": event["tool_name"],
+            "result_index": event["result_index"],
+            "text": event["text"],
+            "result": event["text"],
+            "partial": event["partial"],
+            "final": event["final"],
+            "replace": event["replace"],
+            "metadata": event["metadata"],
+            "model": event["metadata"].get("model"),
+            "error": event["metadata"].get("error"),
+            "mode": mode,
+            "timestamp": datetime.now().isoformat(),
+        }
+        logger.info(
+            "[GeneratedToolTransport] payload_ready client=%s tool=%s session=%s "
+            "request=%s index=%s type=%s partial=%s final=%s replace=%s "
+            "text_length=%s mode=%s frontend_type=%s",
+            client_id,
+            event["tool_name"],
+            event["session_id"],
+            event["request_id"],
+            event["result_index"],
+            "tool_progress_result",
+            event["partial"],
+            event["final"],
+            event["replace"],
+            len(event["text"] or ""),
+            mode,
+            payload["type"],
+        )
+        if event["result_index"] == 1:
+            logger.info(
+                "[GeneratedToolTransport] send_started client=%s tool=%s session=%s "
+                "request=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                mode,
+            )
+            await websocket.send(json.dumps({
+                "type": "tool_progress_started",
+                "invocation_id": event["invocation_id"],
+                "tool_name": event["tool_name"],
+                "mode": mode,
+                "timestamp": datetime.now().isoformat(),
+            }))
+            logger.info(
+                "[GeneratedToolTransport] send_started_complete client=%s tool=%s "
+                "session=%s request=%s mode=%s",
+                client_id,
+                event["tool_name"],
+                event["session_id"],
+                event["request_id"],
+                mode,
+            )
+        logger.info(
+            "[GeneratedToolTransport] send_result client=%s tool=%s session=%s "
+            "request=%s index=%s partial=%s final=%s replace=%s text_length=%s mode=%s",
+            client_id,
+            event["tool_name"],
+            event["session_id"],
+            event["request_id"],
+            event["result_index"],
+            event["partial"],
+            event["final"],
+            event["replace"],
+            len(event["text"] or ""),
+            mode,
+        )
+        await websocket.send(json.dumps(payload))
+        logger.info(
+            "[GeneratedToolTransport] send_result_complete client=%s tool=%s session=%s "
+            "request=%s index=%s mode=%s",
+            client_id,
+            event["tool_name"],
+            event["session_id"],
+            event["request_id"],
+            event["result_index"],
+            mode,
+        )
+        return True
+
+    return emit
+
+
+def _build_generated_runtime(
+    websocket,
+    client_id: str,
+    owner: Dict[str, Any],
+    *,
+    tool_name: str,
+    tool_code: str,
+    mode: str,
+    request_id: Optional[str] = None,
+) -> ToolRuntime:
+    return ToolRuntime(
+        client_id=client_id,
+        tool_name=tool_name,
+        tool_version=_tool_source_version(tool_code),
+        session_id=owner.setdefault("generated_session_id", secrets.token_hex(16)),
+        request_id=request_id,
+        frame_store=owner.setdefault("frame_store", FrameStore()),
+        emit_callback=_generated_emit_callback(websocket, client_id, owner, mode),
+        cancelled=lambda: bool(owner.get("cancelled")) or (
+            mode == "streaming" and active_streaming_tools.get(client_id) is not owner
+        ),
+    )
+
+
+def _validated_generated_namespace(tool_name: str, tool_code: str) -> Dict[str, Any]:
+    rel_path = Path("tools") / f"{tool_name}.py"
+    failures = validate_generated_tool_source(tool_code, rel_path)
+    if failures:
+        raise ValueError("Unsafe generated tool source: " + "; ".join(failures))
+    return load_generated_tool(
+        tool_code,
+        filename=str(Path(__file__).parent.parent / rel_path),
+    )
+
+
+async def _initialize_executable_streaming_tool(
+    websocket, client_id: str, tool_config: Dict[str, Any]
+) -> None:
+    tool = tool_config["tool"]
+    tool_code = tool["code"]
+    runtime = _build_generated_runtime(
+        websocket,
+        client_id,
+        tool_config,
+        tool_name=tool["name"],
+        tool_code=tool_code,
+        mode="streaming",
+    )
+    namespace = _validated_generated_namespace(tool["name"], tool_code)
+    tool_config.update({
+        "executable_lifecycle": True,
+        "generated_runtime": runtime,
+        "generated_namespace": namespace,
+        "generated_tasks": set(),
+        "generated_frame_sequence": 0,
+    })
+    input_data = _with_runtime_inputs(
+        _generated_input_data(tool.get("input")),
+        tool.get("runtime_inputs", {}) or {},
+    )
+    parsed_value = None
+    if isinstance(input_data, dict):
+        parsed_value = next(iter((input_data.get('runtime_inputs') or {}).values()), None)
+    logger.info(
+        "[Runtime Input Trace] stage=on_stream_start tool=%s keys=%s value_present=%s value=%s",
+        tool["name"],
+        sorted((input_data or {}).keys()) if isinstance(input_data, dict) else [],
+        str(bool(tool.get("runtime_inputs"))).lower(),
+        _preview_runtime_value(parsed_value),
+    )
+    await invoke_tool_hook(
+        namespace, "on_stream_start", runtime, input_data
+    )
+
+
+async def _dispatch_executable_tool_frame(
+    client_id: str,
+    tool_config: Dict[str, Any],
+    image,
+    image_base64: str,
+    timestamp: float,
+) -> None:
+    if active_streaming_tools.get(client_id) is not tool_config:
+        return
+    if len(tool_config.get("generated_tasks") or ()) >= 8:
+        logger.info(
+            "[GeneratedTool] frame dropped client=%s tool=%s reason=pending_hook_limit",
+            client_id,
+            tool_config["tool"]["name"],
+        )
+        return
+    sequence = int(tool_config.get("generated_frame_sequence", 0)) + 1
+    tool_config["generated_frame_sequence"] = sequence
+    frame = _tool_frame(sequence, image, image_base64, timestamp)
+    runtime = tool_config["generated_runtime"]
+    runtime._frames.add(frame)
+    task = asyncio.create_task(
+        invoke_tool_hook(tool_config["generated_namespace"], "on_frame", runtime, frame)
+    )
+    tasks = tool_config["generated_tasks"]
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    task.add_done_callback(_log_streaming_task_error)
+
+
+async def _stop_executable_streaming_tool(tool_config: Dict[str, Any]) -> None:
+    if not tool_config.get("executable_lifecycle"):
+        return
+    tool_config["cancelled"] = True
+    runtime = tool_config.get("generated_runtime")
+    namespace = tool_config.get("generated_namespace") or {}
+    await cancel_generated_tool_tasks(tool_config.get("generated_tasks") or ())
+    if runtime is not None:
+        try:
+            await invoke_tool_hook(namespace, "on_stream_stop", runtime)
+        except Exception:
+            logger.exception("[GeneratedTool] on_stream_stop failed tool=%s", runtime.tool_name)
+    if runtime is not None:
+        runtime.clear_state()
+        runtime._frames.clear()
+
+
+async def _run_executable_take_photo(
+    websocket,
+    client_id: str,
+    tool_name: str,
+    tool_code: str,
+    image,
+    image_base64: str,
+    input_data: Any,
+) -> tuple[Any, int]:
+    owner: Dict[str, Any] = {"cancelled": False}
+    runtime = _build_generated_runtime(
+        websocket,
+        client_id,
+        owner,
+        tool_name=tool_name,
+        tool_code=tool_code,
+        mode="take-photo",
+    )
+    runtime._frames.add(_tool_frame(1, image, image_base64))
+    namespace = _validated_generated_namespace(tool_name, tool_code)
+    try:
+        parsed_value = None
+        if isinstance(input_data, dict):
+            parsed_value = next(iter((input_data.get("runtime_inputs") or {}).values()), None)
+        logger.info(
+            "[Runtime Input Trace] stage=on_take_photo tool=%s keys=%s value_present=%s value=%s",
+            tool_name,
+            sorted(input_data.keys()) if isinstance(input_data, dict) else [],
+            str(
+                bool(
+                    isinstance(input_data, dict)
+                    and input_data.get("runtime_inputs")
+                )
+            ).lower(),
+            _preview_runtime_value(parsed_value),
+        )
+        result = await invoke_tool_hook(
+            namespace, "on_take_photo", runtime, image, input_data
+        )
+        return result, runtime._emit_index
+    finally:
+        owner["cancelled"] = True
+        runtime.clear_state()
+        runtime._frames.clear()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+STREAMING_EXECUTION_POLICY = os.getenv('STREAMING_EXECUTION_POLICY', 'hosted_video_only').strip()
+if STREAMING_EXECUTION_POLICY != 'hosted_video_only':
+    raise ValueError("STREAMING_EXECUTION_POLICY must be 'hosted_video_only'")
+STREAMING_EXECUTOR = 'hosted_video_streaming'
+NVIDIA_HOSTED_ACTIVE = True
+PROGRAMAT_FFMPEG_BINARY = os.getenv('PROGRAMAT_FFMPEG_BINARY', 'ffmpeg')
+
+NVIDIA_HOSTED_API_BASE_URL = os.getenv(
+    'NVIDIA_HOSTED_API_BASE_URL', 'https://integrate.api.nvidia.com/v1'
+).rstrip('/')
+NVIDIA_HOSTED_API_KEY = os.getenv('NVIDIA_HOSTED_API_KEY', '').strip()
+NVIDIA_HOSTED_MODEL = os.getenv('NVIDIA_HOSTED_MODEL', '').strip()
+NVIDIA_HOSTED_WINDOW_SECONDS = float(os.getenv('NVIDIA_HOSTED_WINDOW_SECONDS', '2'))
+NVIDIA_HOSTED_SAMPLE_FRAMES = int(os.getenv('NVIDIA_HOSTED_SAMPLE_FRAMES', '6'))
+NVIDIA_HOSTED_REQUEST_INTERVAL_SECONDS = float(
+    os.getenv('NVIDIA_HOSTED_REQUEST_INTERVAL_SECONDS', '1.5')
+)
+NVIDIA_HOSTED_MAX_IN_FLIGHT = int(os.getenv('NVIDIA_HOSTED_MAX_IN_FLIGHT', '1'))
+NVIDIA_HOSTED_REQUEST_TIMEOUT_SECONDS = float(
+    os.getenv('HOSTED_VIDEO_REQUEST_TIMEOUT_SECONDS', os.getenv('NVIDIA_HOSTED_REQUEST_TIMEOUT_SECONDS', '60'))
+)
+NVIDIA_HOSTED_MAX_TOKENS = int(os.getenv('NVIDIA_HOSTED_MAX_TOKENS', '80'))
+NVIDIA_VIDEO_BASE_URL = os.getenv('NVIDIA_VIDEO_BASE_URL', NVIDIA_HOSTED_API_BASE_URL).rstrip('/')
+NVIDIA_VIDEO_API_KEY = os.getenv('NVIDIA_VIDEO_API_KEY', NVIDIA_HOSTED_API_KEY).strip()
+NVIDIA_VIDEO_MODEL = os.getenv('NVIDIA_VIDEO_MODEL', NVIDIA_HOSTED_MODEL).strip()
+NVIDIA_VIDEO_INPUT_MODE = os.getenv('NVIDIA_VIDEO_INPUT_MODE', 'base64').strip().lower()
+VIDEO_VLM_PROVIDER = os.getenv('VIDEO_VLM_PROVIDER', 'nvidia').strip().lower()
+VIDEO_GEMINI_MODEL = os.getenv(
+    'VIDEO_GEMINI_MODEL', 'gemini-3.1-flash-lite'
+).strip().removeprefix('gemini/')
+HOSTED_VIDEO_WINDOW_SECONDS = float(os.getenv('HOSTED_VIDEO_WINDOW_SECONDS', '6'))
+HOSTED_VIDEO_INTERVAL_SECONDS = float(os.getenv('HOSTED_VIDEO_INTERVAL_SECONDS', '3'))
+HOSTED_VIDEO_OVERLAP_SECONDS = float(os.getenv('HOSTED_VIDEO_OVERLAP_SECONDS', '3'))
+HOSTED_VIDEO_OUTPUT_FPS = float(os.getenv('HOSTED_VIDEO_OUTPUT_FPS', '4'))
+HOSTED_VIDEO_MAX_WIDTH = int(os.getenv('HOSTED_VIDEO_MAX_WIDTH', '1280'))
+HOSTED_VIDEO_JPEG_QUALITY = int(os.getenv('HOSTED_VIDEO_JPEG_QUALITY', '80'))
+HOSTED_VIDEO_MAX_TOKENS = int(os.getenv('HOSTED_VIDEO_MAX_TOKENS', '256'))
+HOSTED_VIDEO_CAPTURE_INTERVAL_MS = max(
+    250, int(os.getenv('HOSTED_VIDEO_CAPTURE_INTERVAL_MS', '333'))
+)
+HOSTED_VIDEO_MAX_CLIP_BYTES = int(os.getenv('HOSTED_VIDEO_MAX_CLIP_BYTES', '8388608') or '8388608')
+HOSTED_VIDEO_DUPLICATE_COOLDOWN_SECONDS = float(os.getenv('HOSTED_VIDEO_DUPLICATE_COOLDOWN_SECONDS', '5'))
+HOSTED_VIDEO_DEBUG_SAVE = _env_flag('HOSTED_VIDEO_DEBUG_SAVE', False)
+HOSTED_VIDEO_DEBUG_DIR = Path(os.getenv(
+    'HOSTED_VIDEO_DEBUG_DIR', str(Path(__file__).resolve().parent / 'hosted_video_debug')
+))
+HOSTED_VIDEO_LAST_CLIP_PATH = Path(__file__).resolve().parent / 'debug' / 'last_hosted_clip.mp4'
+HOSTED_VIDEO_LAST_METADATA_PATH = HOSTED_VIDEO_LAST_CLIP_PATH.with_suffix('.json')
+HOSTED_GEMINI_LAST_IMAGES_DIR = Path(__file__).resolve().parent / 'debug' / 'last_hosted_images'
+if VIDEO_VLM_PROVIDER not in {'gemini', 'nvidia'}:
+    raise ValueError("VIDEO_VLM_PROVIDER must be 'gemini' or 'nvidia'")
+if not 0 <= HOSTED_VIDEO_OVERLAP_SECONDS < HOSTED_VIDEO_WINDOW_SECONDS:
+    raise ValueError('HOSTED_VIDEO_OVERLAP_SECONDS must be less than the window')
+
+logger.info(
+    "Streaming execution policy: hosted video provider=%s model=%s",
+    VIDEO_VLM_PROVIDER,
+    VIDEO_GEMINI_MODEL if VIDEO_VLM_PROVIDER == 'gemini' else (NVIDIA_VIDEO_MODEL or 'not-configured'),
+)
+hosted_nvidia_client = NvidiaHostedClient(
+    NVIDIA_VIDEO_BASE_URL, NVIDIA_VIDEO_API_KEY, NVIDIA_HOSTED_REQUEST_TIMEOUT_SECONDS,
+)
+
+active_hosted_nvidia_sessions: dict[str, Dict[str, Any]] = {}
+
+
+def _literal_tool_metadata(tool_code: str, name: str) -> Any:
+    """Read a declarative module constant without executing generated code."""
+    try:
+        tree = ast.parse(tool_code or '')
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(target, ast.Name) and target.id == name for target in targets):
+            continue
+        try:
+            return ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _tool_execution_mode(tool_code: str) -> str:
+    # Executable lifecycle hooks are the current contract and can support both
+    # Take Photo and Streaming. Ignore a stale legacy mode declaration when
+    # hooks are present so it cannot route the whole tool into a restrictive
+    # declarative executor.
+    if has_executable_lifecycle(tool_code):
+        return ''
+    value = _literal_tool_metadata(tool_code, 'EXECUTION_MODE')
+    return str(value or '').strip().lower().replace('-', '_')
+
+
+def _validated_temporal_streaming_tool(tool_code: str) -> tuple[str, str]:
+    name = _literal_tool_metadata(tool_code, 'TOOL_NAME')
+    mode = _literal_tool_metadata(tool_code, 'EXECUTION_MODE')
+    prompt = _literal_tool_metadata(tool_code, 'TOOL_PROMPT')
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError('Streaming tool requires a non-empty string TOOL_NAME')
+    if mode != 'hosted_video_streaming':
+        raise ValueError("Streaming tool requires EXECUTION_MODE = 'hosted_video_streaming'")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError('Streaming tool requires a non-empty string TOOL_PROMPT')
+    if len(prompt) > 8000:
+        raise ValueError('Streaming TOOL_PROMPT exceeds 8000 characters')
+    video_config = _literal_tool_metadata(tool_code, 'VIDEO_CONFIG')
+    if not isinstance(video_config, dict):
+        raise ValueError('Temporal streaming tool requires a literal VIDEO_CONFIG dictionary')
+    required = (
+        'window_seconds', 'interval_seconds', 'minimum_span_seconds',
+        'minimum_unique_frames',
+    )
+    missing = [key for key in required if key not in video_config]
+    if missing:
+        raise ValueError(
+            'Temporal VIDEO_CONFIG is missing required settings: ' + ', '.join(missing)
+        )
+    return name.strip(), prompt
+
+
+def _filter_temporal_event(
+    session: Dict[str, Any], content: str, start_time: Any, end_time: Any, event_time: float
+) -> tuple[Optional[str], str]:
+    """Apply only generic sentinel and overlap-aware exact deduplication."""
+    normalized = ' '.join(str(content or '').split())
+    if not normalized:
+        return None, 'empty'
+    output_config = session.get('output_config') or {}
+    sentinel = str(output_config.get('no_event_sentinel', 'NO_EVENT'))
+    if normalized == sentinel:
+        return None, 'no_event'
+    key = normalized.casefold()
+    previous = session.setdefault('last_emitted_events', {}).get(key)
+    try:
+        current_start, current_end = float(start_time), float(end_time)
+    except (TypeError, ValueError):
+        current_start = current_end = None
+    if previous:
+        previous_start, previous_end, emitted_at = previous
+        overlaps = (
+            current_start is not None and previous_start is not None
+            and current_start <= previous_end and previous_start <= current_end
+        )
+        cooldown = float(output_config.get('cooldown_seconds', HOSTED_VIDEO_DUPLICATE_COOLDOWN_SECONDS))
+        if output_config.get('deduplicate', True) and (overlaps or event_time - emitted_at < cooldown):
+            return None, 'duplicate'
+    session['last_emitted_events'][key] = (current_start, current_end, event_time)
+    return normalized, 'accepted'
+
+
+def _generic_temporal_user_result(content: str) -> str:
+    """Return user-facing text and never expose a provider JSON object."""
+    normalized = ' '.join(str(content or '').strip().split())
+    if not normalized:
+        return 'No clear result detected.'
+    candidate = normalized
+    if candidate.startswith('```') and candidate.endswith('```'):
+        candidate = re.sub(r'^```(?:json)?\s*|\s*```$', '', candidate).strip()
+    if candidate.startswith(('{', '[')):
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 'I could not produce a clear result.'
+        if isinstance(parsed, dict):
+            for key in (
+                'result', 'text', 'message', 'answer', 'phrase', 'label',
+                'description',
+            ):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    return ' '.join(value.split())
+        return 'I could not produce a clear result.'
+    return normalized
+
+
+def _apply_played_card_semantic_transition(
+    session: Dict[str, Any], parsed: Dict[str, Any],
+    window_start: Optional[float] = None, window_end: Optional[float] = None,
+) -> tuple[Optional[str], str, str, str]:
+    """Advance the played-card detector; stable/no-event transitions are silent."""
+    previous = str(session.get('semantic_state', 'stable_no_event'))
+    accepted, validation = validate_played_card_event(
+        parsed,
+        float(session.get('output_config', {}).get('confidence_threshold', 0.8)),
+    )
+    if validation == 'stable_no_event':
+        session['semantic_state'] = 'stable_no_event'
+        reason = 'stable_reset' if previous.startswith('played_card:') else 'repeated_no_event'
+        return None, previous, 'stable_no_event', reason
+    if accepted is None:
+        # Uncertain/unreadable evidence cannot reset or advance the detector.
+        return None, previous, 'uncertain', validation
+
+    played = ' '.join(str(parsed.get('played_card', '')).casefold().split())
+    current = f'played_card:{played}'
+    if previous != 'stable_no_event':
+        prior_window = session.get('last_emitted_event_window')
+        overlap_ratio = 1.0
+        if prior_window and window_start is not None and window_end is not None:
+            prior_start, prior_end = prior_window
+            intersection = max(0.0, min(prior_end, window_end) - max(prior_start, window_start))
+            shorter = min(prior_end - prior_start, window_end - window_start)
+            overlap_ratio = intersection / shorter if shorter > 0 else 1.0
+        maximum_overlap = float(
+            session.get('video_config', {}).get('maximum_overlap_for_distinct_event', 0.45)
+        )
+        if previous == current or overlap_ratio > maximum_overlap:
+            reason = (
+                'duplicate_overlapping_event' if previous == current
+                else 'distinct_event_clip_overlaps_previous'
+            )
+            return None, previous, current, reason
+    session['semantic_state'] = current
+    if window_start is not None and window_end is not None:
+        session['last_emitted_event_window'] = (window_start, window_end)
+    return accepted, previous, current, 'new_played_card_transition'
+
+
+def _hosted_safe_error(error: Exception) -> str:
+    """Keep hosted HTTP diagnostics while preventing media payload logging."""
+    return re.sub(
+        r'data:(?:image|video)/[^;,\s]+;base64,[A-Za-z0-9+/=]+',
+        '<base64 media omitted>',
+        str(error),
+    )
+
+
+async def _cleanup_policy_streaming_registration(client_id: str) -> None:
+    task = active_streaming_tasks.pop(client_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+    config = active_streaming_tools.pop(client_id, None)
+    if config is None:
+        return
+    await _stop_executable_streaming_tool(config)
+    for key in ('cascade_task', 'debounce_task'):
+        pending = config.get(key)
+        if pending is not None and not pending.done():
+            pending.cancel()
+    if config.get('gemini_live') and gemini_live_manager:
+        await gemini_live_manager.stop_session(client_id)
+
+
+async def _send_hosted_nvidia_error(
+    websocket,
+    client_id: str,
+    session: Dict[str, Any],
+    error: Exception,
+) -> None:
+    if active_hosted_nvidia_sessions.get(client_id) is not session:
+        return
+    safe_error = _hosted_safe_error(error)
+    message = f"NVIDIA hosted video streaming error: {safe_error}"
+    logger.error(
+        "[NVIDIA Hosted] session error client=%s generation=%s error=%s",
+        client_id,
+        session['generation_token'],
+        safe_error,
+    )
+    try:
+        await websocket.send(json.dumps({
+            'type': 'tool_stream_result',
+            'tool_name': session['tool_name'],
+            'result': message,
+            'status': 'error',
+            'error': safe_error,
+            'mode': 'hosted_video_streaming',
+            'execution_id': session.get('clip_sequence', 0) + 1,
+            'timestamp': datetime.now().isoformat(),
+        }))
+    except Exception as send_error:
+        logger.warning(
+            "[NVIDIA Hosted] could not report error client=%s error=%s",
+            client_id,
+            send_error,
+        )
+
+
+def _save_hosted_video_debug_bundle(
+    session: Dict[str, Any], clip_sequence: int, frames: List[TimedFrame],
+    video_path: Path, metadata: Dict[str, Any],
+) -> Path:
+    """Persist the exact uploaded MP4, exact source JPEGs, and clip metadata."""
+    destination = HOSTED_VIDEO_DEBUG_DIR / (
+        f"{safe_rtsp_path(session['tool_name'])}-{session['generation_token'][:8]}-"
+        f"clip-{clip_sequence:04d}"
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(video_path, destination / 'clip.mp4')
+    frame_metadata = []
+    for index, frame in enumerate(frames):
+        encoded = frame.image_data_uri.split(',', 1)[1] if frame.image_data_uri.startswith('data:') else frame.image_data_uri
+        image_bytes = base64.b64decode(encoded, validate=True)
+        frame_path = destination / f'frame-{index:04d}.jpg'
+        frame_path.write_bytes(image_bytes)
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+        frame_metadata.append({
+            'index': index, 'timestamp_monotonic': frame.timestamp,
+            'width': width, 'height': height, 'bytes': len(image_bytes),
+            'file': frame_path.name,
+        })
+    payload = dict(metadata)
+    payload['source_frames'] = frame_metadata
+    (destination / 'metadata.json').write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8'
+    )
+    return destination
+
+
+def _metadata_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _metadata_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_metadata_json_value(item) for item in value]
+    if hasattr(value, 'model_dump'):
+        return _metadata_json_value(value.model_dump(exclude_none=True))
+    if hasattr(value, 'to_dict'):
+        return _metadata_json_value(value.to_dict())
+    return str(value)
+
+
+def _save_last_hosted_clip(video_path: Path, metadata: Dict[str, Any]) -> Path:
+    """Atomically retain the exact MP4 used by the next hosted request."""
+    destination = HOSTED_VIDEO_LAST_CLIP_PATH
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix('.mp4.tmp')
+    shutil.copyfile(video_path, temporary)
+    os.replace(temporary, destination)
+    metadata_temporary = HOSTED_VIDEO_LAST_METADATA_PATH.with_suffix('.json.tmp')
+    metadata_temporary.write_text(
+        json.dumps(_metadata_json_value(metadata), indent=2, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    os.replace(metadata_temporary, HOSTED_VIDEO_LAST_METADATA_PATH)
+    return destination
+
+
+def _prepare_gemini_ordered_jpegs(frames: List[TimedFrame]) -> List[bytes]:
+    if len(frames) != 4:
+        raise ValueError(f"Gemini hosted streaming requires exactly four frames, got {len(frames)}")
+    prepared = []
+    for frame in frames:
+        encoded = frame.image_data_uri.split(',', 1)[1] if frame.image_data_uri.startswith('data:') else frame.image_data_uri
+        source = Image.open(io.BytesIO(base64.b64decode(encoded, validate=True)))
+        image = ImageOps.exif_transpose(source).convert('RGB')
+        image = ImageOps.fit(image, (720, 1280), method=Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, 'JPEG', quality=HOSTED_VIDEO_JPEG_QUALITY, optimize=True)
+        prepared.append(output.getvalue())
+    return prepared
+
+
+def _gemini_ordered_frame_indices(frame_count: int) -> List[int]:
+    """Select first, two uniform interior, and last real source frames."""
+    if frame_count < 4:
+        raise NvidiaHostedError("Gemini ordered-image input requires at least four frames")
+    last_index = frame_count - 1
+    return [0, round(last_index / 3), round(2 * last_index / 3), last_index]
+
+
+def _save_last_gemini_images(images: List[bytes], metadata: Dict[str, Any]) -> Path:
+    destination = HOSTED_GEMINI_LAST_IMAGES_DIR
+    destination.mkdir(parents=True, exist_ok=True)
+    for index, image in enumerate(images):
+        temporary = destination / f'frame-{index:02d}.jpg.tmp'
+        temporary.write_bytes(image)
+        os.replace(temporary, destination / f'frame-{index:02d}.jpg')
+    metadata_temporary = destination / 'metadata.json.tmp'
+    metadata_temporary.write_text(
+        json.dumps(_metadata_json_value(metadata), indent=2, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    os.replace(metadata_temporary, destination / 'metadata.json')
+    return destination
+
+
+async def _run_hosted_gemini_images(
+    websocket, client_id: str, session: Dict[str, Any], clip_sequence: int,
+    frames: List[TimedFrame], source_indices: List[int],
+) -> None:
+    request_started = time.perf_counter()
+    window_start, window_end = frames[0].timestamp, frames[-1].timestamp
+    model_id = session['model_id']
+    try:
+        preprocessing_started = time.perf_counter()
+        images = await asyncio.to_thread(_prepare_gemini_ordered_jpegs, frames)
+        preprocessing_ms = (time.perf_counter() - preprocessing_started) * 1000
+        input_bytes = sum(len(image) for image in images)
+        frame_metadata = []
+        for index, (frame, image_bytes) in enumerate(zip(frames, images)):
+            encoded = frame.image_data_uri.split(',', 1)[1] if frame.image_data_uri.startswith('data:') else frame.image_data_uri
+            with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as source_image:
+                source_dimensions = list(source_image.size)
+            with Image.open(io.BytesIO(image_bytes)) as sent_image:
+                sent_dimensions = list(sent_image.size)
+            frame_metadata.append({
+                'position': index,
+                'source_index': source_indices[index],
+                'timestamp_monotonic': frame.timestamp,
+                'source_dimensions': source_dimensions,
+                'sent_dimensions': sent_dimensions,
+                'bytes': len(image_bytes),
+                'file': f'frame-{index:02d}.jpg',
+            })
+        metadata = {
+            'clip_sequence': clip_sequence,
+            'provider': 'gemini',
+            'model_id': model_id,
+            'request_time': datetime.now().isoformat(),
+            'window_start_monotonic': window_start,
+            'window_end_monotonic': window_end,
+            'frame_count': 4,
+            'input_bytes': input_bytes,
+            'preprocessing_ms': preprocessing_ms,
+            'frames': frame_metadata,
+        }
+        debug_path = await asyncio.to_thread(_save_last_gemini_images, images, metadata)
+        logger.info(
+            "[Hosted Gemini Images] selected client=%s clip=%s source_indices=%s "
+            "timestamps=%s preprocessing_ms=%.1f input_bytes=%s debug_path=%s",
+            client_id, clip_sequence, source_indices,
+            [round(frame.timestamp, 6) for frame in frames], preprocessing_ms,
+            input_bytes, debug_path,
+        )
+        inference_started = time.perf_counter()
+        output_schema = session.get('output_config', {}).get('schema')
+        content, usage = await infer_images_with_gemini(
+            images, session['prompt'], model_id, output_schema
+        )
+        inference_ms = (time.perf_counter() - inference_started) * 1000
+        usage_value = _metadata_json_value(usage)
+        image_tokens = sum(
+            int(detail.get('token_count', 0))
+            for detail in (usage_value or {}).get('prompt_tokens_details', [])
+            if str(detail.get('modality', '')).rsplit('.', 1)[-1].upper() == 'IMAGE'
+        ) if isinstance(usage_value, dict) else 0
+        logger.info(
+            "[Hosted Gemini Images] response client=%s clip=%s model_id=%s "
+            "gemini_latency_ms=%.1f image_token_usage=%s usage=%s raw_response=%s",
+            client_id, clip_sequence, model_id, inference_ms, image_tokens,
+            json.dumps(usage_value, ensure_ascii=False, sort_keys=True), content,
+        )
+        if active_hosted_nvidia_sessions.get(client_id) is not session:
+            logger.info("[Hosted Gemini Images] stale result dropped client=%s clip=%s", client_id, clip_sequence)
+            return
+        if session.get('output_config', {}).get('schema') == 'played_card_event':
+            try:
+                parsed = parse_structured_video_result(content)
+            except NvidiaHostedError as exc:
+                parsed = None
+                decision = 'invalid_json'
+                accepted = 'I could not determine whether a card was played.'
+                logger.warning(
+                    "[Hosted Gemini Images] parsed client=%s clip=%s parsed=null "
+                    "valid=false validation=%s error=%s",
+                    client_id, clip_sequence, decision, exc,
+                )
+            else:
+                played_message, decision = validate_played_card_event(
+                    parsed,
+                    float(session['output_config'].get('confidence_threshold', 0.8)),
+                    allow_remaining_cards_in_evidence=True,
+                )
+                if decision == 'accepted':
+                    accepted = played_message
+                elif decision == 'stable_no_event':
+                    accepted = 'No card played.'
+                else:
+                    accepted = 'I could not determine whether a card was played.'
+                logger.info(
+                    "[Hosted Gemini Images] parsed client=%s clip=%s parsed=%s validation=%s",
+                    client_id, clip_sequence,
+                    json.dumps(parsed, ensure_ascii=False, sort_keys=True), decision,
+                )
+        else:
+            parsed = None
+            user_result = _generic_temporal_user_result(content)
+            accepted, decision = _filter_temporal_event(
+                session, user_result, window_start, window_end, time.monotonic()
+            )
+            if accepted is None:
+                logger.info(
+                    "[Hosted Gemini Images] result suppressed client=%s clip=%s reason=%s",
+                    client_id, clip_sequence, decision,
+                )
+                return
+        session['latest_forwarded_clip'] = clip_sequence
+        payload = {
+            'type': 'tool_stream_result', 'tool_name': session['tool_name'],
+            'result': accepted,
+            'audio': {'type': 'speech', 'text': accepted, 'rate': 1.0, 'interrupt': False},
+            'mode': 'hosted_video_streaming', 'execution_id': clip_sequence,
+            'clip_sequence': clip_sequence, 'frame_count': 4,
+            'input_format': 'ordered_jpegs', 'provider': 'gemini',
+            'model_id': model_id, 'clip_window_start': window_start,
+            'clip_window_end': window_end, 'timestamp': datetime.now().isoformat(),
+        }
+        logger.info(
+            "[Hosted Gemini Images] final emitted client=%s clip=%s message=%s payload=%s",
+            client_id, clip_sequence, accepted,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        )
+        await websocket.send(json.dumps(payload))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "[Hosted Gemini Images] request failed client=%s clip=%s latency_ms=%.1f error=%s",
+            client_id, clip_sequence, (time.perf_counter() - request_started) * 1000,
+            _hosted_safe_error(exc),
+        )
+        await _send_hosted_nvidia_error(websocket, client_id, session, exc)
+        await _cleanup_hosted_nvidia_session(client_id, reason='request_error')
+
+
+async def _run_hosted_nvidia_clip(
+    websocket,
+    client_id: str,
+    session: Dict[str, Any],
+    clip_sequence: int,
+    frames: List[TimedFrame],
+    source_indices: Optional[List[int]] = None,
+) -> None:
+    if session.get('provider') == 'gemini':
+        await _run_hosted_gemini_images(
+            websocket, client_id, session, clip_sequence, frames,
+            source_indices or list(range(len(frames))),
+        )
+        return
+    request_started = time.perf_counter()
+    encoding_started = request_started
+    window_start = frames[0].timestamp
+    window_end = frames[-1].timestamp
+    source_span = max(0.0, window_end - window_start)
+    source_fps = (len(frames) - 1) / source_span if len(frames) > 1 and source_span > 0 else 0.0
+    # FFmpeg assigns each of N images a 1/fps duration. Use N/span to preserve
+    # wall-clock clip duration without synthesizing duplicate evidence frames.
+    duration_preserving_fps = len(frames) / source_span if source_span > 0 else HOSTED_VIDEO_OUTPUT_FPS
+    encoding_fps = min(HOSTED_VIDEO_OUTPUT_FPS, duration_preserving_fps)
+    encoding_fps = max(0.25, encoding_fps)
+    try:
+        provider = session['provider']
+        model_id = session['model_id']
+        model = session.get('model')
+        if provider != 'nvidia':
+            raise NvidiaHostedError(f"Unsupported MP4 provider {provider!r}")
+        if model is None or not model.supports_video:
+            raise NvidiaHostedError(f"Configured model {model_id!r} is not video-capable")
+        if NVIDIA_VIDEO_INPUT_MODE != 'base64':
+            raise NvidiaHostedError(
+                f"NVIDIA_VIDEO_INPUT_MODE={NVIDIA_VIDEO_INPUT_MODE!r} is unsupported by the "
+                "verified integrate.api.nvidia.com integration; configure 'base64'"
+            )
+        with tempfile.TemporaryDirectory(prefix='programat-hosted-video-') as temp_dir:
+            video_path = Path(temp_dir) / f'clip-{clip_sequence}.mp4'
+            session.setdefault('temporary_paths', set()).add(str(video_path))
+            clip_bytes = await asyncio.to_thread(
+                encode_frames_to_mp4, frames, video_path, encoding_fps,
+                HOSTED_VIDEO_MAX_WIDTH, HOSTED_VIDEO_JPEG_QUALITY,
+                PROGRAMAT_FFMPEG_BINARY,
+            )
+            encoded_metadata = await asyncio.to_thread(
+                probe_mp4, video_path, PROGRAMAT_FFMPEG_BINARY
+            )
+            stream_metadata = (encoded_metadata.get('streams') or [{}])[0]
+            format_metadata = encoded_metadata.get('format') or {}
+            debug_metadata = {
+                'clip_sequence': clip_sequence,
+                'window_start_monotonic': window_start,
+                'window_end_monotonic': window_end,
+                'source_duration_seconds': source_span,
+                'source_frame_count': len(frames),
+                'source_fps': source_fps,
+                'encoding_fps': encoding_fps,
+                'encoded_width': stream_metadata.get('width'),
+                'encoded_height': stream_metadata.get('height'),
+                'encoded_duration_seconds': format_metadata.get('duration'),
+                'encoded_bytes': clip_bytes,
+                'provider': session['provider'],
+                'model_id': session['model_id'],
+                'orientation': (
+                    'portrait' if int(stream_metadata.get('height') or 0) > int(stream_metadata.get('width') or 0)
+                    else 'landscape'
+                ),
+            }
+            last_clip_path = await asyncio.to_thread(
+                _save_last_hosted_clip, video_path, debug_metadata
+            )
+            logger.info(
+                "[Hosted Video] exact last clip and metadata saved client=%s clip=%s "
+                "video_path=%s metadata_path=%s",
+                client_id, clip_sequence, last_clip_path, HOSTED_VIDEO_LAST_METADATA_PATH,
+            )
+            if HOSTED_VIDEO_DEBUG_SAVE:
+                debug_path = await asyncio.to_thread(
+                    _save_hosted_video_debug_bundle, session, clip_sequence,
+                    frames, video_path, debug_metadata,
+                )
+                logger.info(
+                    "[NVIDIA Hosted Video] debug saved client=%s clip=%s path=%s",
+                    client_id, clip_sequence, debug_path,
+                )
+            encoding_ended = time.perf_counter()
+            upload_started = encoding_ended
+            video_data_uri = await asyncio.to_thread(
+                video_file_data_uri, video_path, HOSTED_VIDEO_MAX_CLIP_BYTES
+            )
+            upload_ended = time.perf_counter()
+            request = build_video_request(
+                model_id, session['prompt'], video_data_uri, HOSTED_VIDEO_MAX_TOKENS,
+            )
+            inference_started = time.perf_counter()
+            content, usage = await hosted_nvidia_client.chat_completions_with_metadata(
+                request
+            )
+            inference_ended = time.perf_counter()
+            logger.info(
+                "[Hosted Video] response client=%s clip=%s provider=%s model_id=%s "
+                "latency_ms=%.1f video_token_usage=%s raw_response=%s",
+                client_id, clip_sequence, provider, model_id,
+                (inference_ended - inference_started) * 1000,
+                json.dumps(_metadata_json_value(usage), ensure_ascii=False, sort_keys=True),
+                content,
+            )
+            session['temporary_paths'].discard(str(video_path))
+        encoding_latency_ms = (encoding_ended - encoding_started) * 1000
+        upload_latency_ms = (upload_ended - upload_started) * 1000
+        api_latency_ms = (inference_ended - inference_started) * 1000
+        current = active_hosted_nvidia_sessions.get(client_id)
+        if current is not session:
+            logger.info(
+                "[NVIDIA Hosted] stale result dropped client=%s clip=%s reason=session_stopped_or_replaced",
+                client_id,
+                clip_sequence,
+            )
+            return
+        if clip_sequence <= session['latest_forwarded_clip']:
+            logger.info(
+                "[NVIDIA Hosted] stale result dropped client=%s clip=%s latest_forwarded=%s",
+                client_id,
+                clip_sequence,
+                session['latest_forwarded_clip'],
+            )
+            return
+        if session.get('output_config', {}).get('schema') == 'played_card_event':
+            try:
+                parsed = parse_structured_video_result(content)
+            except NvidiaHostedError as exc:
+                parsed = None
+                decision = 'invalid_json'
+                accepted = 'I could not determine whether a card was played.'
+                logger.warning(
+                    "[Hosted Video] parsed result client=%s clip=%s provider=%s model_id=%s "
+                    "valid=false error=%s final_classification=uncertain",
+                    client_id, clip_sequence, provider, model_id, exc,
+                )
+            else:
+                played_message, decision = validate_played_card_event(
+                    parsed,
+                    float(session['output_config'].get('confidence_threshold', 0.8)),
+                )
+                if decision == 'accepted':
+                    accepted = played_message
+                elif decision == 'stable_no_event':
+                    accepted = 'No card played.'
+                else:
+                    accepted = 'I could not determine whether a card was played.'
+                logger.info(
+                    "[Hosted Video] parsed result client=%s clip=%s provider=%s model_id=%s "
+                    "parsed=%s validation=%s final_classification=%s",
+                    client_id, clip_sequence, provider, model_id,
+                    json.dumps(parsed, ensure_ascii=False, sort_keys=True), decision,
+                    ('played_card' if decision == 'accepted' else
+                     'no_event' if decision == 'stable_no_event' else 'uncertain'),
+                )
+        else:
+            parsed = None
+            user_result = _generic_temporal_user_result(content)
+            accepted, decision = _filter_temporal_event(
+                session, user_result, window_start, window_end, time.monotonic()
+            )
+        if accepted is None:
+            logger.info(
+                "[NVIDIA Hosted Video] result suppressed client=%s clip=%s reason=%s",
+                client_id, clip_sequence, decision,
+            )
+            return
+        session['latest_forwarded_clip'] = clip_sequence
+        emitted_at = time.monotonic()
+        end_to_end_ms = (emitted_at - window_end) * 1000
+        logger.info(
+            "[Hosted Video] result client=%s generation=%s clip=%s provider=%s model_id=%s format=base64_mp4 "
+            "frame_count=%s window_start=%.6f window_end=%.6f clip_bytes=%s "
+            "source_fps=%.3f encoded_resolution=%sx%s encoded_duration=%s "
+            "encoding_ms=%.1f upload_ms=%.1f inference_ms=%.1f total_from_clip_end_ms=%.1f",
+            client_id,
+            session['generation_token'],
+            clip_sequence,
+            provider,
+            model_id,
+            len(frames),
+            window_start, window_end, clip_bytes, source_fps,
+            stream_metadata.get('width'), stream_metadata.get('height'),
+            format_metadata.get('duration'), encoding_latency_ms,
+            upload_latency_ms, api_latency_ms, end_to_end_ms,
+        )
+        response_payload = {
+            'type': 'tool_stream_result',
+            'tool_name': session['tool_name'],
+            'result': accepted,
+            'audio': {
+                'type': 'speech',
+                'text': accepted,
+                'rate': 1.0,
+                'interrupt': False,
+            },
+            'mode': 'hosted_video_streaming',
+            'execution_id': clip_sequence,
+            'clip_sequence': clip_sequence,
+            'frame_count': len(frames),
+            'input_format': 'base64_mp4',
+            'provider': provider,
+            'model_id': model_id,
+            'clip_window_start': window_start,
+            'clip_window_end': window_end,
+            'timestamp': datetime.now().isoformat(),
+        }
+        logger.info(
+            "[Hosted Video] final emitted message client=%s clip=%s provider=%s model_id=%s message=%s payload=%s",
+            client_id, clip_sequence, provider, model_id, accepted,
+            json.dumps(response_payload, ensure_ascii=False, sort_keys=True),
+        )
+        await websocket.send(json.dumps(response_payload))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        safe_error = _hosted_safe_error(exc)
+        logger.error(
+            "[NVIDIA Hosted] request failed client=%s clip=%s latency_ms=%.1f error=%s",
+            client_id,
+            clip_sequence,
+            (time.perf_counter() - request_started) * 1000,
+            safe_error,
+        )
+        await _send_hosted_nvidia_error(websocket, client_id, session, exc)
+        await _cleanup_hosted_nvidia_session(client_id, reason='request_error')
+
+
+async def _hosted_nvidia_scheduler(
+    websocket,
+    client_id: str,
+    session: Dict[str, Any],
+) -> None:
+    try:
+        provider = session['provider']
+        if provider == 'nvidia':
+            model = await hosted_nvidia_client.select_model(NVIDIA_VIDEO_MODEL)
+            if not model.supports_video:
+                raise NvidiaHostedError(
+                    f"Configured NVIDIA_VIDEO_MODEL {model.id!r} does not support MP4 video"
+                )
+            session['model'] = model
+            session['model_id'] = model.id
+        else:
+            session['model'] = None
+            session['model_id'] = VIDEO_GEMINI_MODEL
+        if active_hosted_nvidia_sessions.get(client_id) is not session:
+            return
+        session['input_format'] = 'ordered_jpegs' if provider == 'gemini' else 'base64_mp4'
+        logger.info(
+            "[Hosted Video] session ready client=%s generation=%s provider=%s model_id=%s format=%s",
+            client_id,
+            session['generation_token'],
+            provider,
+            session['model_id'],
+            session['input_format'],
+        )
+        next_due = time.monotonic() + session['interval_seconds']
+        while active_hosted_nvidia_sessions.get(client_id) is session:
+            delay = next_due - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            next_due = time.monotonic() + session['interval_seconds']
+            request_task = session.get('request_task')
+            if request_task is not None and not request_task.done():
+                session['skipped_intervals'] += 1
+                logger.info(
+                    "[Hosted Video] interval coalesced client=%s reason=request_in_flight "
+                    "action=process_newest_immediately_after_completion skipped=%s",
+                    client_id,
+                    session['skipped_intervals'],
+                )
+                await asyncio.gather(request_task, return_exceptions=True)
+                if active_hosted_nvidia_sessions.get(client_id) is not session:
+                    return
+            now = time.monotonic()
+            available = [
+                frame for frame in session['frame_buffer'].snapshot(now)
+                if frame.timestamp >= now - session['window_seconds']
+            ]
+            if not available:
+                session['skipped_intervals'] += 1
+                logger.info(
+                    "[NVIDIA Hosted] interval skipped client=%s reason=no_frames skipped=%s",
+                    client_id,
+                    session['skipped_intervals'],
+                )
+                continue
+            available_span = max(0.0, available[-1].timestamp - available[0].timestamp)
+            minimum_span = float(session.get('minimum_span_seconds', 5))
+            minimum_frames = int(session.get('minimum_unique_frames', 12))
+            if len(available) < minimum_frames or available_span < minimum_span:
+                session['skipped_intervals'] += 1
+                logger.info(
+                    "[NVIDIA Hosted] interval skipped client=%s reason=window_not_ready "
+                    "unique_frames=%s minimum_unique_frames=%s span_seconds=%.3f "
+                    "minimum_span_seconds=%.3f skipped=%s",
+                    client_id, len(available), minimum_frames, available_span,
+                    minimum_span, session['skipped_intervals'],
+                )
+                continue
+            if provider == 'gemini':
+                source_indices = _gemini_ordered_frame_indices(len(available))
+                frames = [available[index] for index in source_indices]
+            else:
+                target_frames = max(2, round(session['window_seconds'] * HOSTED_VIDEO_OUTPUT_FPS))
+                frames = uniformly_sample_frames(available, target_frames)
+                source_indices = [available.index(frame) for frame in frames]
+            session['clip_sequence'] += 1
+            clip_sequence = session['clip_sequence']
+            logger.info(
+                "[NVIDIA Hosted] request started client=%s generation=%s clip=%s "
+                "unique_available_frames=%s selected_frames=%s oldest_ts=%.6f newest_ts=%.6f "
+                "source_span_seconds=%.3f source_fps=%.3f source_indices=%s timestamps=%s",
+                client_id,
+                session['generation_token'],
+                clip_sequence,
+                len(available), len(frames),
+                frames[0].timestamp,
+                frames[-1].timestamp,
+                max(0.0, frames[-1].timestamp - frames[0].timestamp),
+                ((len(available) - 1) / (available[-1].timestamp - available[0].timestamp))
+                if len(available) > 1 and available[-1].timestamp > available[0].timestamp else 0.0,
+                source_indices, [round(frame.timestamp, 6) for frame in frames],
+            )
+            session['request_task'] = asyncio.create_task(
+                _run_hosted_nvidia_clip(
+                    websocket, client_id, session, clip_sequence, frames, source_indices
+                )
+            )
+            next_due = time.monotonic() + session['interval_seconds']
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await _send_hosted_nvidia_error(websocket, client_id, session, exc)
+        await _cleanup_hosted_nvidia_session(client_id, reason='scheduler_error')
+
+
+async def _start_hosted_nvidia_session(
+    websocket,
+    client_id: str,
+    data: Dict[str, Any],
+) -> None:
+    if VIDEO_VLM_PROVIDER == 'gemini' and not GEMINI_API_KEY:
+        raise ValueError('GEMINI_API_KEY is required when VIDEO_VLM_PROVIDER=gemini')
+    if VIDEO_VLM_PROVIDER == 'nvidia' and not NVIDIA_VIDEO_API_KEY:
+        raise ValueError('NVIDIA_VIDEO_API_KEY is required when VIDEO_VLM_PROVIDER=nvidia')
+    if VIDEO_VLM_PROVIDER == 'nvidia' and not NVIDIA_VIDEO_MODEL:
+        raise ValueError('NVIDIA_VIDEO_MODEL is required when VIDEO_VLM_PROVIDER=nvidia')
+    if VIDEO_VLM_PROVIDER == 'nvidia' and NVIDIA_VIDEO_INPUT_MODE != 'base64':
+        raise ValueError(
+            "The verified NVIDIA endpoint requires NVIDIA_VIDEO_INPUT_MODE=base64"
+        )
+    await _cleanup_hosted_nvidia_session(client_id, reason='replaced')
+    tool_code = resolve_tool_code_for_execution(
+        tool_name=data.get('tool_name', ''), tool_path=data.get('tool_path', ''),
+        client_tool_code=data.get('tool_code', ''),
+        client_tool_source=data.get('tool_source', ''),
+    )
+    tool_name, tool_prompt = _validated_temporal_streaming_tool(tool_code)
+    video_config = _literal_tool_metadata(tool_code, 'VIDEO_CONFIG') or {}
+    output_config = _literal_tool_metadata(tool_code, 'OUTPUT_CONFIG') or {}
+    if not isinstance(video_config, dict) or not isinstance(output_config, dict):
+        raise ValueError('VIDEO_CONFIG and OUTPUT_CONFIG must be literal dictionaries')
+    window_seconds = float(video_config.get('window_seconds', HOSTED_VIDEO_WINDOW_SECONDS))
+    interval_seconds = float(video_config.get('interval_seconds', HOSTED_VIDEO_INTERVAL_SECONDS))
+    overlap_seconds = float(video_config.get('overlap_seconds', HOSTED_VIDEO_OVERLAP_SECONDS))
+    minimum_span_seconds = float(video_config.get('minimum_span_seconds', 5))
+    minimum_unique_frames = int(video_config.get('minimum_unique_frames', 12))
+    if (window_seconds <= 0 or interval_seconds <= 0
+            or not 0 <= overlap_seconds < window_seconds
+            or not 0 < minimum_span_seconds <= window_seconds
+            or minimum_unique_frames < 2):
+        raise ValueError('Invalid hosted-video window, interval, or overlap configuration')
+    max_buffer_frames = max(
+        20,
+        int((window_seconds + overlap_seconds + 2) * 30),
+    )
+    session = {
+        'generation_token': secrets.token_hex(16),
+        'provider': VIDEO_VLM_PROVIDER,
+        'model_id': VIDEO_GEMINI_MODEL if VIDEO_VLM_PROVIDER == 'gemini' else NVIDIA_VIDEO_MODEL,
+        'tool_name': tool_name,
+        'prompt': tool_prompt,
+        'video_config': video_config,
+        'output_config': output_config,
+        'window_seconds': window_seconds,
+        'interval_seconds': interval_seconds,
+        'overlap_seconds': overlap_seconds,
+        'minimum_span_seconds': minimum_span_seconds,
+        'minimum_unique_frames': minimum_unique_frames,
+        'frame_buffer': RollingFrameBuffer(
+            window_seconds + overlap_seconds + 2,
+            max_buffer_frames,
+        ),
+        'scheduler_task': None,
+        'request_task': None,
+        'model': None,
+        'input_format': None,
+        'clip_sequence': 0,
+        'latest_forwarded_clip': 0,
+        'skipped_intervals': 0,
+        'stopping': False,
+        'temporary_paths': set(),
+        'last_emitted_events': {},
+        'received_frame_count': 0,
+        'first_frame_at': None,
+        'last_frame_at': None,
+    }
+    if output_config.get('schema') == 'played_card_event':
+        session['semantic_state'] = 'stable_no_event'
+        session['last_emitted_event_window'] = None
+    active_hosted_nvidia_sessions[client_id] = session
+    session['scheduler_task'] = asyncio.create_task(
+        _hosted_nvidia_scheduler(websocket, client_id, session)
+    )
+    logger.info(
+        "[Hosted Video] session started client=%s generation=%s provider=%s model_id=%s "
+        "execution_mode=hosted_video_streaming hosted_runtime_only=true rtsp=false mediamtx=false "
+        "gpu_required=false cascade=false clip=false "
+        "window_seconds=%s interval_seconds=%s overlap_seconds=%s",
+        client_id,
+        session['generation_token'],
+        session['provider'], session['model_id'],
+        window_seconds, interval_seconds, overlap_seconds,
+    )
+    await websocket.send(json.dumps({
+        'type': 'streaming_started',
+        'tool_name': session['tool_name'],
+        'mode': 'hosted_video_streaming',
+        'provider': session['provider'],
+        'model_id': session['model_id'],
+        'timestamp': datetime.now().isoformat(),
+    }))
+
+
+async def _offer_hosted_nvidia_frame(
+    client_id: str,
+    image_base64: str,
+    _source_timestamp: float,
+) -> None:
+    session = active_hosted_nvidia_sessions.get(client_id)
+    if session is None:
+        return
+    now = time.monotonic()
+    session['frame_buffer'].add(image_base64, now)
+    session['received_frame_count'] += 1
+    session['first_frame_at'] = session['first_frame_at'] or now
+    session['last_frame_at'] = now
+    if session['received_frame_count'] % 10 == 0:
+        elapsed = now - session['first_frame_at']
+        incoming_fps = (session['received_frame_count'] - 1) / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "[NVIDIA Hosted Video] incoming transport client=%s frames=%s elapsed_seconds=%.3f "
+            "true_incoming_fps=%.3f",
+            client_id, session['received_frame_count'], elapsed, incoming_fps,
+        )
+
+
+async def _cleanup_hosted_nvidia_session(client_id: str, reason: str) -> None:
+    session = active_hosted_nvidia_sessions.pop(client_id, None)
+    if session is None:
+        return
+    session['stopping'] = True
+    logger.info(
+        "[NVIDIA Hosted] cleanup started client=%s generation=%s reason=%s",
+        client_id,
+        session['generation_token'],
+        reason,
+    )
+    current_task = asyncio.current_task()
+    tasks = [session.get('scheduler_task'), session.get('request_task')]
+    tasks_to_wait = []
+    for task in tasks:
+        if task is not None and task is not current_task and not task.done():
+            task.cancel()
+            tasks_to_wait.append(task)
+    if tasks_to_wait:
+        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    session['frame_buffer'].clear()
+    session.get('temporary_paths', set()).clear()
+    logger.info(
+        "[NVIDIA Hosted] cleanup finished client=%s generation=%s reason=%s skipped_intervals=%s",
+        client_id,
+        session['generation_token'],
+        reason,
+        session['skipped_intervals'],
+    )
+
+
+async def _dispatch_active_streaming_frame(
+    websocket,
+    client_id: str,
+    image,
+    image_base64: str,
+    frame_timestamp: float | None = None,
+) -> asyncio.Task | None:
+    """Dispatch an incoming frame to the unchanged tool-policy scheduler."""
+    if image is None or client_id not in active_streaming_tools:
+        return None
+    task = asyncio.create_task(
+        schedule_streaming_frame(websocket, client_id, image, image_base64)
+    )
+    active_streaming_tasks[client_id] = task
+    task.add_done_callback(_log_streaming_task_error)
+    return task
+
 _clip_encoders = {}
 _clip_encoder_load_lock = threading.Lock()
 _clip_ready_models = set()
 
 
-def load_streaming_frame_selector_config(path=EXECUTION_POLICY_PATH) -> Dict[str, Any]:
-    """Load and validate streaming-only frame selector configuration."""
-    with Path(path).open('r', encoding='utf-8') as handle:
-        root = yaml.safe_load(handle) or {}
-    selector = (root.get('streaming') or {}).get('frame_selector') or {}
-    if selector.get('implementation') != 'clip':
-        raise ValueError("streaming.frame_selector.implementation must be 'clip'")
-    model = str(selector.get('model') or '').strip()
-    threshold = float(selector.get('similarity_threshold'))
+def load_streaming_frame_selector_config(path=None) -> Dict[str, Any]:
+    """Return the unchanged streaming frame-selection settings."""
+    del path
+    model = 'openai/clip-vit-base-patch32'
+    threshold = 0.985
     last_sent_threshold = float(os.getenv(
         'STREAMING_MAX_SIMILARITY_TO_LAST_SENT',
         os.getenv(
             'MAX_SIMILARITY_TO_LAST_SENT',
-            selector.get(
-                'max_similarity_to_last_sent', STREAMING_MAX_SIMILARITY_TO_LAST_SENT
-            ),
+            STREAMING_MAX_SIMILARITY_TO_LAST_SENT,
         ),
     ))
-    max_skip_frames = int(selector.get('max_skip_frames'))
+    max_skip_frames = 20
     if not model:
         raise ValueError('streaming.frame_selector.model is required')
     if not -1.0 <= threshold <= 1.0:
@@ -747,6 +2170,10 @@ yolo_model_cache = {}
 # Format: {client_id: {'process': subprocess, 'session_id': str, 'task': asyncio.Task}}
 active_copilot_streams = {}
 
+# Opt-in progressive policy invocations, keyed by (client_id, tool_name).
+# Provider work may outlive cancellation, so every send also checks record identity.
+active_progressive_invocations = {}
+
 # Issues awaiting Copilot PR creation - tracks issues we're monitoring for PR creation
 # Format: {issue_number: {'created_at': datetime, 'websocket': websocket, 'client_id': str}}
 pending_copilot_issues = {}
@@ -763,22 +2190,7 @@ def _response_field_only(result: Any) -> str:
         if value is None:
             return ''
         if isinstance(value, str):
-            text = value.strip()
-            parsed = None
-            if len(text) <= 1_000_000 and text.startswith('{') and text.endswith('}'):
-                for parser in (json.loads, ast.literal_eval):
-                    try:
-                        candidate = parser(text)
-                    except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
-                        continue
-                    if isinstance(candidate, dict) and 'response' in candidate:
-                        parsed = candidate
-                        break
-            if parsed is None:
-                return value
-            logger.debug("Unwrapped serialized execution result at mobile boundary")
-            value = parsed
-            continue
+            return value.strip()
         if isinstance(value, (int, float, bool)):
             return str(value)
 
@@ -861,23 +2273,670 @@ def _log_final_tool_response(_tool_name: str, response_data: Dict[str, Any]) -> 
     logger.info("[FINAL SPOKEN RESPONSE]\n%s", spoken)
 
 
-def _single_stage_tool_result(
-    tool_name: str, task: str, image, streaming: bool = False,
-    metadata: Optional[Dict[str, Any]] = None,
-):
-    """Return a direct default-model result when planning is disabled."""
-    config = load_global_execution_config()
-    if config['planner_enabled']:
-        return None
-    request_text = str(task or '').strip() or str(tool_name).replace('_', ' ')
-    logger.info("[Execution Policy] planner disabled -> single-stage execution")
-    call_metadata = dict(metadata or {})
-    call_metadata.update({'streaming': streaming, 'tool_name': tool_name})
-    return single_stage_llm_call(
-        task=request_text,
-        images=[image],
-        metadata=call_metadata,
+def _take_photo_tool_prompt(tool_name: str, tool_code: str) -> str:
+    """Read the Copilot-authored TOOL_PROMPT without executing generated tool code."""
+    prompt = _literal_tool_metadata(tool_code, 'TOOL_PROMPT')
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+    logger.debug("Could not extract TOOL_PROMPT from %s", tool_name, exc_info=True)
+    raise ValueError(
+        f"Take-photo tool {tool_name!r} has no string TOOL_PROMPT; regenerate the tool "
+        "with the unified take-photo contract."
     )
+
+
+_RUNTIME_INPUT_MAX_LENGTH = 200
+
+
+def _preview_runtime_value(value: Any, limit: int = 80) -> str:
+    if not isinstance(value, str):
+        return 'none'
+    normalized = " ".join(value.split()).strip()
+    if not normalized:
+        return 'none'
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + '...'
+
+
+def _log_runtime_prompt_trace(
+    stage: str,
+    tool_name: str,
+    prompt: str,
+    runtime_inputs: Optional[Dict[str, str]] = None,
+    runtime_input_definition: Optional[Dict[str, str]] = None,
+) -> None:
+    runtime_key = (
+        runtime_input_definition.get('key')
+        if isinstance(runtime_input_definition, dict)
+        else None
+    )
+    runtime_value = (
+        runtime_inputs.get(runtime_key)
+        if runtime_key and isinstance(runtime_inputs, dict)
+        else None
+    )
+    runtime_instruction_present = False
+    if runtime_key and runtime_value and runtime_input_definition:
+        expected_instruction = runtime_input_definition['prompt_instruction'].replace(
+            '{value}', runtime_value
+        )
+        runtime_instruction_present = expected_instruction in prompt
+    logger.info(
+        "[Runtime Input Prompt] stage=%s tool=%s runtime_key=%s runtime_value=%s "
+        "value_present=%s prompt_length=%s runtime_instruction_present=%s prompt_preview=%s",
+        stage,
+        tool_name,
+        runtime_key or 'none',
+        _preview_runtime_value(runtime_value),
+        str(bool(runtime_value)).lower(),
+        len(prompt or ''),
+        str(runtime_instruction_present).lower(),
+        json.dumps((prompt or '')[:240], ensure_ascii=False),
+    )
+
+
+def _sanitize_runtime_input_definition(raw: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(raw, dict):
+        return None
+    required_fields = (
+        'key',
+        'label',
+        'placeholder',
+        'prompt_instruction',
+    )
+    normalized: Dict[str, str] = {}
+    for field in required_fields:
+        value = raw.get(field)
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        normalized[field] = stripped
+    if '{value}' not in normalized['prompt_instruction']:
+        return None
+    return normalized
+
+
+def _tool_runtime_input_definition(tool_code: str) -> Optional[Dict[str, str]]:
+    for metadata_name in ('TOOL_RUNTIME_INPUT', 'runtime_input', 'RUNTIME_INPUT'):
+        normalized = _sanitize_runtime_input_definition(
+            _literal_tool_metadata(tool_code, metadata_name)
+        )
+        if normalized:
+            return normalized
+    return None
+
+
+def _sanitize_runtime_inputs(
+    runtime_inputs: Any, runtime_input_definition: Optional[Dict[str, str]]
+) -> Dict[str, str]:
+    if not runtime_input_definition or not isinstance(runtime_inputs, dict):
+        return {}
+    declared_key = runtime_input_definition['key']
+    raw_value = runtime_inputs.get(declared_key)
+    if not isinstance(raw_value, str):
+        return {}
+    normalized = " ".join(raw_value.split()).strip()
+    if not normalized or len(normalized) > _RUNTIME_INPUT_MAX_LENGTH:
+        return {}
+    return {declared_key: normalized}
+
+
+def _effective_tool_prompt(
+    tool_name: str,
+    tool_code: str,
+    runtime_inputs: Any = None,
+) -> str:
+    prompt = _take_photo_tool_prompt(tool_name, tool_code)
+    runtime_input_definition = _tool_runtime_input_definition(tool_code)
+    sanitized_runtime_inputs = _sanitize_runtime_inputs(
+        runtime_inputs, runtime_input_definition
+    )
+    if not runtime_input_definition or not sanitized_runtime_inputs:
+        _log_runtime_prompt_trace(
+            'effective_prompt',
+            tool_name,
+            prompt,
+            sanitized_runtime_inputs,
+            runtime_input_definition,
+        )
+        return prompt
+    declared_key = runtime_input_definition['key']
+    value = sanitized_runtime_inputs.get(declared_key)
+    if not value:
+        _log_runtime_prompt_trace(
+            'effective_prompt',
+            tool_name,
+            prompt,
+            sanitized_runtime_inputs,
+            runtime_input_definition,
+        )
+        return prompt
+    instruction = runtime_input_definition['prompt_instruction'].replace('{value}', value)
+    effective_prompt = f"{prompt}\n\n{instruction}"
+    _log_runtime_prompt_trace(
+        'effective_prompt',
+        tool_name,
+        effective_prompt,
+        sanitized_runtime_inputs,
+        runtime_input_definition,
+    )
+    return effective_prompt
+
+
+def _tool_runtime_input_metadata(tool_code: str) -> Optional[Dict[str, str]]:
+    definition = _tool_runtime_input_definition(tool_code)
+    if not definition:
+        return None
+    return {
+        'key': definition['key'],
+        'label': definition['label'],
+        'placeholder': definition['placeholder'],
+        'prompt_instruction': definition['prompt_instruction'],
+    }
+
+
+def _parse_runtime_inputs_from_request(
+    data: Dict[str, Any], tool_code: str
+) -> Dict[str, str]:
+    parsed = _sanitize_runtime_inputs(
+        data.get('runtime_inputs'),
+        _tool_runtime_input_definition(tool_code),
+    )
+    preview_value = next(iter(parsed.values()), None) if parsed else None
+    logger.info(
+        "[Runtime Input Trace] stage=backend_parse tool=%s keys=%s value_present=%s value=%s",
+        data.get('tool_name', 'unknown'),
+        sorted(parsed.keys()),
+        str(bool(parsed)).lower(),
+        _preview_runtime_value(preview_value),
+    )
+    return parsed
+
+
+def _inject_runtime_input_metadata(tool_record: Dict[str, Any]) -> Dict[str, Any]:
+    code = tool_record.get('code')
+    if not isinstance(code, str) or not code.strip():
+        return tool_record
+    runtime_input = _tool_runtime_input_metadata(code)
+    if not runtime_input:
+        return tool_record
+    enriched = dict(tool_record)
+    enriched['runtime_input'] = runtime_input
+    return enriched
+
+
+def _log_runtime_input_tool_metadata(source: str, tool_record: Dict[str, Any]) -> None:
+    tool_id = str(
+        tool_record.get('path')
+        or tool_record.get('name')
+        or 'unknown'
+    )
+    enabled = isinstance(tool_record.get('runtime_input'), dict)
+    metadata = tool_record.get('runtime_input') if enabled else 'none'
+    logger.info(
+        "[Runtime Input] source=%s tool=%s enabled=%s",
+        source,
+        tool_id,
+        str(enabled).lower(),
+    )
+    logger.info(
+        "[Runtime Input Metadata] tool=%s metadata=%s",
+        tool_id,
+        json.dumps(metadata, ensure_ascii=False) if enabled else 'none',
+    )
+
+
+def _log_runtime_input_tool_source(
+    tool_record: Dict[str, Any],
+    source_mode: str,
+    repo_name: str,
+    branch_name: str = '',
+    pr_number: Optional[int] = None,
+    commit_sha: str = '',
+) -> None:
+    tool_id = str(tool_record.get('path') or tool_record.get('name') or 'unknown')
+    declared = isinstance(tool_record.get('runtime_input'), dict)
+    logger.info(
+        "[Runtime Input Source] tool=%s source=%s repo=%s branch=%s pr=%s sha=%s declared=%s",
+        tool_id,
+        source_mode,
+        repo_name or 'unknown',
+        branch_name or '',
+        '' if pr_number is None else str(pr_number),
+        commit_sha or '',
+        str(declared).lower(),
+    )
+
+
+def _with_runtime_inputs(input_data: Any, runtime_inputs: Dict[str, str]) -> Any:
+    if not runtime_inputs:
+        return input_data
+    if isinstance(input_data, dict):
+        merged = dict(input_data)
+        merged.update(runtime_inputs)
+        merged['runtime_inputs'] = dict(runtime_inputs)
+        logger.info(
+            "[Runtime Input Trace] stage=generated_handler_merge shape=dict keys=%s runtime_keys=%s runtime_values=%s",
+            sorted(merged.keys()),
+            sorted(runtime_inputs.keys()),
+            json.dumps(
+                {key: _preview_runtime_value(value) for key, value in runtime_inputs.items()},
+                ensure_ascii=False,
+            ),
+        )
+        return merged
+    merged = {
+        'value': input_data,
+        **dict(runtime_inputs),
+        'runtime_inputs': dict(runtime_inputs),
+    }
+    logger.info(
+        "[Runtime Input Trace] stage=generated_handler_merge shape=wrapped runtime_keys=%s runtime_values=%s",
+        sorted(runtime_inputs.keys()),
+        json.dumps(
+            {key: _preview_runtime_value(value) for key, value in runtime_inputs.items()},
+            ensure_ascii=False,
+        ),
+    )
+    return merged
+
+
+def _run_take_photo_vlm(
+    tool_name: str,
+    tool_code: str,
+    image,
+    mode: str = 'take-photo',
+    request_id: Optional[str] = None,
+    runtime_inputs: Any = None,
+) -> str:
+    """Execute the fused prompt through the shared structured policy executor."""
+    prompt = _effective_tool_prompt(tool_name, tool_code, runtime_inputs)
+    policy = _take_photo_tool_policy(tool_code)
+    logger.info(
+        "[Tool Policy] mode=%s prompt_author=copilot policy_source=%s "
+        "request_id=%s",
+        mode,
+        'TOOL_POLICY' if policy else 'default',
+        request_id or 'generated',
+    )
+    return execute_tool_policy(
+        image=image,
+        prompt=prompt,
+        mode=mode,
+        request_id=request_id,
+        policy=policy,
+        tool_name=tool_name,
+    )
+
+
+def _take_photo_tool_policy(tool_code: str) -> Any:
+    """Read an optional literal TOOL_POLICY without executing generated code."""
+    try:
+        tree = ast.parse(tool_code or '')
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == 'TOOL_POLICY' for target in targets):
+                value = ast.literal_eval(node.value)
+                return value
+    except (SyntaxError, ValueError, TypeError) as exc:
+        logger.warning("[Tool Policy] unreadable TOOL_POLICY; using default error=%s", exc)
+        return None
+    return None
+
+
+def _is_progressive_tool_policy(tool_code: str) -> bool:
+    policy = _take_photo_tool_policy(tool_code)
+    return isinstance(policy, dict) and policy.get('strategy') == 'parallel_progressive'
+
+
+def _progressive_invocation_key(client_id: str, tool_name: str) -> tuple[str, str]:
+    return client_id, tool_name
+
+
+def _obsolete_progressive_invocation(client_id: str, tool_name: str) -> None:
+    key = _progressive_invocation_key(client_id, tool_name)
+    record = active_progressive_invocations.pop(key, None)
+    if record is None:
+        return
+    record['cancelled'].set()
+    task = record.get('task')
+    if (
+        task is not None
+        and task is not asyncio.current_task()
+        and not task.done()
+    ):
+        task.cancel()
+    logger.info(
+        "[ToolProgress] invocation=%s tool=%s obsolete=true",
+        record['invocation_id'],
+        tool_name,
+    )
+
+
+def _obsolete_client_progressive_invocations(client_id: str) -> None:
+    keys = [
+        key for key in active_progressive_invocations
+        if key[0] == client_id
+    ]
+    for _, tool_name in keys:
+        _obsolete_progressive_invocation(client_id, tool_name)
+
+
+def _progressive_invocation_is_fresh(
+    key: tuple[str, str], record: Dict[str, Any]
+) -> bool:
+    return (
+        active_progressive_invocations.get(key) is record
+        and not record['cancelled'].is_set()
+    )
+
+
+def _log_progressive_task_error(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "Progressive tool task error",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+async def _execute_progressive_invocation(
+    websocket,
+    client_id: str,
+    tool_name: str,
+    tool_code: str,
+    image,
+    mode: str,
+    record: Dict[str, Any],
+) -> bool:
+    key = _progressive_invocation_key(client_id, tool_name)
+    event_queue: queue.Queue = queue.Queue()
+    prompt = _take_photo_tool_prompt(tool_name, tool_code)
+    policy = _take_photo_tool_policy(tool_code)
+    result_index = 0
+
+    def queue_event(model_name: str, text: str, error: Optional[str] = None) -> None:
+        nonlocal result_index
+        stale = not _progressive_invocation_is_fresh(key, record)
+        if stale:
+            logger.info(
+                "[Progressive] event_queued invocation_id=%s model=%s result_index=0 "
+                "final=false stale=true cancelled=%s",
+                record['invocation_id'], model_name, record['cancelled'].is_set(),
+            )
+            return
+        result_index += 1
+        event = {
+            'type': 'tool_progress_result',
+            'invocation_id': record['invocation_id'],
+            'tool_name': tool_name,
+            'model': model_name,
+            'result_index': result_index,
+            'text': text,
+            'final': False,
+            'mode': mode,
+            'timestamp': datetime.now().isoformat(),
+        }
+        if error:
+            event['error'] = error
+
+        try:
+            logger.info(
+                "[Progressive] event_queued invocation_id=%s model=%s result_index=%d "
+                "final=false stale=false cancelled=false",
+                record['invocation_id'], model_name, event['result_index'],
+            )
+            event_queue.put_nowait(event)
+        except Exception:
+            logger.exception(
+                "[Progressive] event_queue_failed invocation_id=%s model=%s "
+                "result_index=%d final=false stale=%s cancelled=%s",
+                record['invocation_id'], model_name, result_index, stale,
+                record['cancelled'].is_set(),
+            )
+
+    def on_progress(model_name: str, text: str) -> None:
+        queue_event(model_name, text)
+
+    def on_progress_error(model_name: str, error: Exception) -> None:
+        queue_event(model_name, '', str(error))
+
+    try:
+        worker_state: Dict[str, Any] = {}
+
+        def run_worker() -> str:
+            try:
+                worker_state['result'] = execute_resolved_tool_policy(
+                    prompt,
+                    image,
+                    policy=policy,
+                    request_id=record['invocation_id'],
+                    metadata={'mode': mode, 'tool_name': tool_name},
+                    on_progress=on_progress,
+                    on_progress_error=on_progress_error,
+                    is_cancelled=record['cancelled'].is_set,
+                )
+                return worker_state['result']
+            except BaseException as exc:
+                worker_state['error'] = exc
+                return ''
+            finally:
+                event_queue.put_nowait(None)
+
+        worker = threading.Thread(
+            target=run_worker,
+            name=f"tool-progress-{record['invocation_id'][:8]}",
+            daemon=True,
+        )
+        record['worker_thread'] = worker
+        worker.start()
+        while True:
+            try:
+                event = event_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+            if event is None:
+                break
+            stale = not _progressive_invocation_is_fresh(key, record)
+            logger.info(
+                "[Progressive] event_sending invocation_id=%s model=%s result_index=%d "
+                "final=false stale=%s cancelled=%s",
+                record['invocation_id'], event['model'], event['result_index'],
+                stale, record['cancelled'].is_set(),
+            )
+            if stale:
+                continue
+            try:
+                await websocket.send(json.dumps(event))
+                logger.info(
+                    "[Progressive] event_sent invocation_id=%s model=%s result_index=%d "
+                    "final=false stale=false cancelled=false",
+                    record['invocation_id'], event['model'], event['result_index'],
+                )
+            except Exception:
+                logger.exception(
+                    "[Progressive] event_send_failed invocation_id=%s model=%s "
+                    "result_index=%d final=false stale=false cancelled=false",
+                    record['invocation_id'], event['model'], event['result_index'],
+                )
+                raise
+        if worker_state.get('error') is not None:
+            raise worker_state['error']
+        if not _progressive_invocation_is_fresh(key, record):
+            return False
+        final_event = {
+            'type': 'tool_progress_result',
+            'invocation_id': record['invocation_id'],
+            'tool_name': tool_name,
+            'model': None,
+            'result_index': result_index + 1,
+            'text': '',
+            'final': True,
+            'mode': mode,
+            'timestamp': datetime.now().isoformat(),
+        }
+        logger.info(
+            "[Progressive] event_sending invocation_id=%s model=none result_index=%d "
+            "final=true stale=false cancelled=false",
+            record['invocation_id'], final_event['result_index'],
+        )
+        await websocket.send(json.dumps(final_event))
+        logger.info(
+            "[Progressive] event_sent invocation_id=%s model=none result_index=%d "
+            "final=true stale=false cancelled=false",
+            record['invocation_id'], final_event['result_index'],
+        )
+        logger.info(
+            "[Progressive] invocation_complete invocation_id=%s model=none "
+            "result_index=%d final=true stale=false cancelled=false",
+            record['invocation_id'], final_event['result_index'],
+        )
+        return True
+    except asyncio.CancelledError:
+        record['cancelled'].set()
+        raise
+    except Exception as exc:
+        logger.error(
+            "[ToolProgress] invocation failed tool=%s invocation=%s error=%s",
+            tool_name,
+            record['invocation_id'],
+            exc,
+        )
+        if _progressive_invocation_is_fresh(key, record):
+            try:
+                final_event = {
+                    'type': 'tool_progress_result',
+                    'invocation_id': record['invocation_id'],
+                    'tool_name': tool_name,
+                    'model': None,
+                    'result_index': result_index + 1,
+                    'text': '',
+                    'final': True,
+                    'error': str(exc),
+                    'mode': mode,
+                    'timestamp': datetime.now().isoformat(),
+                }
+                await websocket.send(json.dumps(final_event))
+                logger.info(
+                    "[Progressive] invocation_complete invocation_id=%s model=none "
+                    "result_index=%d final=true stale=false cancelled=false error=%s",
+                    record['invocation_id'], final_event['result_index'], exc,
+                )
+            except Exception:
+                logger.exception(
+                    "[ToolProgress] final error marker send failed invocation=%s",
+                    record['invocation_id'],
+                )
+        return False
+    finally:
+        if active_progressive_invocations.get(key) is record:
+            active_progressive_invocations.pop(key, None)
+
+
+async def _start_progressive_invocation(
+    websocket,
+    client_id: str,
+    tool_name: str,
+    tool_code: str,
+    image,
+    mode: str,
+) -> str:
+    _obsolete_progressive_invocation(client_id, tool_name)
+    invocation_id = secrets.token_hex(16)
+    record = {
+        'invocation_id': invocation_id,
+        'cancelled': threading.Event(),
+        'task': None,
+    }
+    active_progressive_invocations[
+        _progressive_invocation_key(client_id, tool_name)
+    ] = record
+    await websocket.send(json.dumps({
+        'type': 'tool_progress_started',
+        'invocation_id': invocation_id,
+        'tool_name': tool_name,
+        'mode': mode,
+        'timestamp': datetime.now().isoformat(),
+    }))
+    logger.info(
+        "[Progressive] event_sent invocation_id=%s model=none result_index=0 "
+        "final=false stale=false cancelled=false type=tool_progress_started",
+        invocation_id,
+    )
+    task = asyncio.create_task(_execute_progressive_invocation(
+        websocket, client_id, tool_name, tool_code, image, mode, record
+    ))
+    record['task'] = task
+    task.add_done_callback(_log_progressive_task_error)
+    return invocation_id
+
+
+def _resolve_tool_prompt(tool_code: str) -> Optional[str]:
+    """Resolve the prompt already declared by a generated tool without executing it."""
+    try:
+        tree = ast.parse(tool_code or '')
+    except SyntaxError:
+        return None
+
+    string_values: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                string_values[target.id] = value.value
+
+    declared_prompt = string_values.get('TOOL_PROMPT')
+    if declared_prompt and declared_prompt.strip():
+        return declared_prompt.strip()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        is_copilot_call = (
+            isinstance(node.func, ast.Name) and node.func.id == 'copilot_llm_call'
+        ) or (
+            isinstance(node.func, ast.Attribute) and node.func.attr == 'copilot_llm_call'
+        )
+        if not is_copilot_call:
+            continue
+        messages_kw = next((kw.value for kw in node.keywords if kw.arg == 'messages'), None)
+        if not isinstance(messages_kw, (ast.List, ast.Tuple)):
+            continue
+        for message_node in messages_kw.elts:
+            if not isinstance(message_node, ast.Dict):
+                continue
+            message = {
+                key.value: value
+                for key, value in zip(message_node.keys, message_node.values)
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            role_node = message.get('role')
+            if not (
+                isinstance(role_node, ast.Constant)
+                and role_node.value == 'user'
+            ):
+                continue
+            content_node = message.get('content')
+            if isinstance(content_node, ast.Constant) and isinstance(content_node.value, str):
+                return content_node.value.strip() or None
+            if isinstance(content_node, ast.Name):
+                prompt = string_values.get(content_node.id, '').strip()
+                if prompt:
+                    return prompt
+    return None
 
 
 def _streaming_embedding_similarity(
@@ -1528,12 +3587,20 @@ async def run_streaming_tools(websocket, client_id: str, image, image_base64: st
     execution_id = tool_config.get('execution_sequence', 0) + 1
     tool_config['execution_sequence'] = execution_id
     async with execution_lock:
+        logger.info(
+            "[Streaming] streaming_executor=%s nvidia_hosted_active=%s "
+            "client=%s execution=%s",
+            STREAMING_EXECUTOR,
+            str(NVIDIA_HOSTED_ACTIVE).lower(),
+            client_id,
+            execution_id,
+        )
         logger.info("[Streaming] execution started client=%s execution=%s", client_id, execution_id)
         context_token = STREAMING_EXECUTION_CONTEXT.set(True)
         try:
             logger.info("[Streaming] routing started client=%s execution=%s", client_id, execution_id)
             logger.info(
-                "[Streaming] planner selected pre-generated tool stages client=%s execution=%s",
+                "[Streaming] using Copilot-authored fused tool prompt client=%s execution=%s",
                 client_id,
                 execution_id,
             )
@@ -1584,6 +3651,7 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
     tool_code = tool.get('code', '')
     tool_language = tool.get('language', 'python')
     tool_input = tool.get('input', '')
+    runtime_inputs = tool.get('runtime_inputs', {})
     
     # Get cached execution environment or create it
     if 'exec_env' not in tool_config:
@@ -1624,300 +3692,64 @@ async def _execute_streaming_tools_unlocked(websocket, client_id: str, image, im
     # Get cached environment
     exec_env = tool_config['exec_env']
     parsed_input = exec_env['parsed_input']  # Make it available as local variable
+    parsed_input = _with_runtime_inputs(parsed_input, runtime_inputs)
 
     def streaming_cancelled() -> bool:
         current = active_streaming_tools.get(client_id)
         return current is not tool_config or current.get('generation', 0) != dispatched_generation
 
-    encoded_payload = (image_base64 or '').split(',', 1)[-1]
-    encoded_length = len(encoded_payload)
-    original_payload_bytes = max(0, (encoded_length * 3) // 4 - encoded_payload.count('='))
-
-    def streaming_copilot_llm_call(*args, **kwargs):
-        metadata = dict(kwargs.get('metadata') or {})
-        metadata['streaming'] = True
-        metadata.setdefault('tool_name', tool_name)
-        metadata['streaming_execution_id'] = tool_config.get('current_execution_id')
-        metadata['streaming_original_payload_bytes'] = original_payload_bytes
-        metadata['streaming_original_image'] = image_base64
-        metadata['_streaming_cancelled'] = streaming_cancelled
-        kwargs['metadata'] = metadata
-        if not kwargs.get('images'):
-            kwargs['images'] = [image]
-        return tool_copilot_llm_call(*args, **kwargs)
-
-    exec_env['exec_globals_base']['copilot_llm_call'] = streaming_copilot_llm_call
-
-    try:
-        single_stage_result = await asyncio.to_thread(
-            _single_stage_tool_result,
+    # Streaming resolves the same mode policy as take-photo. Generated tool
+    # bodies are not executed per frame; TOOL_PROMPT is the complete fused task.
+    if tool_language != 'python' or not tool_code:
+        logger.error(
+            "[Streaming] tool policy requires a Python tool with TOOL_PROMPT "
+            "client=%s tool=%s language=%s",
+            client_id,
             tool_name,
-            tool.get('task', ''),
-            image,
-            True,
-            {
-                'streaming_execution_id': tool_config.get('current_execution_id'),
-                'tool_name': tool_name,
-                'streaming_original_payload_bytes': original_payload_bytes,
-                'streaming_original_image': image_base64,
-                '_streaming_cancelled': streaming_cancelled,
-            },
+            tool_language,
         )
-    except StreamingExecutionCancelled:
-        logger.info("[Streaming] single-stage execution cancelled client=%s", client_id)
         return False
-    if single_stage_result is not None:
+    if tool_language == 'python' and tool_code:
+        execution_id = tool_config.get('current_execution_id')
+        if _is_progressive_tool_policy(tool_code):
+            await _start_progressive_invocation(
+                websocket,
+                client_id,
+                tool_name,
+                tool_code,
+                image,
+                'streaming',
+            )
+            return True
+        try:
+            cascade_result = await asyncio.to_thread(
+                _run_take_photo_vlm,
+                tool_name,
+                tool_code,
+                image,
+                'streaming',
+                str(execution_id or 'unknown'),
+                runtime_inputs,
+            )
+        except Exception as exc:
+            logger.error(
+                "[Streaming] tool policy failed client=%s execution=%s error=%s",
+                client_id, execution_id, exc,
+            )
+            return False
         if streaming_cancelled():
-            logger.info("[Streaming] result discarded after stop client=%s", client_id)
+            logger.info(
+                "[Streaming] tool policy result discarded as stale client=%s execution=%s",
+                client_id, execution_id,
+            )
             return False
         response_data = _build_mobile_tool_response(
-            'tool_stream_result', tool_name, single_stage_result, now
+            'tool_stream_result', tool_name, cascade_result, now
         )
-        execution_id = tool_config.get('current_execution_id')
         response_data['execution_id'] = execution_id
         _log_final_tool_response(tool_name, response_data)
         await websocket.send(json.dumps(response_data))
         return True
-    
-    # Execute the tool (Python only for now)
-    if tool_language == 'python' and tool_code:
-        logger.info(f"Starting execution of streaming tool {tool_name} for {client_id}")
-        image_context_token = None
-        try:
-            # Use cached environment with frame-specific data
-            exec_globals = {
-                **exec_env['exec_globals_base'],
-                'input_data': exec_env['parsed_input'],
-                'image': image,
-                'image_base64': image_base64,
-            }
-            exec_locals = {}
-            
-            # Use cached stdout capture and clear it
-            stdout_capture = exec_env['stdout_capture']
-            stdout_capture.seek(0)
-            stdout_capture.truncate(0)
-            
-            # Run exec + function call in a thread so blocking LLM/CV calls
-            # inside the tool don't stall the event loop (which would cause
-            # the aiohttp heartbeat to miss and the app to declare disconnect).
-            import sys
-            import inspect
-            import io as _io
-
-            def _run_tool_in_thread():
-                _capture = _io.StringIO()
-                _old = sys.stdout
-                sys.stdout = _capture
-                try:
-                    exec(tool_code, exec_globals, exec_locals)
-                finally:
-                    sys.stdout = _old
-
-                exec_globals.update(exec_locals)
-
-                _result = None
-                if 'main' in exec_locals and callable(exec_locals['main']):
-                    sig = inspect.signature(exec_locals['main'])
-                    if len(sig.parameters) == 2:
-                        _result = exec_locals['main'](image, parsed_input)
-                    else:
-                        logger.warning(f"main() has {len(sig.parameters)} params, expected 2")
-                elif 'run' in exec_locals and callable(exec_locals['run']):
-                    sig = inspect.signature(exec_locals['run'])
-                    if len(sig.parameters) == 2:
-                        _result = exec_locals['run'](image, parsed_input)
-                    else:
-                        logger.warning(f"run() has {len(sig.parameters)} params, expected 2")
-                elif 'process_image' in exec_locals and callable(exec_locals['process_image']):
-                    sig = inspect.signature(exec_locals['process_image'])
-                    if len(sig.parameters) == 2:
-                        _result = exec_locals['process_image'](image, parsed_input)
-                    else:
-                        logger.info(f"Skipping process_image() - has {len(sig.parameters)} params (likely a helper function)")
-                elif 'process_frame_for_text' in exec_locals and callable(exec_locals['process_frame_for_text']):
-                    if 'initialize_verbalizer' in exec_locals and 'get_verbalizer' in exec_locals:
-                        verbalizer = exec_locals['get_verbalizer']()
-                        if not verbalizer and GEMINI_API_KEY:
-                            exec_locals['initialize_verbalizer'](GEMINI_API_KEY)
-                    _result = exec_locals['process_frame_for_text'](image_base64)
-                elif 'result' in exec_locals:
-                    _result = exec_locals['result']
-                else:
-                    available_funcs = [n for n, o in exec_locals.items() if callable(o) and not n.startswith('_')]
-                    available_classes = [n for n, o in exec_locals.items() if isinstance(o, type) and not n.startswith('_')]
-                    if available_funcs or available_classes:
-                        _result = f"Tool loaded successfully.\n\nAvailable functions: {', '.join(available_funcs) if available_funcs else 'none'}\nAvailable classes: {', '.join(available_classes) if available_classes else 'none'}\n\nNote: This tool is a library. To use it, you may need to call one of these functions."
-
-                return _capture.getvalue(), _result
-
-            retry_count = 0
-            max_retries = 3
-            image_context_token = TOOL_EXECUTION_IMAGES.set([image])
-            printed_output = ''
-            result = None
-
-            while retry_count < max_retries:
-                try:
-                    logger.info(f"Executing {tool_name} code for {client_id}, attempt {retry_count + 1}")
-                    printed_output, result = await asyncio.to_thread(_run_tool_in_thread)
-                    logger.info(f"Tool {tool_name} completed for {client_id}: {type(result)}")
-                    break
-                except (ImportError, ModuleNotFoundError) as e:
-                    error_msg = str(e)
-                    logger.warning(f"Module error in streaming {tool_name}: {error_msg}")
-
-                    tool_config['installing_module'] = True
-                    await websocket.send(json.dumps({
-                        'type': 'module_installing',
-                        'tool_name': tool_name,
-                        'message': f"Pausing streaming to install required module...",
-                        'timestamp': datetime.now().isoformat()
-                    }))
-
-                    installed_module = await asyncio.to_thread(module_mgr.install_from_error, error_msg)
-                    tool_config['installing_module'] = False
-
-                    if installed_module:
-                        logger.info(f"Installed {installed_module}, resuming streaming execution...")
-                        await websocket.send(json.dumps({
-                            'type': 'module_installed',
-                            'tool_name': tool_name,
-                            'module': installed_module,
-                            'message': f"Successfully installed {installed_module}. Resuming streaming...",
-                            'timestamp': datetime.now().isoformat()
-                        }))
-                        common_modules = module_mgr.get_common_modules()
-                        exec_globals.update(common_modules)
-                        retry_count += 1
-                    else:
-                        await websocket.send(json.dumps({
-                            'type': 'module_install_failed',
-                            'tool_name': tool_name,
-                            'error': error_msg,
-                            'message': f"Failed to install module: {error_msg}",
-                            'timestamp': datetime.now().isoformat()
-                        }))
-                        raise
-                except Exception:
-                    raise
-            
-            # Get captured print output
-            printed_output = stdout_capture.getvalue()
-            
-            # IMPORTANT: Merge exec_locals into exec_globals so functions can see each other
-            # This allows main() to call helper functions defined in the same file
-            exec_globals.update(exec_locals)
-            
-            # Get result from function or variable
-            # Check function signatures to avoid calling helper functions
-            import inspect
-            
-            result = None
-            
-            # Try main() - highest priority
-            if 'main' in exec_locals and callable(exec_locals['main']):
-                try:
-                    logger.info(f"Calling main() function for {tool_name} on {client_id}")
-                    sig = inspect.signature(exec_locals['main'])
-                    if len(sig.parameters) == 2:  # Should take (image, input_data)
-                        result = await asyncio.to_thread(exec_locals['main'], image, parsed_input)
-                        logger.info(f"main() returned result for {tool_name}: {type(result)}")
-                    else:
-                        logger.warning(f"main() has {len(sig.parameters)} params, expected 2")
-                except Exception as e:
-                    logger.error(f"Error calling main(): {e}")
-            
-            # Try run() - second priority
-            elif 'run' in exec_locals and callable(exec_locals['run']):
-                try:
-                    sig = inspect.signature(exec_locals['run'])
-                    if len(sig.parameters) == 2:
-                        result = await asyncio.to_thread(exec_locals['run'], image, parsed_input)
-                    else:
-                        logger.warning(f"run() has {len(sig.parameters)} params, expected 2")
-                except Exception as e:
-                    logger.error(f"Error calling run(): {e}")
-            
-            # Try process_image() - but check signature carefully
-            elif 'process_image' in exec_locals and callable(exec_locals['process_image']):
-                try:
-                    sig = inspect.signature(exec_locals['process_image'])
-                    # Only call if it takes 2 params (entry point), not 1 (helper function)
-                    if len(sig.parameters) == 2:
-                        result = await asyncio.to_thread(exec_locals['process_image'], image, parsed_input)
-                    else:
-                        logger.info(f"Skipping process_image() - has {len(sig.parameters)} params (likely a helper function)")
-                except Exception as e:
-                    logger.error(f"Error calling process_image(): {e}")
-            
-            # Try process_frame_for_text() - special case for text tools
-            elif 'process_frame_for_text' in exec_locals and callable(exec_locals['process_frame_for_text']):
-                try:
-                    # Initialize verbalizer if needed
-                    if 'initialize_verbalizer' in exec_locals and 'get_verbalizer' in exec_locals:
-                        verbalizer = exec_locals['get_verbalizer']()
-                        if not verbalizer and GEMINI_API_KEY:
-                            exec_locals['initialize_verbalizer'](GEMINI_API_KEY)
-                    result = await asyncio.to_thread(
-                        exec_locals['process_frame_for_text'], image_base64
-                    )
-                except Exception as e:
-                    logger.error(f"Error calling process_frame_for_text(): {e}")
-            
-            # Check for result variable
-            elif 'result' in exec_locals:
-                result = exec_locals['result']
-            else:
-                # Tool is a library - show available functions
-                available_funcs = [name for name, obj in exec_locals.items() 
-                                 if callable(obj) and not name.startswith('_')]
-                available_classes = [name for name, obj in exec_locals.items() 
-                                   if isinstance(obj, type) and not name.startswith('_')]
-                
-                if available_funcs or available_classes:
-                    result = f"Tool loaded successfully.\n\nAvailable functions: {', '.join(available_funcs) if available_funcs else 'none'}\nAvailable classes: {', '.join(available_classes) if available_classes else 'none'}\n\nNote: This tool is a library. To use it, you may need to call one of these functions."
-                else:
-                    result = None
-            TOOL_EXECUTION_IMAGES.reset(image_context_token)
-            image_context_token = None
-            
-            response_data = _build_mobile_tool_response(
-                'tool_stream_result', tool_name, result, now, printed_output
-            )
-            if streaming_cancelled():
-                logger.info("[Streaming] result discarded after stop client=%s", client_id)
-                return False
-            execution_id = tool_config.get('current_execution_id')
-            response_data['execution_id'] = execution_id
-            _log_final_tool_response(tool_name, response_data)
-            logger.info(
-                "[Streaming] final response generated client=%s execution=%s text=%r",
-                client_id,
-                execution_id,
-                response_data['result'],
-            )
-            await websocket.send(json.dumps(response_data))
-            logger.info(
-                "[Streaming] websocket result sent client=%s execution=%s type=tool_stream_result tool=%s",
-                client_id,
-                execution_id,
-                tool_name,
-            )
-            return True
-            
-        except StreamingExecutionCancelled:
-            if image_context_token is not None:
-                TOOL_EXECUTION_IMAGES.reset(image_context_token)
-            logger.info("[Streaming] cascade execution cancelled client=%s", client_id)
-            return False
-        except Exception as e:
-            if image_context_token is not None:
-                TOOL_EXECUTION_IMAGES.reset(image_context_token)
-            logger.error(f"Error in streaming tool {tool_name}: {e}")
-            # Don't send errors for streaming (would be too noisy)
-            # Just log them for debugging
-            return False
 
     return False
 
@@ -2056,1007 +3888,144 @@ async def _process_entry_batch(websocket, session_id: str, pr_or_session: str, e
 
 
 async def fetch_copilot_sessions() -> list:
-    """
-    Fetch active Copilot coding agent tasks for the repository.
-    Uses `gh agent-task list` CLI command.
-    
-    Note: gh agent-task list doesn't support --json, so we parse text output
-    or just return empty and rely on PR-based lookup instead.
-    
-    Returns:
-        List of session dictionaries (may be empty if parsing fails)
-    """
-    try:
-        # gh agent-task list doesn't have --json flag, so we'll return empty
-        # and rely on the PR number based lookup in poll_for_copilot_session
-        logger.info("fetch_copilot_sessions called - using PR-based lookup instead")
-        return []
-        
-    except Exception as e:
-        logger.error(f"Error fetching Copilot sessions: {e}")
-        return []
+    """Return no remote code-agent sessions; Claude execution lives in GitHub Actions."""
+    return []
 
 
 async def stream_copilot_session_logs(websocket, client_id: str, pr_number_or_session: str, pr_number: int = None, skip_wait: bool = False, _last_summary_time=None, _skip_lines: int = 0, _start_entry_count: int = 0):
-    """
-    Stream Copilot agent task logs to a client using `gh agent-task view --follow`.
-    
-    Args:
-        websocket: WebSocket connection to send logs to
-        client_id: Client identifier for tracking
-        pr_number_or_session: PR number or session ID to stream logs for
-        pr_number: Explicit PR number (optional, used when pr_number_or_session is a session ID)
-        skip_wait: If True, skip the 45-second initialization wait (caller already confirmed session exists)
-        _last_summary_time: Internal: carry forward last summary time on reconnect to prevent rapid-fire summaries
-        _skip_lines: Internal: number of log lines to skip on reconnect (already processed)
-        _start_entry_count: Internal: starting entry count on reconnect (continue numbering)
-    """
-    global active_copilot_streams
-    
-    logger.info(f"Starting Copilot agent task log stream for {client_id}, pr/session: {pr_number_or_session}, pr_number: {pr_number}")
-    
-    try:
-        # Create clean environment for gh CLI - remove token env vars so it uses OAuth from gh auth login
-        # PAT tokens (GITHUB_TOKEN) don't work with agent-task, it requires OAuth credentials
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        session_id = str(pr_number_or_session)
-        
-        # If given a PR number, first fetch the session ID
-        if session_id.isdigit():
-            import pty
-            import fcntl
-            import re
-            
-            pr_number = int(session_id)  # Store the PR number
-            logger.info(f"PR number provided, fetching session ID for PR #{session_id}")
-            
-            # Wait for the session to initialize on GitHub's side before querying
-            # Skip this wait if the caller already confirmed the session exists
-            if not skip_wait:
-                logger.info("Waiting 45 seconds for GitHub to initialize the Copilot session...")
-                await asyncio.sleep(45)
-            else:
-                logger.info("Skipping 45-second wait (session already confirmed)")
-            
-            # Use Python's pty module to create a real PTY and send enter after delay
-            logger.info(f"Creating PTY for: gh agent-task view {session_id} -R {GITHUB_REPO}")
-            
-            # Create a PTY
-            master, slave = pty.openpty()
-            
-            # Spawn the gh command in the PTY
-            proc = await asyncio.create_subprocess_exec(
-                'gh', 'agent-task', 'view', str(session_id),
-                '-R', GITHUB_REPO,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                env=env
-            )
-            
-            # Close slave in parent process
-            os.close(slave)
-            
-            # Send multiple enters with delays to ensure we catch the prompt
-            # First wait for gh to query and display sessions
-            logger.info("Waiting 0.8 seconds then sending first enter...")
-            await asyncio.sleep(0.8)
-            os.write(master, b'\r\n')
-            logger.info("Sent first enter, waiting 0.3 seconds...")
-            await asyncio.sleep(0.3)
-            os.write(master, b'\r\n')
-            logger.info("Sent second enter to PTY")
-            
-            # Read output
-            output = b''
-            try:
-                # Set non-blocking
-                flags = fcntl.fcntl(master, fcntl.F_GETFL)
-                fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                
-                # Read with timeout
-                for _ in range(50):  # 5 seconds total
-                    await asyncio.sleep(0.1)
-                    try:
-                        chunk = os.read(master, 4096)
-                        if chunk:
-                            output += chunk
-                    except OSError:
-                        pass
-                    
-                    # Check if process has exited
-                    if proc.returncode is not None:
-                        break
-            finally:
-                os.close(master)
-                
-            # Wait for process to complete
-            await proc.wait()
-            
-            logger.info(f"Command completed with return code: {proc.returncode}")
-            output_str = output.decode('utf-8', errors='replace')
-            logger.info(f"Output length: {len(output_str)}")
-            
-            # Parse session ID from output - look for UUID pattern
-            uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-            matches = re.findall(uuid_pattern, output_str)
-            logger.info(f"Found {len(matches)} UUID matches in output")
-            
-            if matches:
-                session_id = matches[0]
-                logger.info(f"Selected most recent session: {session_id}")
-            else:
-                logger.error(f"Could not find session ID in output: {output_str[:200]}")
-                await websocket.send(json.dumps({
-                    'type': 'copilot_session_error',
-                    'pr_or_session': str(pr_number),
-                    'error': 'Could not find session ID for this PR'
-                }))
-                return
-        
-        # Spawn the gh CLI process with --follow and --log for continuous streaming
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            session_id,
-            '-R', GITHUB_REPO,
-            '--follow',
-            '--log',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        
-        # Create or get session in database with PR number
-        if pr_number is not None:
-            logger.info(f"Creating session {session_id} for PR #{pr_number} in database")
-            copilot_db.create_session(session_id, pr_number)
-        else:
-            logger.warning(f"Session {session_id} created without PR number - will not be queryable by PR")
-        
-        # Store process reference for cleanup
-        active_copilot_streams[client_id] = {
-            'process': proc,
-            'pr_or_session': pr_number_or_session,
-            'started_at': datetime.now(),
-            'session_id': session_id
-        }
-        
-        # Notify client that streaming has started
-        print(f"\n{'='*60}\n🤖 Copilot Session Started: {session_id}\n{'='*60}", flush=True)
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_stream_started',
-            'pr_or_session': str(pr_number_or_session),
-            'session_id': session_id,
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        # Entry tracking state
-        current_entry_lines = []
-        entry_buffer = []  # Buffer of complete entries
-        entry_count = _start_entry_count  # Continue from where we left off on reconnect
-        log_index = _skip_lines  # Continue log index from reconnect
-        prev_line = ""
-        in_code_section = False
-        lines_seen = 0  # Count lines seen this invocation (for skip logic)
-        last_summary_time = _last_summary_time or datetime.now()  # Don't fire immediately on first run
-        summary_interval = 30  # Generate summary every 30 seconds
-        check_interval = 5  # Check for new entries every 5 seconds
-        max_entry_lines = 50  # Force a boundary if an entry exceeds this many lines
-        
-        # Background task to periodically generate summaries
-        async def periodic_summarizer():
-            """Check every 5 seconds, summarize if 30 seconds have passed since last summary."""
-            nonlocal entry_buffer, last_summary_time
-            while True:
-                try:
-                    await asyncio.sleep(check_interval)
-                    now = datetime.now()
-                    
-                    # Only summarize if we have entries
-                    if not entry_buffer:
-                        continue
-                    
-                    # If first batch or 30 seconds have passed since last summary
-                    if last_summary_time is None:
-                        time_since_last = float('inf')
-                    else:
-                        time_since_last = (now - last_summary_time).total_seconds()
-                    
-                    if time_since_last >= summary_interval:
-                        # Copy and clear buffer
-                        entries_to_process = entry_buffer.copy()
-                        entry_buffer.clear()
-                        last_summary_time = now
-                        
-                        if not entries_to_process:
-                            continue
-                        
-                        logger.info(f"Periodic summarizer: Processing {len(entries_to_process)} entries ({time_since_last:.1f}s since last summary)")
-                        
-                        # Cap total text size to avoid overwhelming the summarizer
-                        # Any entries that don't fit go back in the buffer for next cycle
-                        total_chars = sum(len(e.get('text', '')) for e in entries_to_process)
-                        if total_chars > 15000:
-                            kept = []
-                            deferred = []
-                            char_count = 0
-                            for entry in entries_to_process:
-                                entry_text = entry.get('text', '')
-                                if char_count + len(entry_text) > 15000 and kept:
-                                    # This entry and all remaining go back in the buffer
-                                    deferred.append(entry)
-                                else:
-                                    kept.append(entry)
-                                    char_count += len(entry_text)
-                            # Put un-processed entries back in the buffer for next cycle
-                            if deferred:
-                                entry_buffer = deferred + entry_buffer
-                                logger.info(f"Capped at {len(kept)} entries ({char_count} chars), deferred {len(deferred)} entries to next cycle")
-                            entries_to_process = kept
-                        
-                        if entries_to_process:
-                            await _process_entry_batch(websocket, session_id, pr_number_or_session, entries_to_process)
-                        
-                        logger.info(f"Summary complete, next in {summary_interval}s")
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Error in periodic summarizer: {e}")
-        
-        # Start the periodic summarizer task
-        summarizer_task = asyncio.create_task(periodic_summarizer())
-        
-        try:
-            # Read and forward log lines as they arrive
-            while True:
-                line = await proc.stdout.readline()
-                
-                if not line:
-                    # Process ended or EOF - stop the periodic summarizer first
-                    summarizer_task.cancel()
-                    try:
-                        await summarizer_task
-                    except asyncio.CancelledError:
-                        pass
-                    
-                    # Flush any remaining entry
-                    if current_entry_lines:
-                        entry_text = '\n'.join(current_entry_lines)
-                        entry_buffer.append({
-                            'entry_num': entry_count,
-                            'lines': current_entry_lines[:],
-                            'text': entry_text,
-                            'is_code': in_code_section
-                        })
-                        entry_count += 1
-                        
-                        # Store in DB using batch insert (non-blocking)
-                        batch = [(session_id, log_index + i, line_text, in_code_section, entry_count - 1) 
-                                for i, line_text in enumerate(current_entry_lines)]
-                        asyncio.create_task(async_insert_logs_batch(batch))
-                        log_index += len(current_entry_lines)
-                    
-                    # Summarize any remaining entries
-                    if entry_buffer:
-                        await _process_entry_batch(websocket, session_id, pr_number_or_session, entry_buffer)
-                        entry_buffer.clear()  # Clear after final summary
-                    
-                    break
-                
-                log_line = line.decode('utf-8', errors='replace').rstrip()
-                
-                if log_line:
-                    lines_seen += 1
-                    
-                    # Skip lines already processed in previous invocation (reconnect)
-                    if lines_seen <= _skip_lines:
-                        prev_line = log_line
-                        continue
-                    
-                    # Print to terminal for server-side visibility
-                    print(f"  {log_line}", flush=True)
-                    
-                    # Send raw log to client
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_log',
-                        'pr_or_session': str(pr_number_or_session),
-                        'line': log_line,
-                        'timestamp': datetime.now().isoformat()
-                    }))
-                    
-                    # Track code fence state (```)
-                    if log_line.strip().startswith('```'):
-                        in_code_section = not in_code_section  # Toggle
-                    
-                    # Check if this line looks like code
-                    line_is_code = looks_like_code(log_line) or in_code_section
-                    
-                    # Detect entry boundary OR force boundary if entry is too large
-                    force_boundary = len(current_entry_lines) >= max_entry_lines
-                    natural_boundary = is_entry_boundary(log_line, prev_line)
-                    
-                    if (natural_boundary or force_boundary) and current_entry_lines:
-                        if force_boundary and not natural_boundary:
-                            logger.debug(f"Forcing entry boundary at {len(current_entry_lines)} lines")
-                        
-                        # Complete the current entry
-                        entry_text = '\n'.join(current_entry_lines)
-                        entry_buffer.append({
-                            'entry_num': entry_count,
-                            'lines': current_entry_lines[:],
-                            'text': entry_text,
-                            'is_code': in_code_section
-                        })
-                        
-                        # Store in DB using batch insert (non-blocking)
-                        batch = [(session_id, log_index + i, line_text, in_code_section, entry_count) 
-                                for i, line_text in enumerate(current_entry_lines)]
-                        asyncio.create_task(async_insert_logs_batch(batch))
-                        log_index += len(current_entry_lines)
-                        
-                        entry_count += 1
-                        current_entry_lines = []
-                        # Note: Don't reset in_code_section here - it persists across entries
-                    
-                    # Add line to current entry
-                    if log_line.strip():  # Don't add blank lines
-                        current_entry_lines.append(log_line)
-                    
-                    prev_line = log_line
-        finally:
-            # Cancel the summarizer task when done
-            summarizer_task.cancel()
-            try:
-                await summarizer_task
-            except asyncio.CancelledError:
-                pass
-
-        
-        # Check for any stderr output
-        stderr_output = await proc.stderr.read()
-        if stderr_output:
-            stderr_text = stderr_output.decode('utf-8', errors='replace').strip()
-            if stderr_text:
-                # Print to terminal
-                print(f"⚠️  STDERR: {stderr_text}", flush=True)
-                logger.warning(f"Copilot agent task stderr: {stderr_text}")
-                # Only send as error if it looks like an actual error (not just warnings/info)
-                if any(err_word in stderr_text.lower() for err_word in ['error', 'failed', 'fatal']):
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_error',
-                        'pr_or_session': str(pr_number_or_session),
-                        'error': stderr_text,
-                        'timestamp': datetime.now().isoformat()
-                    }))
-        
-        # Get exit code
-        exit_code = await proc.wait()
-        
-        logger.info(f"gh agent-task view exited with code {exit_code} for session {session_id}")
-        
-        # Check if the session is actually complete or if it's still running
-        # (This can happen when a sub-agent finishes but the parent is still active)
-        try:
-            # Query the session status
-            status_proc = await asyncio.create_subprocess_exec(
-                'gh', 'agent-task', 'view',
-                session_id,
-                '-R', GITHUB_REPO,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
-            stdout, stderr = await status_proc.communicate()
-            output = stdout.decode('utf-8', errors='replace')
-            
-            # Check if session shows as "in progress" or "active"
-            is_still_active = any(status in output.lower() for status in ['in progress', 'active', 'running'])
-            
-            if is_still_active:
-                if exit_code == 0:
-                    # Session is still active - the --follow just ended (likely due to sub-agent completion)
-                    logger.info(f"Session {session_id} is still active, restarting follow stream...")
-                    print(f"  🔄 Sub-agent completed, continuing to follow parent session...", flush=True)
-                else:
-                    # Non-zero exit but session still active - connection issue, try to reconnect
-                    logger.warning(f"Session {session_id} is still active but stream exited with code {exit_code}, reconnecting...")
-                    print(f"  🔄 Connection lost, attempting to reconnect to active session...", flush=True)
-                
-                # Restart the follow by calling stream_copilot_session_logs recursively
-                # Use the same websocket and parameters, carry forward summary timing
-                await stream_copilot_session_logs(websocket, client_id, session_id, pr_number, skip_wait=True, _last_summary_time=last_summary_time, _skip_lines=lines_seen, _start_entry_count=entry_count)
-                return  # Exit this instance, the recursive call handles the rest
-                
-        except Exception as e:
-            logger.warning(f"Could not check session status: {e}, assuming complete")
-        
-        # Determine session status based on exit code and whether we got any logs
-        # Get log count to see if we captured anything
-        logs_count = copilot_db.get_log_count(session_id)
-        
-        if exit_code == 0:
-            status = 'completed'
-        elif logs_count > 0:
-            # We got some logs but stream ended abnormally - mark as partial, not failed
-            status = 'partial'
-            logger.info(f"Session {session_id} recording ended early (exit {exit_code}) but captured {logs_count} log entries - marking as partial")
-        else:
-            # No logs captured and non-zero exit
-            status = 'failed'
-            
-        copilot_db.update_session_status(session_id, status, exit_code)
-        
-        # Notify client that streaming has ended
-        print(f"{'='*60}\n✅ Copilot Session Ended (exit code: {exit_code})\n{'='*60}\n", flush=True)
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_stream_ended',
-            'pr_or_session': str(pr_number_or_session),
-            'session_id': session_id,
-            'exit_code': exit_code,
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        logger.info(f"Copilot agent task log stream ended for {client_id}, exit code: {exit_code}")
-        
-    except asyncio.CancelledError:
-        logger.info(f"Copilot agent task stream cancelled for {client_id}")
-        raise
-    except Exception as e:
-        logger.error(f"Error streaming Copilot agent task logs: {e}")
-        try:
-            await websocket.send(json.dumps({
-                'type': 'copilot_session_error',
-                'pr_or_session': str(pr_number_or_session),
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }))
-        except:
-            pass  # Connection may already be closed
-    finally:
-        # Cleanup
-        if client_id in active_copilot_streams:
-            stream_info = active_copilot_streams[client_id]
-            if stream_info.get('process'):
-                try:
-                    stream_info['process'].terminate()
-                    await asyncio.wait_for(stream_info['process'].wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    stream_info['process'].kill()
-                except:
-                    pass
-            del active_copilot_streams[client_id]
+    await websocket.send(json.dumps({
+        'type': 'copilot_session_error',
+        'pr_or_session': str(pr_number_or_session),
+        'error': 'Remote code-agent session streaming is no longer supported on this branch.',
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def stop_copilot_session_stream(client_id: str):
-    """
-    Stop an active Copilot session stream for a client.
-    
-    Args:
-        client_id: Client identifier
-    """
-    global active_copilot_streams
-    
-    if client_id not in active_copilot_streams:
-        logger.warning(f"No active Copilot stream for {client_id}")
-        return
-    
-    stream_info = active_copilot_streams[client_id]
-    
-    # Cancel the streaming task if it exists
-    if 'task' in stream_info and stream_info['task']:
-        stream_info['task'].cancel()
-    
-    # Terminate the subprocess
-    if stream_info.get('process'):
-        try:
-            stream_info['process'].terminate()
-            await asyncio.wait_for(stream_info['process'].wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            stream_info['process'].kill()
-        except Exception as e:
-            logger.error(f"Error stopping Copilot stream process: {e}")
-    
-    if client_id in active_copilot_streams:
-        del active_copilot_streams[client_id]
-    
-    logger.info(f"Stopped Copilot session stream for {client_id}")
+    active_copilot_streams.pop(client_id, None)
 
 
 async def fetch_and_store_pr_sessions(websocket, client_id: str, pr_number: int):
-    """
-    Fetch sessions for a PR and return them to the client.
-    
-    Note: GitHub CLI doesn't provide a way to list historical sessions.
-    We can only access:
-    1. Sessions already stored in our database from previous live streaming
-    2. The currently active session (if any) by streaming it live
-    
-    Args:
-        websocket: WebSocket connection to send updates to
-        client_id: Client identifier
-        pr_number: PR number to fetch sessions for
-    """
-    logger.info(f"Fetching sessions for PR #{pr_number}")
-    
-    try:
-        # Check database for existing sessions
-        sessions = copilot_db.get_sessions_for_pr(pr_number)
-        
-        if sessions:
-            logger.info(f"Found {len(sessions)} session(s) in database for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': sessions,
-                'timestamp': datetime.now().isoformat()
-            }))
-            return
-        
-        # No sessions in DB - check if there's an active session we can fetch
-        logger.info(f"No sessions in DB for PR #{pr_number}, checking for active session")
-        
-        # Try to get active session by running gh agent-task view
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            str(pr_number),
-            '-R', GITHUB_REPO,
-            '--log',  # Just get log info, not streaming
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            # No active session for this PR
-            logger.info(f"No active session found for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': [],
-                'timestamp': datetime.now().isoformat()
-            }))
-            return
-        
-        # Parse output to extract session ID
-        output = stdout.decode('utf-8', errors='replace')
-        import re
-        uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-        session_ids = re.findall(uuid_pattern, output)
-        
-        if session_ids:
-            session_id = session_ids[0]  # Use first found session ID
-            logger.info(f"Found active session {session_id} for PR #{pr_number}, creating in DB")
-            
-            # Create session in database
-            copilot_db.create_session(session_id, pr_number)
-            
-            # Fetch logs for this session without streaming
-            await fetch_and_store_session_logs(session_id, pr_number)
-            
-            # Get sessions from database and send to client
-            sessions = copilot_db.get_sessions_for_pr(pr_number)
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': sessions,
-                'timestamp': datetime.now().isoformat()
-            }))
-        else:
-            logger.info(f"Could not extract session ID for PR #{pr_number}")
-            await websocket.send(json.dumps({
-                'type': 'pr_sessions_list',
-                'pr_number': pr_number,
-                'sessions': [],
-                'timestamp': datetime.now().isoformat()
-            }))
-        
-    except Exception as e:
-        logger.error(f"Error fetching sessions for PR #{pr_number}: {e}")
-        await websocket.send(json.dumps({
-            'type': 'error',
-            'message': f'Failed to fetch sessions: {str(e)}',
-            'timestamp': datetime.now().isoformat()
-        }))
+    await websocket.send(json.dumps({
+        'type': 'pr_sessions_list',
+        'pr_number': pr_number,
+        'sessions': [],
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def fetch_and_store_session_logs(session_id: str, pr_number: int):
-    """
-    Fetch logs for a specific session from GitHub and store in database.
-    Uses gh agent-task view --log (without --follow) to get historical logs.
-    
-    Args:
-        session_id: Copilot session ID
-        pr_number: Associated PR number
-    """
-    logger.info(f"Fetching historical logs for session {session_id}")
-    
-    try:
-        # Create clean environment for gh CLI
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        # Run gh agent-task view with --log but WITHOUT --follow for historical data
-        proc = await asyncio.create_subprocess_exec(
-            'gh', 'agent-task', 'view',
-            session_id,
-            '-R', GITHUB_REPO,
-            '--log',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        
-        # Process logs line by line
-        current_entry_lines = []
-        entry_buffer = []
-        entry_count = 0
-        log_index = 0
-        prev_line = ""
-        in_code_section = False
-        max_entry_lines = 50  # Force boundary if entry exceeds this
-        
-        while True:
-            line = await proc.stdout.readline()
-            
-            if not line:
-                # EOF - flush any remaining entry
-                if current_entry_lines:
-                    entry_text = '\n'.join(current_entry_lines)
-                    entry_buffer.append({
-                        'entry_num': entry_count,
-                        'lines': current_entry_lines[:],
-                        'text': entry_text,
-                        'is_code': in_code_section
-                    })
-                    entry_count += 1
-                    
-                    # Store in DB using batch insert (non-blocking)
-                    batch = [(session_id, log_index + i, line_text, in_code_section, entry_count - 1) 
-                            for i, line_text in enumerate(current_entry_lines)]
-                    asyncio.create_task(async_insert_logs_batch(batch))
-                    log_index += len(current_entry_lines)
-                
-                # Summarize any remaining entries
-                if entry_buffer:
-                    await _process_historical_batch(session_id, entry_buffer)
-                
-                break
-            
-            log_line = line.decode('utf-8', errors='replace').rstrip()
-            
-            if log_line:
-                # Track code fence state (```)
-                if log_line.strip().startswith('```'):
-                    in_code_section = not in_code_section  # Toggle
-                
-                # Check if this line looks like code
-                line_is_code = looks_like_code(log_line) or in_code_section
-                
-                # Detect entry boundary or force if too large
-                force_boundary = len(current_entry_lines) >= max_entry_lines
-                natural_boundary = is_entry_boundary(log_line, prev_line)
-                
-                if (natural_boundary or force_boundary) and current_entry_lines:
-                    # Complete the current entry
-                    entry_text = '\n'.join(current_entry_lines)
-                    entry_buffer.append({
-                        'entry_num': entry_count,
-                        'lines': current_entry_lines[:],
-                        'text': entry_text,
-                        'is_code': in_code_section
-                    })
-                    
-                    # Store in DB using batch insert (non-blocking)
-                    batch = [(session_id, log_index + i, line_text, in_code_section, entry_count) 
-                            for i, line_text in enumerate(current_entry_lines)]
-                    asyncio.create_task(async_insert_logs_batch(batch))
-                    log_index += len(current_entry_lines)
-                    
-                    entry_count += 1
-                    current_entry_lines = []
-                    # Don't reset in_code_section - it persists across entries
-                    
-                    # For historical logs, batch every 10 entries to avoid too many summaries
-                    if len(entry_buffer) >= 10:
-                        await _process_historical_batch(session_id, entry_buffer[:10])
-                        entry_buffer = entry_buffer[10:]
-                
-                # Add line to current entry
-                if log_line.strip():
-                    current_entry_lines.append(log_line)
-                
-                prev_line = log_line
-        
-        # Get exit code
-        exit_code = await proc.wait()
-        
-        # Determine session status based on exit code and whether we got any logs
-        if exit_code == 0:
-            status = 'completed'
-        elif log_index > 0:
-            # We got some logs but stream ended abnormally - mark as partial, not failed
-            status = 'partial'
-            logger.info(f"Session {session_id} fetch ended early (exit {exit_code}) but captured {log_index} log entries - marking as partial")
-        else:
-            # No logs captured and non-zero exit
-            status = 'failed'
-            
-        copilot_db.update_session_status(session_id, status, exit_code)
-        
-        logger.info(f"Stored {log_index} log lines and {entry_count} entries for session {session_id}")
-        
-    except Exception as e:
-        logger.error(f"Error fetching logs for session {session_id}: {e}")
+    return
 
 
 async def _process_historical_batch(session_id: str, entries: list):
-    """
-    Process a batch of historical entries: generate summary and store in DB.
-    Similar to _process_entry_batch but without WebSocket sending.
-    
-    Args:
-        session_id: Copilot session ID
-        entries: List of entry dicts
-    """
-    if not entries:
-        return
-    
-    # Generate summary (including code now)
-    loop = asyncio.get_event_loop()
-    try:
-        summary = await loop.run_in_executor(None, summarize_entries_sync, entries)
-        
-        # Get entry range
-        start_entry = entries[0]['entry_num']
-        end_entry = entries[-1]['entry_num']
-        
-        # Store summary in database
-        copilot_db.insert_summary(session_id, summary, start_entry, end_entry)
-        
-        logger.info(f"Generated summary for historical entries {start_entry}-{end_entry}: {summary[:50]}...")
-        
-    except Exception as e:
-        logger.error(f"Error processing historical batch: {e}")
+    return
 
 
 async def poll_for_copilot_session_on_pr(pr_number: int, websocket, client_id: str):
-    """
-    Poll for a Copilot agent task on a specific PR (used when commenting on existing PRs).
-    Much simpler than poll_for_copilot_session since we already know the PR number.
-    
-    Args:
-        pr_number: The PR number where @copilot was mentioned
-        websocket: WebSocket connection to stream logs to
-        client_id: Client identifier
-    """
-    logger.info(f"Polling for Copilot session on PR #{pr_number}")
-    
-    max_wait = 120  # Wait up to 2 minutes for session to start
-    poll_interval = 5  # Check every 5 seconds
-    start_time = datetime.now()
-    
-    try:
-        # Notify client we're watching
-        await websocket.send(json.dumps({
-            'type': 'copilot_watching',
-            'pr_number': pr_number,
-            'message': f'Waiting for Copilot session to start on PR #{pr_number}...',
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-        # Create clean environment for gh CLI
-        env = os.environ.copy()
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
-        
-        while (datetime.now() - start_time).total_seconds() < max_wait:
-            try:
-                # Check if session exists for this PR using gh agent-task list
-                proc = await asyncio.create_subprocess_exec(
-                    'gh', 'agent-task', 'list',
-                    '--limit', '50',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env
-                )
-                stdout, stderr = await proc.communicate()
-                stdout_text = stdout.decode('utf-8', errors='replace').strip()
-                
-                # Look for our PR in the output
-                if f'#{pr_number}' in stdout_text and 'program-at/ProgramAT' in stdout_text:
-                    logger.info(f"Found session on PR #{pr_number}, starting stream")
-                    
-                    # Notify client
-                    await websocket.send(json.dumps({
-                        'type': 'copilot_session_starting',
-                        'pr_number': pr_number,
-                        'message': f'Copilot session found, streaming logs...',
-                        'timestamp': datetime.now().isoformat()
-                    }))
-                    
-                    # Start streaming logs - stream function will extract the session ID
-                    # skip_wait=True because we already confirmed the session exists via agent-task list
-                    await stream_copilot_session_logs(
-                        websocket,
-                        client_id,
-                        str(pr_number),  # Pass PR number, function will get session ID
-                        pr_number=pr_number,
-                        skip_wait=True
-                    )
-                    return
-                else:
-                    logger.debug(f"No session yet on PR #{pr_number}, waiting...")
-                    
-            except Exception as e:
-                logger.warning(f"Error checking for session on PR #{pr_number}: {e}")
-            
-            await asyncio.sleep(poll_interval)
-        
-        # Timeout
-        logger.info(f"Timed out waiting for Copilot session on PR #{pr_number}")
-        await websocket.send(json.dumps({
-            'type': 'copilot_session_timeout',
-            'pr_number': pr_number,
-            'message': f'No Copilot session started within {max_wait} seconds',
-            'timestamp': datetime.now().isoformat()
-        }))
-        
-    except Exception as e:
-        logger.error(f"Error polling for session on PR #{pr_number}: {e}")
+    await websocket.send(json.dumps({
+        'type': 'copilot_session_timeout',
+        'pr_number': pr_number,
+        'message': 'Remote code-agent session polling is no longer supported on this branch.',
+        'timestamp': datetime.now().isoformat()
+    }))
 
 
 async def poll_for_copilot_session(issue_number: int, websocket, client_id: str):
     """
-    Poll for a Copilot agent task associated with a newly created issue.
-    Watches for PR creation and then streams the agent task logs using gh agent-task view.
-    
-    Args:
-        issue_number: The GitHub issue number to monitor
-        websocket: WebSocket connection to stream logs to
-        client_id: Client identifier
+    Poll GitHub for the Claude PR created for a newly opened VAT issue.
+    The legacy helper name is retained to avoid unrelated compatibility churn.
     """
     global pending_copilot_issues
-    
-    logger.info(f"Starting to poll for Copilot agent task for issue #{issue_number}")
-    
-    max_poll_duration = 600  # Poll for up to 10 minutes
-    poll_interval = 15  # Check every 15 seconds
-    session_poll_interval = 5  # Check for session more frequently once PR is found
+
+    logger.info(f"Starting to poll for Claude work for issue #{issue_number}")
+    max_poll_duration = 600
+    poll_interval = 15
     start_time = datetime.now()
-    found_pr = None
-    
-    # Helper to send to websocket, tolerating disconnects
-    async def _safe_send(msg_dict):
-        """Send JSON to the websocket. Returns False if send failed (client gone)."""
+
+    async def _safe_send(message: dict) -> bool:
         nonlocal websocket
-        # Refresh websocket from pending_copilot_issues in case client reconnected
         info = pending_copilot_issues.get(issue_number)
         if info and info.get('websocket'):
             websocket = info['websocket']
         try:
-            await websocket.send(json.dumps(msg_dict))
+            await websocket.send(json.dumps(message))
             return True
         except Exception:
-            logger.debug(f"WebSocket send failed for issue #{issue_number} poll (client disconnected)")
+            logger.debug(
+                f"WebSocket send failed for issue #{issue_number} poll (client disconnected)"
+            )
             return False
-    
+
     try:
-        # Notify client we're watching for Copilot
         await _safe_send({
             'type': 'copilot_watching',
             'issue_number': issue_number,
-            'message': f'Watching for Copilot to create a PR for issue #{issue_number}...',
+            'message': f'Watching for Claude to create a PR for issue #{issue_number}...',
             'timestamp': datetime.now().isoformat()
         })
-        
+
         while (datetime.now() - start_time).total_seconds() < max_poll_duration:
-            # Check if client disconnected
             if issue_number not in pending_copilot_issues:
                 logger.info(f"Stopped polling for issue #{issue_number} - removed from pending")
                 return
-            
+
             try:
-                # If we haven't found a PR yet, look for one
-                if not found_pr:
-                    g = Github(GITHUB_TOKEN)
-                    repo = g.get_repo(GITHUB_REPO)
-                    pulls = repo.get_pulls(state='open', sort='created', direction='desc')
-                    
-                    for pr in list(pulls)[:10]:  # Check recent PRs
-                        pr_text = f"{pr.title} {pr.body or ''}"
-                        if f"#{issue_number}" in pr_text or f"Fixes #{issue_number}" in pr_text or f"Closes #{issue_number}" in pr_text:
-                            logger.info(f"Found PR #{pr.number} for issue #{issue_number}")
-                            found_pr = pr
-                            
-                            # Store PR number in pending info for reconnecting clients
-                            if issue_number in pending_copilot_issues:
-                                pending_copilot_issues[issue_number]['pr_number'] = pr.number
-                            
-                            # Notify client about PR (tolerate disconnects)
-                            await _safe_send({
-                                'type': 'copilot_pr_found',
-                                'issue_number': issue_number,
-                                'pr_number': pr.number,
-                                'pr_title': pr.title,
-                                'pr_url': pr.html_url,
-                                'message': f'Copilot created PR #{pr.number}: {pr.title}. Waiting for agent session to start...',
-                                'timestamp': datetime.now().isoformat()
-                            })
-                            break
-                
-                # If we found a PR, try to stream its session
-                # The stream function will use gh agent-task list to find the session ID
-                if found_pr:
-                    logger.info(f"Found PR #{found_pr.number}, attempting to stream session")
-                    
-                    # Refresh websocket from pending info (client may have reconnected)
-                    info = pending_copilot_issues.get(issue_number)
-                    if info and info.get('websocket'):
-                        websocket = info['websocket']
-                        client_id = info.get('client_id', client_id)
-                    
-                    # Remove from pending (done polling, about to stream)
-                    if issue_number in pending_copilot_issues:
-                        del pending_copilot_issues[issue_number]
-                    
-                    # Notify client session is starting (tolerate disconnects)
-                    await _safe_send({
-                        'type': 'copilot_session_starting',
-                        'pr_number': found_pr.number,
-                        'message': f'Agent session found, streaming logs...',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    # Start streaming - pass PR number, stream function will extract session ID
-                    # skip_wait=True because poll already confirmed the session exists
-                    await stream_copilot_session_logs(
-                        websocket, 
-                        client_id, 
-                        str(found_pr.number),  # Pass PR number as string
-                        pr_number=found_pr.number,  # Explicitly pass PR number for database
-                        skip_wait=True
-                    )
-                    return
-                    
-                    # Session not ready, wait shorter interval
-                    await asyncio.sleep(session_poll_interval)
-                    continue
-                
+                g = Github(GITHUB_TOKEN)
+                repo = g.get_repo(GITHUB_REPO)
+                pulls = repo.get_pulls(state='open', sort='created', direction='desc')
+
+                for i, pr in enumerate(pulls):
+                    if i >= 20:
+                        break
+                    pr_text = f"{pr.title} {pr.body or ''}"
+                    if (
+                        f"#{issue_number}" in pr_text
+                        or f"Fixes #{issue_number}" in pr_text
+                        or f"Closes #{issue_number}" in pr_text
+                    ):
+                        logger.info(f"Found Claude PR #{pr.number} for issue #{issue_number}")
+                        upsert_traceability_record(
+                            mode='create',
+                            issue_number=issue_number,
+                            pr_number=pr.number,
+                            commit_sha=pr.head.sha,
+                            metadata={'pr_url': pr.html_url, 'branch_name': pr.head.ref},
+                        )
+                        if issue_number in pending_copilot_issues:
+                            pending_copilot_issues[issue_number]['pr_number'] = pr.number
+                            pending_copilot_issues.pop(issue_number, None)
+
+                        await _safe_send({
+                            'type': 'copilot_pr_found',
+                            'issue_number': issue_number,
+                            'pr_number': pr.number,
+                            'pr_title': pr.title,
+                            'pr_url': pr.html_url,
+                            'message': f'Claude created PR #{pr.number}: {pr.title}.',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        return
             except Exception as e:
-                logger.warning(f"Error polling for Copilot agent task: {e}")
-            
+                logger.warning(f"Error polling for Claude PR: {e}")
+
             await asyncio.sleep(poll_interval)
-        
-        # Timeout reached
-        logger.info(f"Stopped polling for issue #{issue_number} - timeout reached")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
-        
+
+        pending_copilot_issues.pop(issue_number, None)
         await _safe_send({
             'type': 'copilot_watch_timeout',
             'issue_number': issue_number,
-            'message': f'Timed out waiting for Copilot to create a PR for issue #{issue_number}',
+            'message': f'Timed out waiting for Claude to create a PR for issue #{issue_number}',
             'timestamp': datetime.now().isoformat()
         })
-        
     except asyncio.CancelledError:
-        logger.info(f"Copilot polling cancelled for issue #{issue_number}")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
+        logger.info(f"Claude polling cancelled for issue #{issue_number}")
+        pending_copilot_issues.pop(issue_number, None)
         raise
     except Exception as e:
         logger.error(f"Error in poll_for_copilot_session: {e}")
-        if issue_number in pending_copilot_issues:
-            del pending_copilot_issues[issue_number]
+        pending_copilot_issues.pop(issue_number, None)
+
 
 
 def fetch_open_prs():
@@ -3135,9 +4104,11 @@ def fetch_open_issues():
         
         # Fetch open issues (limit to 50 most recent)
         issues = repo.get_issues(state='open', sort='updated', direction='desc')
-        
+
         issue_list = []
-        for issue in issues[:50]:  # Limit to 50 issues
+        for i, issue in enumerate(issues):
+            if i >= 50:
+                break
             issue_list.append({
                 'number': issue.number,
                 'title': issue.title,
@@ -3181,6 +4152,31 @@ def fetch_pr_title(pr_number: int) -> str:
     except Exception as e:
         logger.error(f"Failed to fetch title for PR #{pr_number}: {e}")
         return f"PR #{pr_number}"
+
+
+def _fallback_issue_title(parsed_data: dict, raw_text: str) -> str:
+    """Build a non-empty GitHub issue title when the parser leaves it blank."""
+    candidates = [
+        parsed_data.get('title'),
+        parsed_data.get('description'),
+        parsed_data.get('example_usage'),
+        _original_request_fallback(parsed_data),
+        raw_text,
+    ]
+
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            candidate = ' '.join(str(item) for item in candidate)
+        elif candidate is None:
+            candidate = ''
+        elif not isinstance(candidate, str):
+            candidate = str(candidate)
+
+        normalized = ' '.join(candidate.split()).strip(' .:-')
+        if normalized:
+            return normalized[:256]
+
+    return "Visual assistive tool request"
 
 
 def fetch_pr_tools(pr_number: int) -> list:
@@ -3228,6 +4224,19 @@ def get_local_tools_for_pr_merge() -> list:
     """Get local tools that can be used for PR merging"""
     local_tools = []
     local_tools_dir = Path(__file__).parent.parent / 'tools'
+    source_repo = GITHUB_REPO
+    branch_name = ''
+    commit_sha = ''
+    try:
+        head_ref = (Path(__file__).parent.parent / '.git' / 'HEAD').read_text(encoding='utf-8').strip()
+        if head_ref.startswith('ref: '):
+            ref_path = head_ref.split(' ', 1)[1].strip()
+            branch_name = Path(ref_path).name
+            commit_sha = (Path(__file__).parent.parent / '.git' / ref_path).read_text(encoding='utf-8').strip()
+        else:
+            commit_sha = head_ref
+    except Exception:
+        logger.debug("Could not determine local git source info", exc_info=True)
     
     if not local_tools_dir.exists():
         return []
@@ -3267,7 +4276,7 @@ def get_local_tools_for_pr_merge() -> list:
                         description = description[:200] + "..."
             
             tool_name = py_file.stem
-            local_tools.append({
+            tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': f'tools/{py_file.name}',
                 'description': description,
@@ -3275,6 +4284,16 @@ def get_local_tools_for_pr_merge() -> list:
                 'language': 'python',
                 'source': 'local'
             })
+            _log_runtime_input_tool_source(
+                tool_record,
+                'local',
+                source_repo,
+                branch_name,
+                None,
+                commit_sha,
+            )
+            _log_runtime_input_tool_metadata('local_pr_merge', tool_record)
+            local_tools.append(tool_record)
             
         except Exception as e:
             logger.warning(f"Failed to read local tool {py_file}: {e}")
@@ -3283,8 +4302,29 @@ def get_local_tools_for_pr_merge() -> list:
     return local_tools
 
 
-def resolve_tool_code_for_execution(tool_name: str, tool_path: str = '', client_tool_code: str = '') -> str:
-    """Prefer the server's current local tool code over stale client-sent code."""
+def resolve_tool_code_for_execution(
+    tool_name: str,
+    tool_path: str = '',
+    client_tool_code: str = '',
+    client_tool_source: str = '',
+) -> str:
+    """Prefer fetched remote code, using the current local tool only as fallback."""
+    remote_code = client_tool_code or ''
+    if remote_code and not (client_tool_source or '').strip().lower().startswith('local'):
+        normalized_path = (tool_path or '').strip().lower()
+        remote_is_python = not normalized_path or normalized_path.endswith('.py')
+        try:
+            if remote_is_python:
+                ast.parse(remote_code)
+            logger.info("[ToolResolution] tool=%s source=remote", tool_name)
+            return remote_code
+        except SyntaxError as exc:
+            logger.warning(
+                "[ToolResolution] tool=%s remote_invalid=%s; trying local fallback",
+                tool_name,
+                exc,
+            )
+
     candidates = []
 
     raw_path = (tool_path or '').strip()
@@ -3313,16 +4353,13 @@ def resolve_tool_code_for_execution(tool_name: str, tool_path: str = '', client_
         if candidate.exists() and candidate.is_file():
             try:
                 server_tool_code = candidate.read_text(encoding='utf-8')
-                if client_tool_code and client_tool_code != server_tool_code:
-                    logger.info(
-                        f"[RUN_TOOL] Using server-local tool code for {tool_name} from {candidate}; "
-                        "client-sent code was stale or different"
-                    )
+                logger.info("[ToolResolution] tool=%s source=local_fallback", tool_name)
                 return server_tool_code
             except Exception as e:
                 logger.warning(f"Failed to read local tool {candidate}: {e}")
 
-    return client_tool_code or ''
+    logger.warning("[ToolResolution] tool=%s source=unavailable", tool_name)
+    return ''
 
 
 def fetch_pr_tools_from_github(pr, repo) -> list:
@@ -3364,6 +4401,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
     commit = repo.get_commit(pr.head.sha)
     tree = commit.commit.tree
     logger.info(f"Successfully fetched tree for PR #{pr.number}, tree SHA: {tree.sha}")
+    repo_name = getattr(repo, 'full_name', GITHUB_REPO)
     
     # Recursively traverse the tree to find files in tools/ directory
     def find_tool_files(tree_obj, current_path=""):
@@ -3455,7 +4493,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
             }
             language = language_map.get(file_ext, file_ext)
             
-            tools.append({
+            tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': file_info['path'],
                 'description': description,
@@ -3470,6 +4508,16 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
                 'system_instruction': pr_system_instruction,
                 'query_interval': pr_query_interval,
             })
+            _log_runtime_input_tool_source(
+                tool_record,
+                'github_pr',
+                repo_name,
+                pr.head.ref,
+                pr.number,
+                pr.head.sha,
+            )
+            _log_runtime_input_tool_metadata('github_pr', tool_record)
+            tools.append(tool_record)
             logger.info(f"Added PR tool: {tool_name} from {file_info['path']} (PR #{pr.number})")
         except Exception as e:
             logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -3566,6 +4614,7 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
     try:
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO)
+        repo_name = getattr(repo, 'full_name', GITHUB_REPO)
         
         logger.info(f"Fetching production tools from branch: {branch_name}")
         
@@ -3655,15 +4704,26 @@ def fetch_branch_tools(branch_name: str = 'main') -> list:
                 }
                 language = language_map.get(file_ext, file_ext)
                 
-                tools.append({
+                tool_record = _inject_runtime_input_metadata({
                     'name': tool_name,
                     'path': file_info['path'],
                     'description': description,
                     'code': code,
                     'language': language,
                     'branch_name': branch_name,
-                    'is_production': True
+                    'is_production': True,
+                    'source': 'github_branch',
                 })
+                _log_runtime_input_tool_source(
+                    tool_record,
+                    'github_branch',
+                    repo_name,
+                    branch_name,
+                    None,
+                    commit_sha,
+                )
+                _log_runtime_input_tool_metadata('github_branch', tool_record)
+                tools.append(tool_record)
                 logger.info(f"Added production tool: {tool_name} from {file_info['path']} (branch {branch_name})")
             except Exception as e:
                 logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -3793,7 +4853,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                     'system_instruction': issue_system_instruction,
                     'query_interval': issue_query_interval,
                 })
-                return tools
+                return [_inject_runtime_input_metadata(tool) for tool in tools]
         
         # Extract tools from the best matched PR (only use the first one)
         for pr in matched_prs[:1]:  # Only use the best match
@@ -3909,7 +4969,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                         }
                         language = language_map.get(file_ext, file_ext)
                         
-                        tools.append({
+                        tools.append(_inject_runtime_input_metadata({
                             'name': tool_name,
                             'path': file_info['path'],
                             'description': description,
@@ -3923,7 +4983,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                             'gpt_query': issue_gpt_query,
                             'system_instruction': issue_system_instruction,
                             'query_interval': issue_query_interval,
-                        })
+                        }))
                         logger.info(f"Added tool: {tool_name} from {file_info['path']} (PR #{pr.number}, branch {pr.head.ref})")
                     except Exception as e:
                         logger.warning(f"Failed to fetch content for {file_info['path']}: {e}")
@@ -3932,7 +4992,7 @@ def fetch_issue_tools(issue_number: int) -> list:
                 logger.error(f"Failed to process PR #{pr.number}: {e}")
         
         logger.info(f"Found {len(tools)} tools for issue #{issue_number}")
-        return tools
+        return [_inject_runtime_input_metadata(tool) for tool in tools]
         
     except Exception as e:
         logger.error(f"Failed to fetch tools for issue #{issue_number}: {e}")
@@ -4163,8 +5223,8 @@ Return ONLY a valid JSON object:
 
 def should_mention_copilot(text: str) -> bool:
     """
-    Determine if the text is asking for code changes (should mention @copilot)
-    vs just status updates or issue selection (should not mention @copilot).
+    Determine if the text is asking for code changes that should trigger Claude
+    vs just status updates or issue selection.
     
     Args:
         text: The comment text to analyze
@@ -4188,9 +5248,12 @@ def should_mention_copilot(text: str) -> bool:
         'switching to', 'selected issue', 'working on'
     ]
     
-    # Check for status keywords first - these take precedence
+    # Treat these as navigation/status comments only when the whole comment is
+    # such a command.  A substring check made implementation requests such as
+    # "update the view to show ..." incorrectly return False.
+    normalized = ' '.join(text_lower.split()).strip(' .!?')
     for keyword in status_keywords:
-        if keyword in text_lower:
+        if normalized == keyword or normalized.startswith(f"{keyword} issue ") or normalized.startswith(f"{keyword} pr "):
             return False
     
     # Check for code change keywords
@@ -4198,19 +5261,68 @@ def should_mention_copilot(text: str) -> bool:
         if keyword in text_lower:
             return True
     
-    # Default: always mention @copilot so it stays aware of issue updates.
+    # Default: keep the active code agent aware of issue updates.
     return True
+
+
+def build_copilot_comment(
+    comment_text: str,
+    trigger_required: bool,
+    provider: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Build an agent-triggering comment while preserving the legacy helper name."""
+    mention = '@claude'
+    if not trigger_required or re.search(
+        rf'(?i)(?<![\w-]){re.escape(mention)}\b', comment_text
+    ):
+        return comment_text, False
+    return f"{mention}\n\n{comment_text}", True
+
+
+def resolve_claude_progress_comment(repo_name: str, number: int,
+                                    comment_id: Optional[int] = None,
+                                    mode: str = 'create') -> tuple[object, object, list]:
+    g = Github(GITHUB_TOKEN)
+    repo = g.get_repo(repo_name)
+    issue = repo.get_issue(int(number))
+    endpoint = f"/repos/{repo_name}/issues/{number}/comments"
+
+    comments = list(issue.get_comments())
+    logger.info(
+        "[Claude Comment] mode=%s number=%s endpoint=%s comments=%s",
+        mode, number, endpoint, len(comments),
+    )
+    if comment_id:
+        selected = select_claude_progress_comment(comments, int(comment_id))
+        logger.info("[Claude Comment] selected_id=%s", getattr(selected, 'id', None))
+        return issue, selected, comments
+    for comment in comments:
+        logger.info(
+            "[Claude Comment] candidate_id=%s author=%s body_present=%s",
+            getattr(comment, 'id', None),
+            getattr(getattr(comment, 'user', None), 'login', None),
+            bool(getattr(comment, 'body', None)),
+        )
+    try:
+        selected = select_claude_progress_comment(comments)
+        logger.info("[Claude Comment] selected_id=%s", getattr(selected, 'id', None))
+        return issue, selected, comments
+    except LookupError:
+        logger.info("[Claude Comment] selected_id=none")
+        raise
+
 
 
 async def update_github_issue(issue_number: int, comment_text: str, mention_copilot: bool = True):
     """
     Add a comment to an existing GitHub issue or PR.
-    Optionally mentions @copilot in the comment to get Copilot's attention.
+    Optionally mention the active code agent to trigger implementation work.
     
     Args:
         issue_number: The issue or PR number to update
         comment_text: The comment to add
-        mention_copilot: Whether to add @copilot mention (True for code changes, False for status updates)
+        mention_copilot: Whether to trigger the agent (True for code changes,
+            False for status updates). The name is retained for compatibility.
     """
     _log_to_all_sessions("INFO", f"update_github_issue called: issue/PR #{issue_number}, comment: {comment_text}, mention_copilot: {mention_copilot}")
     
@@ -4223,38 +5335,66 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO)
         issue = repo.get_issue(issue_number)
-        
-        # Append @copilot to the comment if requested (for code change requests)
-        final_comment = f"{comment_text}\n\n@copilot" if mention_copilot else comment_text
+
+        is_pr = issue.pull_request is not None
+        target_kind = "PR" if is_pr else "issue"
+        # Claude should continue an existing PR, not start a second issue run.
+        pr_number = issue_number if is_pr else None
+        pr_url = issue.html_url if is_pr else None
+        associated_pr = None
+        if not is_pr:
+            try:
+                pulls = repo.get_pulls(state='open')
+                for pr in pulls:
+                    if f"#{issue_number}" in f"{pr.title} {pr.body or ''}":
+                        associated_pr = pr
+                        pr_number = pr.number
+                        pr_url = pr.html_url
+                        break
+            except Exception as e:
+                _log_to_all_sessions("WARNING", f"Could not find PR for issue #{issue_number}: {e}")
+                logger.warning(f"Could not find PR for issue #{issue_number}: {e}")
+
+        trigger_required = mention_copilot
+        issue_trigger_required = trigger_required and associated_pr is None
+        final_comment, mention_added = build_copilot_comment(
+            comment_text,
+            issue_trigger_required if not is_pr else trigger_required,
+        )
+        preview = ' '.join(final_comment.split())[:240]
+        decision_log = (
+            f"GitHub comment decision: target={target_kind} #{issue_number}, "
+            f"agent=claude, trigger_required={trigger_required}, "
+            f"mention_added_automatically={mention_added}, preview={preview!r}"
+        )
+        _log_to_all_sessions("INFO", decision_log)
+        logger.info(decision_log)
         
         # Add comment to the issue/PR
         issue.create_comment(final_comment)
-        _log_to_all_sessions("INFO", f"GitHub API: Added comment to #{issue_number}" + (" with @copilot mention" if mention_copilot else ""))
-        logger.info(f"Added comment to #{issue_number}" + (" with @copilot mention" if mention_copilot else ""))
+        trigger_note = " with code-agent mention" if mention_added else ""
+        _log_to_all_sessions("INFO", f"GitHub API: Added comment to #{issue_number}{trigger_note}")
+        logger.info(f"Added comment to #{issue_number}{trigger_note}")
         
-        # Check if this is a PR (pull_request attribute exists) or an issue
-        is_pr = issue.pull_request is not None
-        pr_number = issue_number if is_pr else None
-        pr_url = issue.html_url if is_pr else None
-        
-        # If it's an issue (not a PR), try to find an associated PR
-        if not is_pr:
+        # Also preserve the update on the associated PR. For Claude, this is the
+        # sole triggering mention so the same request cannot start two runs.
+        if associated_pr is not None:
             try:
-                # Search for PR that references this issue
-                pulls = repo.get_pulls(state='open')
-                for pr in pulls:
-                    # Check if PR body or title references this issue
-                    if pr.body and f"#{issue_number}" in pr.body:
-                        pr_number = pr.number
-                        pr.create_issue_comment(final_comment)
-                        pr_url = pr.html_url
-                        _log_to_all_sessions("INFO", f"GitHub API: Added comment to associated PR #{pr_number}" + (" with @copilot mention" if mention_copilot else ""))
-                        logger.info(f"Added comment to associated PR #{pr_number}" + (" with @copilot mention" if mention_copilot else ""))
-                        break
+                pr_comment, _ = build_copilot_comment(comment_text, trigger_required)
+                associated_pr.create_issue_comment(pr_comment)
+                _log_to_all_sessions("INFO", f"GitHub API: Added comment to associated PR #{pr_number}")
+                logger.info(f"Added comment to associated PR #{pr_number}")
+                upsert_traceability_record(
+                    mode='update',
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                    commit_sha=associated_pr.head.sha,
+                    metadata={'pr_url': associated_pr.html_url, 'branch_name': associated_pr.head.ref},
+                )
             except Exception as e:
                 _log_to_all_sessions("WARNING", f"Could not add comment to PR for issue #{issue_number}: {e}")
                 logger.warning(f"Could not add comment to PR for issue #{issue_number}: {e}")
-        
+
         # Send success notification to client
         if connected_clients:
             success_data = {
@@ -4266,8 +5406,7 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
                 'pr_url': pr_url
             }
             await _broadcast_ws(success_data)
-            # @copilot was mentioned in the comment — no automatic log streaming.
-            # Copilot session logs are only streamed when the user explicitly requests them.
+            # Detailed Claude logs remain authoritative in GitHub Actions.
         
     except Exception as e:
         import traceback
@@ -4278,7 +5417,10 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         logger.error(tb)
 
 
-def _build_issue_extraction_prompt(transcript: str, existing_data: Optional[dict] = None) -> str:
+def _build_issue_extraction_prompt(
+    transcript: str,
+    existing_data: Optional[dict] = None,
+) -> str:
     context_info = ""
     if existing_data:
         issue_fields = {
@@ -4299,46 +5441,37 @@ Fields previously missing: {existing_data.get('missing_fields', [])}
 Merge the new transcript into those issue fields.
 """
 
-    return f"""Parse the following voice transcript and extract information for a visual assistive technology (AT) tool request.
+    return f"""Parse the following voice transcript for a visual assistive technology tool request.
 
 CRITICAL: Do not make up, infer, or extrapolate content that was not explicitly provided. Leave unmentioned fields empty.
 
-Extract only these issue fields:
-- title: concise summary, maximum 100 characters
-- description: description of the desired visual assistive technology
-- problem: problem it solves
-- solution: proposed solution
-- implementation_details: requested implementation details
-- example_usage: concrete example and expected behavior
-- alternatives: alternatives considered
-- live_mode: exactly "yes", "no", or empty when not explicitly stated
-- live_query: repeated live-mode query, otherwise empty
-- additional: other context
+Extract only these user-facing fields:
+- title: tool name, maximum 100 characters
+- description: the task the tool performs
+- example_usage: expected output
+- additional: constraints and examples
+- streaming_context: "latest_frame", "recent_history", or empty when unstated
 - missing_fields: only missing important fields
 
 Only block creation when the core task is genuinely unclear.
-- Core context: problem or description.
-- Core goal: example_usage or another clear task goal in solution/description.
-- Derive a concise title, description, and solution from an explicit problem or example when possible without inventing new requirements.
-- implementation_details, alternatives, and additional are optional.
-- live_mode is optional when not explicitly stated.
-- If live_mode is "yes" and live_query is empty, include "live_query" in missing_fields.
-- If live_mode is "no", live_query is optional and must not be included in missing_fields.
-- Do not return stages; task decomposition is handled separately.
+- Tool name, task, and expected output are the core fields.
+- Constraints/examples and streaming_context may be empty when unstated.
+- Use "recent_history" only when Streaming needs evidence across multiple
+  moments: sequence, duration, before/after comparison, state change, or what
+  just happened. Otherwise use "latest_frame".
+- This field describes Streaming frame needs, not the modes supported by the
+  whole tool. New tools normally support both Take Photo and Streaming.
+- Do not generate or improve a VLM prompt.
+- Do not return stages, subtasks, reasoning steps, capabilities, routes, or models.
 
 Return ONLY this JSON object:
 {{
   "type": "visual AT",
   "title": "...",
   "description": "...",
-  "problem": "...",
-  "solution": "...",
-  "implementation_details": "...",
   "example_usage": "...",
-  "alternatives": "...",
-  "live_mode": "...",
-  "live_query": "...",
   "additional": "...",
+  "streaming_context": "...",
   "missing_fields": []
 }}
 {context_info}
@@ -4346,19 +5479,32 @@ Transcript: {transcript}
 """
 
 
-def _stage_decomposition_input(transcript: str, existing_data: Optional[dict] = None) -> str:
-    previous_prompts = list((existing_data or {}).get('original_prompts') or [])
-    prior_text = [entry.split('] ', 1)[-1] for entry in previous_prompts]
-    return "\n".join([*prior_text, transcript]).strip()
+def _request_explicitly_requires_temporal_context(text: str) -> bool:
+    """Recognize explicit cross-moment semantics without guessing from task nouns."""
+    normalized = ' '.join(str(text or '').casefold().split())
+    temporal_patterns = (
+        r'\brecent (?:visual |hand |body )?(?:history|movement|movements|frames?)\b',
+        r'\b(?:movement|movements|motion|gesture|sign|phrase)\b.{0,50}\b(?:sequence|duration|lasts?|lasting|seconds?)\b',
+        r'\b(?:sequence|duration|before|after|early|late)\b.{0,50}\b(?:frames?|movement|movements|motion|state|change|gesture|sign)\b',
+        r'\bwhat (?:has )?just happened\b',
+        r'\b(?:what|sign|phrase|gesture)\b.{0,35}\bjust (?:made|happened|did|occurred)\b',
+        r'\bcompare\b.{0,50}\b(?:before|after|earlier|later|frames?|states?)\b',
+    )
+    return any(re.search(pattern, normalized) for pattern in temporal_patterns)
 
 
-def _merge_issue_and_stage_outputs(
-    issue_data: Dict[str, Any],
-    decomposition_data: Dict[str, Any],
-) -> Dict[str, Any]:
-    merged = dict(issue_data)
-    merged['stages'] = decomposition_data.get('stages')
-    return merged
+def _select_streaming_context(suggested_context: Any, original_request: str) -> str:
+    """Normalize the frame context needed by Streaming."""
+    if _request_explicitly_requires_temporal_context(original_request):
+        return 'recent_history'
+    normalized = str(suggested_context or '').strip().lower().replace('-', '_')
+    aliases = {
+        'take_photo': 'latest_frame',
+        'hosted_video_streaming': 'recent_history',
+        'streaming': 'recent_history',
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {'latest_frame', 'recent_history'} else 'latest_frame'
 
 
 def _normalize_issue_creation_requirements(
@@ -4367,7 +5513,14 @@ def _normalize_issue_creation_requirements(
 ) -> Dict[str, Any]:
     normalized = dict(parsed_data)
     explicit_custom_gpt = _explicit_custom_gpt_value(transcript)
-    parsed_custom_gpt = _normalize_custom_gpt_value(
+    streaming_context = str(
+        normalized.get('streaming_context') or normalized.get('execution_mode') or ''
+    ).strip().lower()
+    mode_custom_gpt = 'no' if streaming_context in {
+        'latest_frame', 'recent_history', 'take_photo',
+        'hosted_video_streaming', 'take-photo', 'streaming'
+    } else ''
+    parsed_custom_gpt = mode_custom_gpt or _normalize_custom_gpt_value(
         normalized.get('custom_gpt') or normalized.get('live_mode')
     )
     custom_gpt = explicit_custom_gpt or parsed_custom_gpt
@@ -4376,13 +5529,8 @@ def _normalize_issue_creation_requirements(
     normalized['custom_gpt'] = custom_gpt
     normalized['gpt_query'] = '' if custom_gpt == 'no' else gpt_query
 
-    has_context = bool(str(normalized.get('problem') or normalized.get('description') or '').strip())
-    has_goal = bool(str(
-        normalized.get('example_usage')
-        or normalized.get('solution')
-        or normalized.get('description')
-        or ''
-    ).strip())
+    has_context = bool(str(normalized.get('description') or '').strip())
+    has_goal = bool(str(normalized.get('example_usage') or '').strip())
 
     missing_fields = []
     if not has_context:
@@ -4408,104 +5556,49 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
     """
     try:
         issue_prompt = _build_issue_extraction_prompt(transcript, existing_data)
-        issue_response = system_llm_call(
+        logger.info("Issue extraction transcript=%s", transcript)
+        issue_response = transcript_llm_call(
             messages=[{'role': 'user', 'content': issue_prompt}],
             metadata={'response_format': {'type': 'json_object'}},
         )
         issue_raw = extract_text(issue_response)
+        logger.info("Issue extraction raw output=%s", issue_raw)
         issue_data = _parse_llm_json_object(issue_raw)
         logger.info(
-            "Issue extraction output=%s",
+            "Issue extraction parsed output=%s",
             json.dumps(issue_data, ensure_ascii=False),
         )
 
-        planner_enabled = load_global_execution_config()['planner_enabled']
-        if not planner_enabled:
-            parsed_data = _normalize_issue_creation_requirements(issue_data, transcript)
-            parsed_data['stages'] = []
-            existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            parsed_data['original_prompts'] = existing_prompts + [f"[{timestamp}] {transcript}"]
-            logger.info("Model routing disabled; skipping stage decomposition")
-            return parsed_data
-
-        try:
-            capability_names = sorted(load_capability_profiles())
-        except Exception:
-            capability_names = [
-                'general_reasoning', 'ocr', 'object_detection_localization',
-                'structured_visual_understanding', 'spatial_reasoning',
-                'navigation', 'camera_motion', 'temporal_reasoning',
-            ]
-
-        decomposition_input = _stage_decomposition_input(transcript, existing_data)
-        decomposition_prompt = build_stage_decomposition_prompt(decomposition_input)
-        decomposition_response = system_llm_call(
-            messages=[{'role': 'user', 'content': decomposition_prompt}],
-            metadata={'response_format': {'type': 'json_object'}},
+        parsed_data = _normalize_issue_creation_requirements(issue_data, transcript)
+        prior_requests = (existing_data or {}).get('original_prompts', [])
+        mode_semantics = '\n'.join([*(str(item) for item in prior_requests), transcript])
+        parsed_data['streaming_context'] = _select_streaming_context(
+            issue_data.get('streaming_context') or issue_data.get('execution_mode'),
+            mode_semantics,
         )
-        decomposition_raw = extract_text(decomposition_response)
-        logger.info(
-            "Stage decomposition raw response length=%s preview=%s",
-            len(decomposition_raw),
-            decomposition_raw[:2000],
-        )
-        decomposition_data = _parse_llm_json_object(decomposition_raw)
-        logger.info(
-            "Stage decomposition output=%s",
-            json.dumps(decomposition_data, ensure_ascii=False),
-        )
-
-        normalized_decomposition = normalize_stage_plan(
-            decomposition_data,
-            capability_names,
-            source_task=decomposition_input,
-        )
-        parsed_data = _merge_issue_and_stage_outputs(issue_data, normalized_decomposition)
-        logger.info(
-            "Merged parser output=%s",
-            json.dumps(parsed_data, ensure_ascii=False),
-        )
-
-        raw_stages = parsed_data.get('stages')
-        logger.info(
-            "Planner raw stages present=%s stage_count=%s",
-            isinstance(raw_stages, list),
-            len(raw_stages) if isinstance(raw_stages, list) else 0,
-        )
-
-        logger.info(
-            "Planner normalized stage_count=%s",
-            len(parsed_data.get('stages') or []),
-        )
-
-        parsed_data = _normalize_issue_creation_requirements(parsed_data, transcript)
+        parsed_data.pop('execution_mode', None)
+        parsed_data['stages'] = []
         
         # Preserve the original transcript for bookkeeping
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         parsed_data['original_prompts'] = existing_prompts + [f"[{timestamp}] {transcript}"]
 
-        logger.info(
-            "Planner stages for issue=%s",
-            json.dumps(parsed_data.get('stages', []), ensure_ascii=False),
-        )
+        logger.info("Issue parser produced one fused-prompt tool with no runtime stages")
         
         logger.info(f"Successfully parsed transcript with AI: type={parsed_data.get('type', 'unknown')}, missing={len(parsed_data.get('missing_fields', []))}")
         return parsed_data
         
     except Exception as e:
-        logger.exception("Failed to complete issue extraction and stage decomposition")
+        logger.exception("Failed to complete issue extraction")
         _log_to_all_sessions("ERROR", f"Issue parser workflow failed: {e}")
-        # Fallback to simple parsing
+        # Preserve the complete request when structured extraction fails. This
+        # is intentionally redundant across Task and Expected output: losing
+        # user intent is worse than asking the code agent to interpret the
+        # original wording in both required sections.
         existing_prompts = existing_data.get('original_prompts', []) if existing_data else []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         fallback_custom_gpt = _normalize_custom_gpt_value(transcript)
-        fallback_missing_fields = []
-        if not fallback_custom_gpt:
-            fallback_missing_fields = ['custom_gpt']
-        elif fallback_custom_gpt == 'yes' and not (existing_data or {}).get('gpt_query'):
-            fallback_missing_fields = ['gpt_query']
         return {
             'type': 'visual AT',
             'title': transcript[:100],
@@ -4513,16 +5606,47 @@ def parse_transcript_with_ai(transcript: str, existing_data: dict = None) -> dic
             'problem': '',
             'solution': '',
             'implementation_details': '',
-            'example_usage': '',
+            'example_usage': transcript,
             'custom_gpt': fallback_custom_gpt,
             'gpt_query': '',
             'alternatives': '',
             'additional': '',
-            'parser_failed': True,
+            'streaming_context': _select_streaming_context('', transcript),
+            'parser_fallback': True,
             'parser_error': str(e),
-            'missing_fields': fallback_missing_fields,
+            'missing_fields': [],
             'original_prompts': existing_prompts + [f"[{timestamp}] {transcript}"]
         }
+
+
+def _original_request_fallback(parsed_data: dict) -> str:
+    """Return preserved user wording suitable for a required issue field."""
+    prompts = parsed_data.get('original_prompts') or []
+    cleaned = []
+    for prompt in prompts:
+        text = re.sub(r'^\[[^\]]+\]\s*', '', str(prompt or '')).strip()
+        if text:
+            cleaned.append(text)
+    return '\n'.join(cleaned).strip()
+
+
+def _replace_issue_section(body: str, heading: str, value: str) -> str:
+    """Fill one issue field by heading instead of a fragile comment key."""
+    pattern = rf'(^## {re.escape(heading)}\s*\n\n).*?(?=^## |\Z)'
+    replacement = lambda match: f"{match.group(1)}{value.strip()}\n\n"
+    return re.sub(pattern, replacement, body, count=1, flags=re.MULTILINE | re.DOTALL)
+
+
+def _issue_section_content(body: str, heading: str) -> str:
+    """Read visible content from one generated issue section."""
+    match = re.search(
+        rf'^## {re.escape(heading)}\s*\n\n(.*?)(?=^## |\Z)',
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return ''
+    return re.sub(r'<!--.*?-->', '', match.group(1), flags=re.DOTALL).strip()
 
 
 def fill_template(template_content: str, parsed_data: dict) -> str:
@@ -4545,6 +5669,24 @@ def fill_template(template_content: str, parsed_data: dict) -> str:
         elif value is None:
             return ''
         return str(value)
+
+    fallback = _original_request_fallback(parsed_data)
+    task = ensure_string(parsed_data.get('description', '')).strip() or fallback
+    expected_output = (
+        ensure_string(parsed_data.get('example_usage', '')).strip() or fallback
+    )
+    fields = {
+        'Tool name': ensure_string(parsed_data.get('title', '')).strip(),
+        'Task': task,
+        'Expected output': expected_output,
+        'Constraints / examples': ensure_string(parsed_data.get('additional', '')).strip(),
+        'Streaming context': ensure_string(
+            parsed_data.get('streaming_context')
+            or parsed_data.get('execution_mode', '')
+        ).strip(),
+    }
+    for heading, value in fields.items():
+        filled = _replace_issue_section(filled, heading, value)
     
     # Inject original prompts into the ORIGINAL_PROMPTS comment block
     original_prompts = parsed_data.get('original_prompts', [])
@@ -4691,6 +5833,326 @@ async def generate_ideation_question(parsed_data: dict, video_summary: str, brai
     )
 
 
+async def generate_ranked_question_queue(
+    parsed_data: dict,
+    video_summary: str,
+    brainstorm_history: list = None,
+    existing_queue: list = None,
+    max_queue_size: int = 8,
+) -> list:
+    """
+    Generate 3 new brainstorming questions using Gemini, merge them with any
+    existing unasked questions from a previous batch, re-rank the combined list
+    by relevance given the full Q&A history, and return it ordered
+    most-to-least relevant.
+
+    Args:
+        parsed_data: The parsed issue data.
+        video_summary: Optional video summary string.
+        brainstorm_history: Previous Q&A pairs, newest last.
+        existing_queue: Unasked questions carried over from earlier batches.
+        max_queue_size: Cap on total queue length returned (default 8).
+
+    Returns a list of question strings, most relevant first.
+    Falls back to built-in defaults on any error or unparseable response.
+    """
+    title = parsed_data.get('title', '')
+    description = parsed_data.get('description', '')
+    solution = parsed_data.get('solution', '')
+    example_usage = parsed_data.get('example_usage', '')
+
+    video_section = ''
+    if video_summary:
+        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
+
+    brainstorm_section = ''
+    if brainstorm_context:
+        brainstorm_pairs = []
+        for qa_pair in brainstorm_context:
+            q = qa_pair.get('question', '').strip()
+            a = qa_pair.get('answer', '').strip()
+            if q and a:
+                brainstorm_pairs.append(f"Q: {q}\nA: {a}")
+        if brainstorm_pairs:
+            brainstorm_section = "\n\nPrevious brainstorming rounds:\n" + "\n\n".join(brainstorm_pairs)
+
+    prompt = (
+        "You are helping a blind or low-vision user design a camera-based assistive tool. "
+        "They have described the tool they want. Your job is to ask them ONE concise, "
+        "open-ended question that helps them think more deeply about their idea — "
+        "such as an edge case, an environmental condition, or how the tool should behave "
+        "when something goes wrong. Do not ask about things already answered below or in previous rounds. "
+        "Return only the question itself, nothing else.\n\n"
+        f"Tool title: {title}\n"
+        f"Description: {description}\n"
+        f"Proposed solution: {solution}\n"
+        f"Example usage: {example_usage}"
+        f"{video_section}"
+        f"{brainstorm_section}"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            system_llm_call,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        question = extract_text(response).strip()
+        if question:
+            return question
+    except Exception:
+        logger.warning("generate_ideation_question failed", exc_info=True)
+
+    return "Is there anything specific about how the tool should behave in difficult conditions, like low lighting or a cluttered background?"
+
+
+async def generate_ranked_question_queue(
+    parsed_data: dict,
+    video_summary: str,
+    brainstorm_history: list = None,
+    existing_queue: list = None,
+    max_queue_size: int = 8,
+) -> list:
+    """
+    Generate 3 new brainstorming questions using Gemini, merge them with any
+    existing unasked questions from a previous batch, re-rank the combined list
+    by relevance given the full Q&A history, and return it ordered
+    most-to-least relevant.
+
+    Args:
+        parsed_data: The parsed issue data.
+        video_summary: Optional video summary string.
+        brainstorm_history: Previous Q&A pairs, newest last.
+        existing_queue: Unasked questions carried over from earlier batches.
+        max_queue_size: Cap on total queue length returned (default 8).
+
+    Returns a list of question strings, most relevant first.
+    Falls back to built-in defaults on any error or unparseable response.
+    """
+    title = parsed_data.get('title', '')
+    description = parsed_data.get('description', '')
+    solution = parsed_data.get('solution', '')
+    example_usage = parsed_data.get('example_usage', '')
+
+    video_section = ''
+    if video_summary:
+        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
+
+    history_section = ''
+    if brainstorm_history:
+        pairs = []
+        for qa in brainstorm_history:
+            q = qa.get('question', '').strip()
+            a = qa.get('answer', '').strip()
+            if q and a:
+                pairs.append(f"Q: {q}\nA: {a}")
+        if pairs:
+            history_section = "\n\nQ&A so far:\n" + "\n\n".join(pairs)
+
+    existing_section = ''
+    if existing_queue:
+        existing_section = (
+            "\n\nThese questions were prepared earlier and not yet asked:\n"
+            + "\n".join(f"- {q}" for q in existing_queue)
+        )
+
+    prompt = (
+        "You are helping a blind or low-vision user design a camera-based assistive tool. "
+        "Here is everything known so far about the tool they want:\n\n"
+        f"Title: {title}\n"
+        f"Description: {description}\n"
+        f"Proposed solution: {solution}\n"
+        f"Example usage: {example_usage}"
+        f"{video_section}"
+        f"{history_section}"
+        f"{existing_section}"
+        "\n\nYour task:\n"
+        "1. Generate exactly 3 new clarifying questions focused on gaps, edge cases, "
+        "environmental conditions, or failure behaviors. "
+        "Do not ask about tool UI, display, interface, or presentation — those are handled by the app, not the tool. "
+        "Do not ask about anything already answered above.\n"
+        "2. Combine these 3 new questions with any existing unasked questions listed above.\n"
+        "3. Rank ALL questions (new + existing) from MOST to LEAST relevant, "
+        "considering what gaps remain most important given what is already known.\n"
+        f"4. Return the final ranked list as a plain numbered list (at most {max_queue_size} questions), "
+        "one question per line, most relevant first. No explanations, no headings.\n\n"
+        "Format exactly:\n"
+        "1. [question]\n"
+        "2. [question]\n"
+        "..."
+    )
+
+    fallback = [
+        "Is there anything specific about how the tool should behave in difficult conditions, "
+        "like low lighting or a cluttered background?",
+        "How precise does the spoken result need to be — does approximate information help, "
+        "or does it need to be exact?",
+        "Are there particular situations where you would want the tool to stay silent "
+        "rather than speak?",
+    ]
+
+    try:
+        response = await asyncio.to_thread(
+            call_model,
+            'gemini/gemini-3.1-flash-lite',
+            [{'role': 'user', 'content': prompt}],
+        )
+        text = extract_text(response).strip()
+        questions = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Strip leading numbering: "1. ", "1) ", "1- ", etc.
+            cleaned = re.sub(r'^\d+[\.\)\-]\s*', '', line).strip()
+            if cleaned and len(cleaned) > 10:
+                questions.append(cleaned)
+        if questions:
+            return questions[:max_queue_size]
+    except Exception:
+        logger.warning("generate_ranked_question_queue failed", exc_info=True)
+
+    return fallback[:max_queue_size]
+
+
+def _truncate_at_sentence_boundary(text: str, max_chars: int = 600) -> str:
+    """Cap a generated summary so a runaway response can't permanently
+    crowd out the pinned card the client displays it in. Prefers cutting at
+    the last sentence-ending punctuation before the limit; hard-truncates
+    with an ellipsis if no such boundary exists."""
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    boundary = max(window.rfind('.'), window.rfind('!'), window.rfind('?'))
+    if boundary > 0:
+        return window[:boundary + 1]
+    return window.rstrip() + '…'
+
+
+async def generate_understanding_summary(
+    parsed_data: dict,
+    video_summary: str,
+    brainstorm_context: list = None,
+    latest_qa: dict = None,
+) -> tuple:
+    """
+    Ask the system LLM for a brief, conversational restatement of what the
+    user is asking for so far — the kind of "so you want a tool that..."
+    paraphrase a person gives before asking a follow-up question. This is
+    purely informational (shown in a pinned UI card), so on any failure we
+    return ('', '') rather than a canned fallback: an uninformative placeholder
+    would be read aloud on every update and misrepresent what was understood.
+
+    Args:
+        parsed_data: The parsed issue data
+        video_summary: Optional video summary
+        brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
+        latest_qa: Optional {"question": str, "answer": str} for the most recent exchange;
+                   when provided, the LLM also generates a one-sentence integration note.
+
+    Returns (summary, integration_note) where summary is a plain 1-3 sentence string
+    and integration_note is a single sentence describing what was just learned
+    (or '' when there is no recent exchange).
+    """
+    title = parsed_data.get('title', '')
+    description = parsed_data.get('description', '')
+    example_usage = parsed_data.get('example_usage', '')
+    additional = parsed_data.get('additional', '')
+
+    video_section = ''
+    if video_summary:
+        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
+
+    brainstorm_section = ''
+    if brainstorm_context:
+        brainstorm_pairs = []
+        for qa_pair in brainstorm_context:
+            q = qa_pair.get('question', '').strip()
+            a = qa_pair.get('answer', '').strip()
+            if q and a:
+                brainstorm_pairs.append(f"Q: {q}\nA: {a}")
+        if brainstorm_pairs:
+            brainstorm_section = "\n\nAdditional details the user gave in follow-up rounds:\n" + "\n\n".join(brainstorm_pairs)
+
+    if latest_qa:
+        lq = latest_qa.get('question', '').strip()
+        la = latest_qa.get('answer', '').strip()
+        latest_section = f"\n\nMost recent exchange (just now):\nYou asked: {lq}\nThey answered: {la}"
+        prompt = (
+            "You are helping a blind or low-vision user design a camera-based assistive tool. "
+            "Below is everything they have told you so far about the tool they want. "
+            "Return exactly two labeled lines in this format:\n"
+            "SUMMARY: <your full restatement here>\n"
+            "NOTE: <one sentence here>\n\n"
+            "SUMMARY must be 1-3 sentences of plain conversational language starting with "
+            "\"Got it —\" or \"So you want\", restating the FULL understanding so far. "
+            "Fold in every detail they have given.\n"
+            "NOTE must be a single sentence starting with \"Added:\" that describes the "
+            "specific detail just incorporated from their most recent answer — not the "
+            "answer verbatim, but what you now understand because of it.\n"
+            "Do NOT ask a question. Do NOT add suggestions. Plain language only. No bullet points.\n\n"
+            f"Tool title: {title}\n"
+            f"Description: {description}\n"
+            f"Desired spoken answer: {example_usage}\n"
+            f"Constraints and extra context: {additional}"
+            f"{video_section}"
+            f"{brainstorm_section}"
+            f"{latest_section}"
+        )
+    else:
+        prompt = (
+            "You are helping a blind or low-vision user design a camera-based assistive tool. "
+            "Below is everything they have told you so far about the tool they want. "
+            "Write a brief, natural restatement of what you understand they are asking for — "
+            "what the tool does and roughly how it works. "
+            "Write 1 to 3 sentences of plain conversational language, addressed to the user, "
+            "the way you would briefly restate someone's request back to them before asking a "
+            "follow-up question. Start with something like \"Got it —\" or \"So you want\". "
+            "Fold in every detail they have given, including their follow-up answers. "
+            "Do NOT ask a question. Do NOT add suggestions, caveats, or ideas of your own. "
+            "Do NOT use bullet points, headings, or field labels. "
+            "Return only the restatement, nothing else.\n\n"
+            f"Tool title: {title}\n"
+            f"Description: {description}\n"
+            f"Desired spoken answer: {example_usage}\n"
+            f"Constraints and extra context: {additional}"
+            f"{video_section}"
+            f"{brainstorm_section}"
+        )
+
+    try:
+        response = await asyncio.to_thread(
+            call_model,
+            'gemini/gemini-3.1-flash-lite',
+            [{'role': 'user', 'content': prompt}],
+        )
+        text = extract_text(response).strip()
+
+        if latest_qa:
+            note = ''
+            if '\nNOTE:' in text:
+                summary_raw, note_raw = text.split('\nNOTE:', 1)
+                summary_raw = summary_raw.strip()
+                if summary_raw.upper().startswith('SUMMARY:'):
+                    summary_raw = summary_raw[len('SUMMARY:'):].strip()
+                note = ' '.join(note_raw.strip().split())
+            else:
+                summary_raw = text
+                if summary_raw.upper().startswith('SUMMARY:'):
+                    summary_raw = summary_raw[len('SUMMARY:'):].strip()
+            summary = ' '.join(summary_raw.split())
+            if summary:
+                summary = _truncate_at_sentence_boundary(summary)
+            return (summary, note)
+        else:
+            summary = ' '.join(text.split())
+            if summary:
+                return (_truncate_at_sentence_boundary(summary), '')
+    except Exception:
+        logger.warning("generate_understanding_summary failed", exc_info=True)
+
+    return ('', '')
+
+
 def _log_to_all_sessions(level: str, message: str):
     """Helper to log a message to all active session logs."""
     for session_log in active_session_loggers.values():
@@ -4712,6 +6174,8 @@ async def _broadcast_ws(data: dict) -> None:
         for result in results:
             if isinstance(result, Exception):
                 logger.warning(f"Failed to broadcast to client: {result}")
+
+
 
 
 async def create_github_issue(text: str):
@@ -4746,9 +6210,9 @@ async def create_github_issue(text: str):
         
         if selected_issue['mode'] == 'update' and selected_issue['number']:
             logger.info(f"Already in update mode for issue #{selected_issue['number']}, adding comment")
-            # Determine if we should mention @copilot based on the comment content
+            # Determine if this is an agent-triggering code update.
             mention_copilot = should_mention_copilot(text.strip())
-            logger.info(f"Comment mentions copilot: {mention_copilot}")
+            logger.info(f"Comment triggers code agent: {mention_copilot}")
             await update_github_issue(selected_issue['number'], text.strip(), mention_copilot)
             return
         
@@ -4834,15 +6298,15 @@ async def create_github_issue(text: str):
 
         if parsed_data.get('parser_failed'):
             error_message = parsed_data.get('parser_error') or 'unknown parser error'
-            logger.error("Issue creation stopped because stage decomposition failed: %s", error_message)
+            logger.error("Issue creation stopped because issue parsing failed: %s", error_message)
             _log_to_all_sessions(
                 "ERROR",
-                f"Issue creation stopped because stage decomposition failed: {error_message}",
+                f"Issue creation stopped because issue parsing failed: {error_message}",
             )
             if connected_clients:
                 await _broadcast_ws({
                     'type': 'issue_creation_error',
-                    'message': 'I could not decompose the task, so no incomplete issue was created. Please try again.',
+                    'message': 'I could not parse the task, so no incomplete issue was created. Please try again.',
                 })
             return
         
@@ -4880,7 +6344,8 @@ async def create_github_issue(text: str):
         # --- Ideation turn ---
         # If not yet done, send one open-ended question to help the user flesh out
         # their idea, then wait for their answer before creating the issue.
-        if not pending_ideation['active']:
+        # Skipped entirely when the client has disabled brainstorming (Basic mode).
+        if not pending_ideation['active'] and selected_issue.get('brainstorming_enabled', True):
             logger.info("Sending ideation question before issue creation")
             _log_to_all_sessions("INFO", "Sending ideation question")
             question = await generate_ideation_question(parsed_data, '')
@@ -4888,20 +6353,21 @@ async def create_github_issue(text: str):
             pending_ideation['parsed_data'] = parsed_data
             pending_ideation['video_summary'] = ''
             await _broadcast_ws({'type': 'ideation_question', 'message': question})
-            return  # wait for user's answer
+            return
 
-        # Ideation answer has arrived — fold it into the parsed data and proceed.
-        logger.info("Received ideation answer, proceeding to issue creation")
-        _log_to_all_sessions("INFO", "Received ideation answer")
-        parsed_data = pending_ideation['parsed_data']
-        ideation_answer = text.strip()
-        if ideation_answer:
-            parsed_data['additional'] = (
-                (parsed_data.get('additional') or '') + '\n\nUser ideation response: ' + ideation_answer
-            ).strip()
-        pending_ideation['active'] = False
-        pending_ideation['parsed_data'] = None
-        pending_ideation['video_summary'] = ''
+        if pending_ideation['active']:
+            # Ideation answer has arrived — fold it into the parsed data and proceed.
+            logger.info("Received ideation answer, proceeding to issue creation")
+            _log_to_all_sessions("INFO", "Received ideation answer")
+            parsed_data = pending_ideation['parsed_data']
+            ideation_answer = text.strip()
+            if ideation_answer:
+                parsed_data['additional'] = (
+                    (parsed_data.get('additional') or '') + '\n\nUser ideation response: ' + ideation_answer
+                ).strip()
+            pending_ideation['active'] = False
+            pending_ideation['parsed_data'] = None
+            pending_ideation['video_summary'] = ''
 
         logger.info("Creating issue after ideation turn")
         _log_to_all_sessions("INFO", "Creating issue after ideation turn")
@@ -4927,37 +6393,25 @@ async def create_github_issue(text: str):
             # Fallback if template doesn't exist
             body = f"**Transcript:**\n{text}\n\n**Parsed Data:**\n{json.dumps(parsed_data, indent=2)}"
 
-        issue_stages = parsed_data.get('stages') or []
-        logger.info(
-            "Issue body stage handoff: stage_count=%s",
-            len(issue_stages),
-        )
-        if issue_stages:
-            body = _append_task_stages_to_issue_body(body, {'stages': issue_stages})
-            logger.info(
-                "Including Task Stages in GitHub issue: %s",
-                json.dumps(issue_stages, ensure_ascii=False),
+        empty_required_sections = [
+            heading for heading in ('Task', 'Expected output')
+            if not _issue_section_content(body, heading)
+        ]
+        if empty_required_sections:
+            raise ValueError(
+                "Refusing to create issue with empty required sections: "
+                + ", ".join(empty_required_sections)
             )
-            _log_to_all_sessions(
-                "INFO",
-                f"Including {len(issue_stages)} Task Stages in GitHub issue: "
-                f"{json.dumps(issue_stages, ensure_ascii=False)}",
-            )
-        
+
         # Create GitHub client
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO)
         
-        # Create issue with parsed title and filled template
-        title = parsed_data.get('title', text[:100])
-        
-        # Ensure title is a string (AI might return unexpected formats)
-        if isinstance(title, list):
-            title = ' '.join(str(item) for item in title)
-        elif not isinstance(title, str):
-            title = str(title)
-        
-        # Truncate title if too long (GitHub has a limit)
+        # Create issue with parsed title and filled template.
+        # The parser occasionally leaves title blank, so always normalize
+        # through a fallback chain before calling GitHub.
+        title = _fallback_issue_title(parsed_data, text)
+
         if len(title) > 256:
             title = title[:253] + '...'
         
@@ -4981,6 +6435,8 @@ async def create_github_issue(text: str):
         issue_cache['last_fetch'] = datetime.now()
         _log_to_all_sessions("INFO", f"GitHub API: Created issue #{issue.number}: {title} (url: {issue.html_url})")
         logger.info(f"Created GitHub issue #{issue.number}: {title[:50]}... (type: {issue_type})")
+
+        issue.add_to_labels('ready-for-claude')
         
         # Send success notification to client
         if connected_clients:
@@ -4992,7 +6448,6 @@ async def create_github_issue(text: str):
             }
             await _broadcast_ws(success_data)
             
-            # Start polling for Copilot session for each connected client
             for ws in connected_clients:
                 try:
                     ws_client_id = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
@@ -5009,9 +6464,9 @@ async def create_github_issue(text: str):
                     asyncio.create_task(
                         poll_for_copilot_session(issue.number, ws, ws_client_id)
                     )
-                    logger.info(f"Started Copilot session polling for issue #{issue.number}")
+                    logger.info(f"Started Claude PR polling for issue #{issue.number}")
                 except Exception as e:
-                    logger.error(f"Error starting Copilot poll for client: {e}")
+                    logger.error(f"Error starting Claude poll for client: {e}")
         
     except Exception as e:
         import traceback
@@ -5259,12 +6714,16 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
 
     Two-shape protocol:
       Shape A (first call)  — no token in metadata:
-        Parses transcript + video, generates ideation question.
-        Returns: {status: 'ideation', question, token}
+        Parses transcript + video, generates ideation question and an
+        understanding summary (a short conversational restatement of what
+        was understood so far, for display in the client's pinned summary UI).
+        Returns: {status: 'ideation', question, token, summary}
 
       Shape B (second call) — token + ideation_answer in metadata:
         Looks up stored parsed_data, folds in the answer, creates GitHub issue.
         Returns: {status: 'created', issue_number, issue_url, video_summary}
+        or, if the user chooses to keep brainstorming instead of building:
+        Returns: {status: 'brainstorm_choice', token, brainstorm_history, summary}
     """
     if not GITHUB_TOKEN:
         return web.json_response({'status': 'error', 'error': 'GitHub not configured'}, status=503)
@@ -5283,6 +6742,7 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
     ideation_answer = ''
     token = ''
     choice = ''  # 'keep_brainstorming' or 'start_building'
+    brainstormingEnabled = True  # default to True for backward compatibility
 
     try:
         reader = await request.multipart()
@@ -5295,14 +6755,21 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                     ideation_answer = meta.get('ideation_answer', '')
                     token = meta.get('token', '')
                     choice = meta.get('choice', '')  # 'keep_brainstorming' or 'start_building'
+                    brainstormingEnabled = meta.get('brainstormingEnabled', True)
                 except Exception:
                     text = raw.decode('utf-8', errors='replace')
             elif part.name == 'video':
                 video_bytes = await part.read(decode=True)
                 filename = part.filename or 'upload.mp4'
                 video_suffix = Path(filename).suffix or '.mp4'
+    except web.HTTPRequestEntityTooLarge as e:
+        logger.error("Request too large in /submit-creation: %s", e)
+        return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
+    except (ConnectionResetError, asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
+        logger.error("Upload connection dropped in /submit-creation: %s: %s", type(e).__name__, e)
+        return web.json_response({'status': 'error', 'error': 'The upload was interrupted. Please check your connection and try again.'}, status=400)
     except Exception as e:
-        logger.error("Failed to parse multipart in /submit-creation: %s", e)
+        logger.error("Failed to parse multipart in /submit-creation: %s: %s", type(e).__name__, e, exc_info=True)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
 
     if not text or not text.strip():
@@ -5352,10 +6819,21 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
         else:
             # User chose to keep brainstorming; return choice
             logger.info("Sending user choice: keep brainstorming (token=%s)", token)
+            await _broadcast_ws({'type': 'progress', 'message': 'Summarizing what I understood…'})
+            latest_qa = brainstorm_history[-1] if brainstorm_history else None
+            summary, integration_note = await generate_understanding_summary(
+                entry['parsed_data'], entry['video_summary'], brainstorm_history,
+                latest_qa=latest_qa,
+            )
+            if not summary:
+                summary = entry.get('last_summary', '')
+            entry['last_summary'] = summary
             return web.json_response({
                 'status': 'brainstorm_choice',
                 'token': token,
                 'brainstorm_history': brainstorm_history,
+                'summary': summary,
+                'integration_note': integration_note,
             })
         # Fall through to template fill + issue creation below using this parsed_data.
     else:
@@ -5405,24 +6883,38 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 status=500,
             )
 
-        # Generate ideation question and return it for the client to present.
-        await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Coming up with a follow-up question…'})
-        try:
-            question = await generate_ideation_question(parsed_data, video_summary)
-        except Exception:
-            logger.warning("generate_ideation_question failed in HTTP path", exc_info=True)
-            question = "Is there anything specific about how the tool should behave in difficult conditions?"
+        if brainstormingEnabled and not choice:
+            # Generate a ranked queue of 3 brainstorming questions and present the most relevant one.
+            await _broadcast_ws({'type': 'progress', 'message': 'Description parsed. Summarizing what I understood…'})
+            try:
+                results = await asyncio.gather(
+                    generate_ranked_question_queue(parsed_data, video_summary, [], []),
+                    generate_understanding_summary(parsed_data, video_summary),
+                )
+                question_queue = results[0]
+                summary, integration_note = results[1]
+                question = question_queue[0] if question_queue else "Is there anything specific about how the tool should behave in difficult conditions?"
+            except Exception:
+                logger.warning("generate_ranked_question_queue failed in HTTP path", exc_info=True)
+                question = "Is there anything specific about how the tool should behave in difficult conditions?"
+                question_queue = []
+                summary = ''
+                integration_note = ''
 
-        new_token = secrets.token_urlsafe(12)
-        pending_ideation_http[new_token] = {
-            'parsed_data': parsed_data,
-            'video_summary': video_summary,
-            'brainstorm_history': [],  # Will accumulate Q&A pairs
-            'last_question': question,  # Track the question we just asked
-            'created_at': datetime.now(),
-        }
-        logger.info("Sending ideation question via HTTP (token=%s)", new_token)
-        return web.json_response({'status': 'ideation', 'question': question, 'token': new_token})
+            new_token = secrets.token_urlsafe(12)
+            pending_ideation_http[new_token] = {
+                'parsed_data': parsed_data,
+                'video_summary': video_summary,
+                'brainstorm_history': [],  # Will accumulate Q&A pairs
+                'question_queue': question_queue[1:],  # Remaining ranked questions
+                'last_question': question,  # Track the question we just asked
+                'last_summary': summary,  # Track the understanding summary we just showed
+                'created_at': datetime.now(),
+            }
+            logger.info("Sending ideation question via HTTP (token=%s, queue_remaining=%d)", new_token, len(question_queue[1:]))
+            return web.json_response({'status': 'ideation', 'question': question, 'token': new_token, 'summary': summary, 'integration_note': integration_note})
+        elif not brainstormingEnabled:
+            logger.info("Brainstorming disabled; proceeding directly to issue creation")
 
     # --- Fill template and create GitHub issue (reached from Shape B) ---
     try:
@@ -5463,6 +6955,13 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
 
         issue = await asyncio.to_thread(_create_issue)
         logger.info("Created GitHub issue #%d via /submit-creation: %s", issue.number, title[:60])
+        upsert_traceability_record(
+            mode='create',
+            issue_number=issue.number,
+            tool_name=title,
+            tool_path=infer_tool_path(title),
+            metadata={'source': 'submit_creation'},
+        )
 
         return web.json_response({
             'status': 'created',
@@ -5484,7 +6983,8 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
 
     Generates the next brainstorming question based on existing brainstorm history.
     The answer to the current question was already stored when /submit-creation was called.
-    Returns the next question and updated brainstorm history.
+    Returns the next question, updated brainstorm history, and an updated
+    understanding summary (see handle_creation_submit's docstring).
     """
     try:
         data = await request.json()
@@ -5509,23 +7009,41 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     # Generate next question with brainstorm context
     parsed_data = entry['parsed_data']
     video_summary = entry['video_summary']
-    await _broadcast_ws({'type': 'progress', 'message': 'Generating next brainstorming question…'})
-    
-    try:
-        next_question = await generate_ideation_question(parsed_data, video_summary, brainstorm_history)
-    except Exception:
-        logger.warning("generate_ideation_question failed in /brainstorm-next-question", exc_info=True)
-        next_question = "What other features or behaviors would be helpful for this tool?"
+    await _broadcast_ws({'type': 'progress', 'message': 'Summarizing and generating the next question…'})
 
-    # Store the new question for next round
+    existing_queue = entry.get('question_queue', [])
+    latest_qa = brainstorm_history[-1] if brainstorm_history else None
+    try:
+        results = await asyncio.gather(
+            generate_ranked_question_queue(parsed_data, video_summary, brainstorm_history, existing_queue),
+            generate_understanding_summary(parsed_data, video_summary, brainstorm_history, latest_qa=latest_qa),
+        )
+        next_question_queue = results[0]
+        summary, integration_note = results[1]
+        next_question = next_question_queue[0] if next_question_queue else "What other features or behaviors would be helpful for this tool?"
+        entry['question_queue'] = next_question_queue[1:]
+    except Exception:
+        logger.warning("generate_ranked_question_queue failed in /brainstorm-next-question", exc_info=True)
+        next_question = "What other features or behaviors would be helpful for this tool?"
+        summary = ''
+        integration_note = ''
+        entry['question_queue'] = []
+
+    if not summary:
+        summary = entry.get('last_summary', '')
+
+    # Store the new question and summary for next round
     entry['last_question'] = next_question
-    
-    logger.info("Sending next brainstorming question (token=%s, history size=%d)", token, len(brainstorm_history))
+    entry['last_summary'] = summary
+
+    logger.info("Sending next brainstorming question (token=%s, history size=%d, queue_remaining=%d)", token, len(brainstorm_history), len(entry['question_queue']))
     return web.json_response({
         'status': 'ideation',
         'question': next_question,
         'token': token,
         'brainstorm_history': brainstorm_history,
+        'summary': summary,
+        'integration_note': integration_note,
     })
 
 
@@ -5562,8 +7080,14 @@ async def handle_update_submit(request: web.Request) -> web.Response:
                 video_bytes = await part.read(decode=True)
                 filename = part.filename or 'upload.mp4'
                 video_suffix = Path(filename).suffix or '.mp4'
+    except web.HTTPRequestEntityTooLarge as e:
+        logger.error("Request too large in /submit-update: %s", e)
+        return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
+    except (ConnectionResetError, asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
+        logger.error("Upload connection dropped in /submit-update: %s: %s", type(e).__name__, e)
+        return web.json_response({'status': 'error', 'error': 'The upload was interrupted. Please check your connection and try again.'}, status=400)
     except Exception as e:
-        logger.error("Failed to parse multipart in /submit-update: %s", e)
+        logger.error("Failed to parse multipart in /submit-update: %s: %s", type(e).__name__, e, exc_info=True)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
 
     if not text or not text.strip():
@@ -5580,7 +7104,7 @@ async def handle_update_submit(request: web.Request) -> web.Response:
             with os.fdopen(tmp_fd, 'wb') as fh:
                 fh.write(video_bytes)
             logger.info("Saved update video to %s (%d bytes)", tmp_path, len(video_bytes))
-            video_summary = await summarize_video(tmp_path)
+            video_summary = await summarize_video(tmp_path, prompt=ITERATION_PROMPT)
         except Exception:
             logger.error("Video summarization failed in /submit-update", exc_info=True)
         finally:
@@ -5597,36 +7121,176 @@ async def handle_update_submit(request: web.Request) -> web.Response:
 
     # --- Post to GitHub ---
     try:
-        # Always @copilot on updates so it stays aware of new context/video summaries.
-        final_comment = f"{comment}\n\n@copilot"
+        # Reuse the normal update path so Claude is triggered on an associated
+        # open PR (when present) instead of starting duplicate issue work.
+        # Note: update_github_issue() already broadcasts issue_updated internally —
+        # do NOT broadcast again here or the client hears "Update sent to issue" twice.
+        await update_github_issue(int(issue_number), comment, mention_copilot=True)
 
-        def _post_comment():
+        def _get_issue_url():
             g = Github(GITHUB_TOKEN)
             repo = g.get_repo(GITHUB_REPO)
             issue = repo.get_issue(int(issue_number))
-            issue.create_comment(final_comment)
             return issue.html_url
 
-        issue_url = await asyncio.to_thread(_post_comment)
+        issue_url = await asyncio.to_thread(_get_issue_url)
         logger.info("Posted comment to issue #%s via /submit-update", issue_number)
-
-        await _broadcast_ws({
-            'type': 'issue_updated',
-            'message': f"Comment added to issue #{issue_number}",
-            'issue_number': int(issue_number),
-            'issue_url': issue_url,
-        })
+        trace_record = get_traceability_record(issue_number=int(issue_number))
+        tracked_pr_number = trace_record.get('pr_number') if trace_record else None
+        upsert_traceability_record(
+            mode='update',
+            issue_number=int(issue_number),
+            pr_number=tracked_pr_number,
+            tool_name=trace_record.get('tool_name') if trace_record else None,
+            tool_path=trace_record.get('tool_path') if trace_record else None,
+            metadata={'source': 'submit_update'},
+        )
 
         return web.json_response({
             'status': 'updated',
             'issue_number': int(issue_number),
             'issue_url': issue_url,
             'video_summary': video_summary,
+            'pr_number': tracked_pr_number,
         })
 
     except Exception as e:
         logger.error("Failed to post comment in /submit-update: %s", e, exc_info=True)
         return web.json_response({'status': 'error', 'error': str(e)}, status=500)
+
+
+async def handle_claude_progress(request: web.Request) -> web.Response:
+    """
+    GET /claude-progress
+    Returns the full Claude comment plus optional parsed checklist metadata.
+    Query params:
+      - issue_number (required for create mode)
+      - pr_number (required for update mode)
+      - mode (create|update)
+      - comment_id (optional exact GitHub comment id)
+      - repo (optional owner/repo override, defaults to configured repo)
+    """
+    if not GITHUB_TOKEN:
+        return web.json_response({'status': 'unavailable', 'error': 'GitHub not configured'}, status=503)
+
+    repo_name = (request.query.get('repo') or GITHUB_REPO or '').strip()
+    mode = (request.query.get('mode') or ('update' if request.query.get('pr_number') else 'create')).strip().lower()
+    issue_or_pr_number = request.query.get('pr_number') if mode == 'update' else request.query.get('issue_number')
+    comment_id = request.query.get('comment_id')
+
+    if not repo_name:
+        return web.json_response({'status': 'error', 'error': 'Repository is required'}, status=400)
+    if mode not in {'create', 'update'}:
+        return web.json_response({'status': 'error', 'error': 'mode must be create or update'}, status=400)
+    if not issue_or_pr_number:
+        return web.json_response({'status': 'error', 'error': 'issue_number or pr_number is required'}, status=400)
+
+    try:
+        issue_number = int(issue_or_pr_number)
+    except ValueError:
+        return web.json_response({'status': 'error', 'error': 'issue_number must be an integer'}, status=400)
+
+    try:
+        exact_comment_id = int(comment_id) if comment_id else None
+    except ValueError:
+        return web.json_response({'status': 'error', 'error': 'comment_id must be an integer'}, status=400)
+
+    try:
+        issue, comment, _comments = await asyncio.to_thread(
+            resolve_claude_progress_comment,
+            repo_name,
+            issue_number,
+            exact_comment_id,
+            mode,
+        )
+    except LookupError:
+        return web.json_response({
+            'status': 'waiting_for_comment',
+            'title': getattr(issue, 'title', None) if 'issue' in locals() else None,
+            'issue_number': issue_number,
+            'comment_id': exact_comment_id,
+            'body': '',
+            'steps': [],
+            'updated_at': None,
+            'message': 'Claude progress comment has not been created yet.',
+        })
+    except Exception as e:
+        logger.error("Failed to fetch Claude progress for #%s: %s", issue_number, e, exc_info=True)
+        return web.json_response({
+            'status': 'unavailable',
+            'title': None,
+            'issue_number': issue_number,
+            'comment_id': exact_comment_id,
+            'body': '',
+            'steps': [],
+            'updated_at': None,
+            'message': 'GitHub progress is temporarily unavailable. Retrying…',
+            'error': str(e),
+        }, status=502)
+
+    parsed = parse_claude_progress_comment(
+        getattr(comment, 'body', '') or '',
+        issue_number=issue_number,
+        comment_id=getattr(comment, 'id', exact_comment_id),
+        updated_at=getattr(comment, 'updated_at', None).isoformat() if getattr(comment, 'updated_at', None) else None,
+    )
+    parsed['title'] = parsed.get('title') or getattr(issue, 'title', None)
+
+    if parsed['status'] == 'failed':
+        parsed['status'] = 'failed'
+        parsed['message'] = 'Claude reported a failure while working on this task.'
+    elif parsed['status'] == 'completed':
+        parsed['status'] = 'completed'
+        parsed['message'] = 'Claude finished all checklist steps.'
+    else:
+        parsed['status'] = 'available'
+        parsed['message'] = 'Claude comment available.'
+
+    summary_fields = extract_implementation_summary(getattr(comment, 'body', '') or '')
+    upsert_traceability_record(
+        mode=mode,
+        issue_number=issue_number if mode == 'create' else None,
+        pr_number=issue_number if mode == 'update' else None,
+        comment_id=getattr(comment, 'id', exact_comment_id),
+        tool_name=parsed.get('title') or getattr(issue, 'title', None),
+        implementation_summary=summary_fields,
+        metadata={'repo_name': repo_name},
+    )
+
+    return web.json_response(parsed)
+
+
+async def handle_implementation_history(request: web.Request) -> web.Response:
+    if not GITHUB_TOKEN:
+        return web.json_response({'status': 'error', 'error': 'GitHub not configured'}, status=503)
+
+    repo_name = (request.query.get('repo') or GITHUB_REPO or '').strip()
+    issue_number_raw = request.query.get('issue_number')
+    pr_number_raw = request.query.get('pr_number')
+    comment_id_raw = request.query.get('comment_id')
+    include_logs = request.query.get('include_logs') in {'1', 'true', 'yes'}
+
+    issue_number = int(issue_number_raw) if issue_number_raw and issue_number_raw.isdigit() else None
+    pr_number = int(pr_number_raw) if pr_number_raw and pr_number_raw.isdigit() else None
+    comment_id = int(comment_id_raw) if comment_id_raw and comment_id_raw.isdigit() else None
+
+    record = get_traceability_record(issue_number=issue_number, pr_number=pr_number, comment_id=comment_id)
+    if not record:
+        return web.json_response({'status': 'not_found', 'error': 'No implementation metadata found yet.'}, status=404)
+
+    try:
+        payload = await asyncio.to_thread(
+            build_traceability_response,
+            repo_name=repo_name,
+            token=GITHUB_TOKEN,
+            record=record,
+            include_logs=include_logs,
+        )
+    except Exception as e:
+        logger.error("Failed to build implementation history: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'error': str(e)}, status=502)
+
+    return web.json_response({'status': 'ok', **payload})
 
 
 async def handle_test_video_summary(request: web.Request) -> web.Response:
@@ -5646,8 +7310,14 @@ async def handle_test_video_summary(request: web.Request) -> web.Response:
                 video_bytes = await part.read(decode=True)
                 filename = part.filename or 'test.mp4'
                 video_suffix = Path(filename).suffix or '.mp4'
+    except web.HTTPRequestEntityTooLarge as e:
+        logger.error("Request too large in /test-video-summary: %s", e)
+        return web.json_response({'status': 'error', 'error': 'That file is too large to upload. Please use a shorter video.'}, status=413)
+    except (ConnectionResetError, asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
+        logger.error("Upload connection dropped in /test-video-summary: %s: %s", type(e).__name__, e)
+        return web.json_response({'status': 'error', 'error': 'The upload was interrupted. Please check your connection and try again.'}, status=400)
     except Exception as e:
-        logger.error("Failed to parse multipart in /test-video-summary: %s", e)
+        logger.error("Failed to parse multipart in /test-video-summary: %s: %s", type(e).__name__, e, exc_info=True)
         return web.json_response({'status': 'error', 'error': 'Malformed request'}, status=400)
 
     if not video_bytes:
@@ -5898,6 +7568,10 @@ async def handle_client(websocket):
             **SERVER_CAPABILITIES,
             'model_routing': True,
             'routing_mode': 'semantic',
+            'nvidia_streaming_mode': 'hosted_video',
+            'streaming_executor': STREAMING_EXECUTOR,
+            'nvidia_hosted_active': NVIDIA_HOSTED_ACTIVE,
+            'streaming_frame_interval_ms': HOSTED_VIDEO_CAPTURE_INTERVAL_MS,
             'default_model': '',
             'available_models': [],
         }
@@ -5935,6 +7609,42 @@ async def handle_client(websocket):
                 if msg_type == 'start_streaming_tool':
                     logger.info(f"Client {client_id} started streaming tool: {data.get('tool_name')}")
                     session_log.log("INFO", f"Started streaming tool: {data.get('tool_name')}")
+                    tool_code = resolve_tool_code_for_execution(
+                        tool_name=data.get('tool_name', ''),
+                        tool_path=data.get('tool_path', ''),
+                        client_tool_code=data.get('tool_code', ''),
+                        client_tool_source=data.get('tool_source', ''),
+                    )
+                    execution_mode = _tool_execution_mode(tool_code)
+                    data = dict(data, tool_code=tool_code)
+                    await _cleanup_policy_streaming_registration(client_id)
+                    if execution_mode == 'hosted_video_streaming':
+                        try:
+                            await _start_hosted_nvidia_session(websocket, client_id, data)
+                        except Exception as exc:
+                            logger.error(
+                                "[Hosted Video] session startup failed client=%s error=%s",
+                                client_id, exc,
+                            )
+                            await websocket.send(json.dumps({
+                                'type': 'tool_stream_result',
+                                'tool_name': data.get('tool_name', 'unknown'),
+                                'status': 'error',
+                                'result': f'Unable to start temporal streaming: {exc}',
+                                'timestamp': datetime.now().isoformat(),
+                            }))
+                        continue
+                    await _cleanup_hosted_nvidia_session(
+                        client_id, reason='policy_cascade_active'
+                    )
+                    logger.info(
+                        "[Streaming] streaming_executor=%s nvidia_hosted_active=%s "
+                        "configured_nvidia_mode=%s client=%s",
+                        STREAMING_EXECUTOR,
+                        str(NVIDIA_HOSTED_ACTIVE).lower(),
+                        STREAMING_EXECUTION_POLICY,
+                        client_id,
+                    )
 
                     # Cancel any in-flight task from the previous tool so its
                     # stale result can't arrive after the new tool is registered.
@@ -5945,15 +7655,19 @@ async def handle_client(websocket):
 
                     custom_gpt = data.get('custom_gpt', False)
                     gpt_query = data.get('gpt_query', '')
+                    if custom_gpt:
+                        logger.info(
+                            "[Streaming] custom Gemini Live request bypassed; "
+                            "streaming_executor=policy_cascade client=%s",
+                            client_id,
+                        )
+                    custom_gpt = False
                     tool_name = data.get('tool_name', 'unknown')
                     tool_path = data.get('tool_path', '')
-                    tool_code = resolve_tool_code_for_execution(
-                        tool_name=tool_name,
-                        tool_path=tool_path,
-                        client_tool_code=data.get('tool_code', ''),
-                    )
                     
                     previous_config = active_streaming_tools.get(client_id)
+                    if previous_config is not None:
+                        await _stop_executable_streaming_tool(previous_config)
                     previous_task = previous_config.get('cascade_task') if previous_config else None
                     if previous_task is not None and not previous_task.done():
                         previous_task.cancel()
@@ -5968,6 +7682,7 @@ async def handle_client(websocket):
                             'language': data.get('tool_language', 'python'),
                             'input': data.get('input', ''),
                             'task': data.get('task', ''),
+                            'runtime_inputs': _parse_runtime_inputs_from_request(data, tool_code),
                         },
                         'last_run': None,
                         'throttle_ms': data.get('throttle_ms', 1000),
@@ -5998,6 +7713,32 @@ async def handle_client(websocket):
                         active_streaming_tools[client_id]['forced_key_frame_interval_seconds'],
                         active_streaming_tools[client_id]['min_stable_confirmations'],
                     )
+                    if has_executable_lifecycle(tool_code):
+                        try:
+                            await _initialize_executable_streaming_tool(
+                                websocket, client_id, active_streaming_tools[client_id]
+                            )
+                            logger.info(
+                                "[GeneratedTool] executable streaming lifecycle active "
+                                "client=%s tool=%s",
+                                client_id,
+                                tool_name,
+                            )
+                        except Exception as exc:
+                            active_streaming_tools[client_id]["cancelled"] = True
+                            del active_streaming_tools[client_id]
+                            logger.exception(
+                                "[GeneratedTool] stream initialization failed tool=%s",
+                                tool_name,
+                            )
+                            await websocket.send(json.dumps({
+                                "type": "tool_stream_result",
+                                "tool_name": tool_name,
+                                "status": "error",
+                                "result": f"Unable to start generated tool: {exc}",
+                                "timestamp": datetime.now().isoformat(),
+                            }))
+                            continue
                     
                     # Custom GPT mode: use Gemini Live instead of code execution
                     if custom_gpt and gpt_query and gemini_live_manager:
@@ -6090,12 +7831,24 @@ async def handle_client(websocket):
                 # Handle stop_streaming_tool message type
                 if msg_type == 'stop_streaming_tool':
                     logger.info(f"Client {client_id} stopped streaming tool")
+                    if client_id in active_hosted_nvidia_sessions:
+                        tool_name = active_hosted_nvidia_sessions[client_id]['tool_name']
+                        await _cleanup_hosted_nvidia_session(client_id, reason='client_stop')
+                        await websocket.send(json.dumps({
+                            'type': 'streaming_stopped',
+                            'tool_name': tool_name,
+                            'mode': 'hosted_video_streaming',
+                            'timestamp': datetime.now().isoformat(),
+                        }))
+                        continue
                     if client_id in active_streaming_tasks:
                         old_task = active_streaming_tasks.pop(client_id)
                         if not old_task.done():
                             old_task.cancel()
                     if client_id in active_streaming_tools:
-                        stopping_config = active_streaming_tools[client_id]
+                        # Remove the registration first so frame dispatch and emit
+                        # callbacks reject this session while cleanup is in flight.
+                        stopping_config = active_streaming_tools.pop(client_id)
                         tool_name = stopping_config['tool']['name']
                         cascade_task = stopping_config.get('cascade_task')
                         if cascade_task is not None and not cascade_task.done():
@@ -6103,11 +7856,12 @@ async def handle_client(websocket):
                         debounce_task = stopping_config.get('debounce_task')
                         if debounce_task is not None and not debounce_task.done():
                             debounce_task.cancel()
+                        _obsolete_progressive_invocation(client_id, tool_name)
+                        await _stop_executable_streaming_tool(stopping_config)
                         # Clean up Gemini Live session if active
-                        if active_streaming_tools[client_id].get('gemini_live') and gemini_live_manager:
+                        if stopping_config.get('gemini_live') and gemini_live_manager:
                             await gemini_live_manager.stop_session(client_id)
                             logger.info(f"Stopped Gemini Live session for {client_id}")
-                        del active_streaming_tools[client_id]
                         
                         await websocket.send(json.dumps({
                             'type': 'streaming_stopped',
@@ -6241,6 +7995,8 @@ async def handle_client(websocket):
                         # Fetch PR title and tools separately to ensure we always have the title
                         pr_title = fetch_pr_title(pr_number)
                         tools = fetch_pr_tools(pr_number)
+                        for tool in tools:
+                            _log_runtime_input_tool_metadata('pr_response', tool)
                         await websocket.send(json.dumps({
                             'type': 'pr_tools',
                             'pr_number': pr_number,
@@ -6302,6 +8058,8 @@ async def handle_client(websocket):
                 if msg_type == 'request_production_tools':
                     branch = data.get('branch', 'main')
                     tools = fetch_branch_tools(branch)
+                    for tool in tools:
+                        _log_runtime_input_tool_metadata('production_response', tool)
                     await websocket.send(json.dumps({
                         'type': 'production_tools',
                         'branch': branch,
@@ -6581,15 +8339,40 @@ async def handle_client(websocket):
                     # Process image
                     frame_results = process_frame(data)
                     combined_results['frame'] = frame_results
+                    source_timestamp = data.get('timestamp')
+                    if isinstance(source_timestamp, (int, float)):
+                        frame_timestamp = float(source_timestamp)
+                        if frame_timestamp > 10_000_000_000:
+                            frame_timestamp /= 1000.0
+                    else:
+                        frame_timestamp = time.time()
+                    if client_id in active_hosted_nvidia_sessions:
+                        await _offer_hosted_nvidia_frame(
+                            client_id, data_field['base64Image'], frame_timestamp
+                        )
                     
-                    # Run active streaming tools asynchronously
-                    if last_frame['image'] is not None and client_id in active_streaming_tools:
-                        logger.debug("[Streaming] frame received; scheduling client=%s", client_id)
-                        task = asyncio.create_task(schedule_streaming_frame(
-                            websocket, client_id, last_frame['image'], last_frame['base64']
-                        ))
-                        active_streaming_tasks[client_id] = task
-                        task.add_done_callback(_log_streaming_task_error)
+                    if (
+                        last_frame['image'] is not None
+                        and client_id in active_streaming_tools
+                    ):
+                        tool_config = active_streaming_tools[client_id]
+                        if tool_config.get("executable_lifecycle"):
+                            await _dispatch_executable_tool_frame(
+                                client_id,
+                                tool_config,
+                                last_frame["image"],
+                                data_field["base64Image"],
+                                frame_timestamp,
+                            )
+                        else:
+                            logger.debug("[Streaming] frame received; scheduling client=%s", client_id)
+                            await _dispatch_active_streaming_frame(
+                                websocket,
+                                client_id,
+                                last_frame['image'],
+                                data_field['base64Image'],
+                                frame_timestamp,
+                            )
                     elif last_frame['image'] is None:
                         logger.debug(f"No image available for {client_id}")
                     elif client_id not in active_streaming_tools:
@@ -6632,7 +8415,8 @@ async def handle_client(websocket):
                         selected_issue['mode'] = 'create'
                         selected_issue['number'] = None
                         selected_issue['title'] = None
-                        
+                        selected_issue['brainstorming_enabled'] = data.get('brainstormingEnabled', True)
+
                         # Clear any pending text
                         last_text['content'] = None
                         last_text['prev_raw'] = ""
@@ -6669,6 +8453,8 @@ async def handle_client(websocket):
                             # Fetch tools associated with this issue
                             logger.info(f"Fetching tools for issue #{issue_number}...")
                             issue_tools = fetch_issue_tools(issue_number)
+                            for tool in issue_tools:
+                                _log_runtime_input_tool_metadata('issue_update_response', tool)
                             
                             # Send confirmation
                             confirm_data = {
@@ -6695,12 +8481,15 @@ async def handle_client(websocket):
                 if data.get('type') == 'run_tool':
                     logger.info(f"Client {client_id} requested tool execution: {data.get('tool_name')}")
                     tool_name = data.get('tool_name', 'unknown')
+                    _obsolete_progressive_invocation(client_id, tool_name)
                     tool_path = data.get('tool_path', '')
                     tool_code = resolve_tool_code_for_execution(
                         tool_name=tool_name,
                         tool_path=tool_path,
                         client_tool_code=data.get('tool_code', ''),
+                        client_tool_source=data.get('tool_source', ''),
                     )
+                    runtime_inputs = _parse_runtime_inputs_from_request(data, tool_code)
                     tool_language = data.get('tool_language', 'python')
                     tool_input = data.get('input', '')
                     frame_data = data.get('frame', None)  # Get optional frame data
@@ -6741,6 +8530,7 @@ async def handle_client(websocket):
                     if tool_language == 'python' and tool_code:
                         image_context_token = None
                         try:
+                            resolved_tool_code = tool_code
                             # Use frame from message if provided, otherwise use last streaming frame
                             frame_image = None
                             frame_base64 = None
@@ -6813,154 +8603,61 @@ async def handle_client(websocket):
                                 frame_image = last_frame['image']
                                 frame_base64 = last_frame['base64']
 
-                            single_stage_result = await asyncio.to_thread(
-                                _single_stage_tool_result,
-                                tool_name,
-                                data.get('task', ''),
-                                frame_image,
-                                False,
-                                {'tool_name': tool_name},
-                            )
-                            if single_stage_result is not None:
-                                response_data = _build_mobile_tool_response(
-                                    'tool_result', tool_name, single_stage_result, datetime.now()
+                            if has_executable_lifecycle(resolved_tool_code):
+                                lifecycle_result, emitted_count = await _run_executable_take_photo(
+                                    websocket,
+                                    client_id,
+                                    tool_name,
+                                    resolved_tool_code,
+                                    frame_image,
+                                    frame_base64 or "",
+                                    _with_runtime_inputs(parsed_input, runtime_inputs),
                                 )
-                                _log_final_tool_response(tool_name, response_data)
-                                await websocket.send(json.dumps(response_data))
+                                if lifecycle_result is not None and emitted_count == 0:
+                                    response_data = _build_mobile_tool_response(
+                                        'tool_result',
+                                        tool_name,
+                                        lifecycle_result,
+                                        datetime.now(),
+                                    )
+                                    _log_final_tool_response(tool_name, response_data)
+                                    await websocket.send(json.dumps(response_data))
                                 continue
-                            
-                            # Get module manager and load common modules dynamically
-                            module_mgr = get_module_manager()
-                            common_modules = module_mgr.get_common_modules()
-                            
-                            # Create a sandboxed execution environment with image data
-                            def frame_copilot_llm_call(*args, **kwargs):
-                                metadata = dict(kwargs.get('metadata') or {})
-                                metadata.setdefault('tool_name', tool_name)
-                                kwargs['metadata'] = metadata
-                                if not kwargs.get('images'):
-                                    kwargs['images'] = [frame_image]
-                                return tool_copilot_llm_call(*args, **kwargs)
 
-                            exec_globals = {
-                                '__builtins__': __builtins__,
-                                '__file__': str(TOOLS_DIR / f'{Path(tool_name).name}.py'),
-                                'copilot_llm_call': frame_copilot_llm_call,
-                                'input_data': parsed_input,  # Use parsed input (dict or string)
-                                'image': frame_image,  # OpenCV image (numpy array)
-                                'image_base64': frame_base64,  # Base64 string
-                                'yolo_model_cache': yolo_model_cache,  # Shared YOLO model cache for performance
-                                **common_modules  # Dynamically loaded modules
-                            }
-                            
-                            # Debug: Log what we're passing to the tool
-                            logger.info(f"EXEC_GLOBALS: image is None: {frame_image is None}, image type: {type(frame_image)}, image shape: {frame_image.shape if frame_image is not None else 'N/A'}")
-                            logger.info(f"EXEC_GLOBALS: image_base64 length: {len(frame_base64) if frame_base64 else 0}")
-                            
-                            exec_locals = {}
-                            image_context_token = TOOL_EXECUTION_IMAGES.set([frame_image])
+                            if _is_progressive_tool_policy(resolved_tool_code):
+                                await _start_progressive_invocation(
+                                    websocket,
+                                    client_id,
+                                    tool_name,
+                                    resolved_tool_code,
+                                    frame_image,
+                                    'take-photo',
+                                )
+                                continue
 
-                            import sys
-                            import inspect
-                            import io as _io
-
-                            _fi = frame_image
-                            _fb = frame_base64
-
-                            def _run_one_shot_in_thread():
-                                _capture = _io.StringIO()
-                                _old = sys.stdout
-                                sys.stdout = _capture
-                                try:
-                                    exec(tool_code, exec_globals, exec_locals)
-                                finally:
-                                    sys.stdout = _old
-
-                                exec_globals.update(exec_locals)
-
-                                _result = None
-                                if 'main' in exec_locals and callable(exec_locals['main']):
-                                    sig = inspect.signature(exec_locals['main'])
-                                    if len(sig.parameters) == 2:
-                                        _result = exec_locals['main'](_fi, parsed_input)
-                                    else:
-                                        logger.warning(f"main() has {len(sig.parameters)} params, expected 2")
-                                elif 'run' in exec_locals and callable(exec_locals['run']):
-                                    sig = inspect.signature(exec_locals['run'])
-                                    if len(sig.parameters) == 2:
-                                        _result = exec_locals['run'](_fi, parsed_input)
-                                    else:
-                                        logger.warning(f"run() has {len(sig.parameters)} params, expected 2")
-                                elif 'process_image' in exec_locals and callable(exec_locals['process_image']):
-                                    sig = inspect.signature(exec_locals['process_image'])
-                                    if len(sig.parameters) == 2:
-                                        _result = exec_locals['process_image'](_fi, parsed_input)
-                                    else:
-                                        logger.info(f"Skipping process_image() - has {len(sig.parameters)} params (likely a helper function)")
-                                elif 'process_frame_for_text' in exec_locals and callable(exec_locals['process_frame_for_text']):
-                                    if 'initialize_verbalizer' in exec_locals and 'get_verbalizer' in exec_locals:
-                                        verbalizer = exec_locals['get_verbalizer']()
-                                        if not verbalizer and GEMINI_API_KEY:
-                                            exec_locals['initialize_verbalizer'](GEMINI_API_KEY)
-                                    _result = exec_locals['process_frame_for_text'](_fb)
-                                elif 'result' in exec_locals:
-                                    _result = exec_locals['result']
-                                else:
-                                    available_funcs = [n for n, o in exec_locals.items() if callable(o) and not n.startswith('_')]
-                                    available_classes = [n for n, o in exec_locals.items() if isinstance(o, type) and not n.startswith('_')]
-                                    if available_funcs or available_classes:
-                                        _result = f"Tool loaded successfully.\n\nAvailable functions: {', '.join(available_funcs) if available_funcs else 'none'}\nAvailable classes: {', '.join(available_classes) if available_classes else 'none'}\n\nNote: This tool is a library. To use it, you may need to call one of these functions."
-
-                                return _capture.getvalue(), _result
-
-                            max_retries = 3
-                            retry_count = 0
-                            printed_output = ''
-                            result = None
-
-                            while retry_count < max_retries:
-                                try:
-                                    printed_output, result = await asyncio.to_thread(_run_one_shot_in_thread)
-                                    break
-                                except (ImportError, ModuleNotFoundError) as e:
-                                    error_msg = str(e)
-                                    logger.warning(f"Module error in {tool_name}: {error_msg}")
-                                    installed_module = await asyncio.to_thread(module_mgr.install_from_error, error_msg)
-                                    if installed_module:
-                                        logger.info(f"Installed {installed_module}, retrying execution...")
-                                        common_modules = module_mgr.get_common_modules()
-                                        exec_globals.update(common_modules)
-                                        retry_count += 1
-                                    else:
-                                        raise
-                                except Exception:
-                                    raise
-                            TOOL_EXECUTION_IMAGES.reset(image_context_token)
-                            image_context_token = None
-                            
-                            response_data = _build_mobile_tool_response(
-                                'tool_result', tool_name, result, datetime.now(), printed_output
+                            vlm_result = await asyncio.to_thread(
+                                _run_take_photo_vlm,
+                                tool_name,
+                                resolved_tool_code,
+                                frame_image,
+                                'take-photo',
+                                None,
+                                runtime_inputs,
                             )
-                            logger.info(
-                                "Sending tool_result: result length=%d, audio.text length=%d",
-                                len(response_data['result']),
-                                len(response_data['audio']['text']),
+                            response_data = _build_mobile_tool_response(
+                                'tool_result', tool_name, vlm_result, datetime.now()
                             )
                             _log_final_tool_response(tool_name, response_data)
                             await websocket.send(json.dumps(response_data))
-                            
-                            logger.info(f"Tool {tool_name} executed successfully")
-                            
-                        except Exception as e:
-                            if image_context_token is not None:
-                                TOOL_EXECUTION_IMAGES.reset(image_context_token)
-                            logger.error(f"Error executing tool {tool_name}: {e}")
+                            continue
+                        except Exception as exc:
+                            logger.error("Error executing policy tool %s: %s", tool_name, exc)
                             await websocket.send(json.dumps({
                                 'type': 'tool_result',
                                 'tool_name': tool_name,
                                 'status': 'error',
-                                'error': str(e),
-                                'timestamp': datetime.now().isoformat()
+                                'error': str(exc),
+                                'timestamp': datetime.now().isoformat(),
                             }))
                     else:
                         await websocket.send(json.dumps({
@@ -7023,7 +8720,6 @@ async def handle_client(websocket):
                         logger.error(f"Error registering conversation image: {e}")
                         logger.error(f"[REGISTER_IMG] Exception type: {type(e).__name__}")
                         logger.error(f"[REGISTER_IMG] Exception details: {str(e)}")
-                        import traceback
                         logger.error(f"[REGISTER_IMG] Traceback: {traceback.format_exc()}")
                         await websocket.send(json.dumps({
                             'type': 'conversation_image_registered',
@@ -7135,9 +8831,7 @@ async def handle_client(websocket):
                 logger.error(tb)
 
     except Exception as e:
-        # Import websockets module to avoid shadowing by parameter name
-        import websockets as ws_module
-        if isinstance(e, ws_module.exceptions.ConnectionClosed):
+        if isinstance(e, WebSocketConnectionClosed):
             logger.info(f"Client disconnected: {client_id} (code: {e.code}, reason: {e.reason})")
             if client_id in active_session_loggers:
                 active_session_loggers[client_id].log("INFO", f"Disconnected (code: {e.code}, reason: {e.reason})")
@@ -7147,6 +8841,7 @@ async def handle_client(websocket):
                 active_session_loggers[client_id].log("ERROR", f"Connection error: {e}")
     finally:
         connected_clients.discard(websocket)
+        await _cleanup_hosted_nvidia_session(client_id, reason='client_disconnect')
         # Cancel any in-flight streaming task
         if client_id in active_streaming_tasks:
             t = active_streaming_tasks.pop(client_id)
@@ -7155,10 +8850,12 @@ async def handle_client(websocket):
         # Clean up streaming tools for this client
         if client_id in active_streaming_tools:
             logger.info(f"Stopping streaming tool for disconnected client {client_id}")
+            await _stop_executable_streaming_tool(active_streaming_tools[client_id])
             # Clean up Gemini Live session if active
             if active_streaming_tools[client_id].get('gemini_live') and gemini_live_manager:
                 await gemini_live_manager.stop_session(client_id)
             del active_streaming_tools[client_id]
+        _obsolete_client_progressive_invocations(client_id)
         # Clean up any active Copilot streams for this client
         if client_id in active_copilot_streams:
             logger.info(f"Stopping Copilot stream for disconnected client {client_id}")
@@ -7240,161 +8937,6 @@ monitored_sessions = set()  # Track session IDs we're already monitoring
 monitored_prs = set()  # Track PR numbers we've checked
 
 
-async def monitor_copilot_sessions():
-    """
-    Background task to continuously monitor for new Copilot sessions and capture their logs.
-    Checks:
-    1. All open PRs for Copilot agent tasks
-    2. Recent @copilot comments that spawn sessions
-    3. Any active sessions we haven't captured yet
-    
-    This ensures we have historical logs for all sessions, even if no one explicitly requests them.
-    """
-    global monitored_sessions, monitored_prs
-    
-    if not GITHUB_TOKEN:
-        logger.warning("GitHub token not available, skipping Copilot session monitoring")
-        return
-    
-    logger.info("Starting background Copilot session monitoring")
-    check_interval = 60  # Check every minute
-    
-    # Create clean environment for gh CLI
-    env = os.environ.copy()
-    env.pop('GH_TOKEN', None)
-    env.pop('GITHUB_TOKEN', None)
-    
-    while True:
-        try:
-            await asyncio.sleep(check_interval)
-            
-            g = Github(GITHUB_TOKEN)
-            repo = g.get_repo(GITHUB_REPO)
-            
-            # 1. Check all open PRs for Copilot sessions
-            pulls = repo.get_pulls(state='open', sort='updated', direction='desc')
-            for pr in list(pulls)[:20]:  # Check 20 most recently updated PRs
-                if pr.number in monitored_prs:
-                    continue  # Already checked this PR
-                
-                try:
-                    # Check if PR has Copilot agent activity (created by copilot or mentions copilot)
-                    is_copilot_pr = (
-                        pr.user.login == 'github-actions[bot]' or
-                        'copilot' in (pr.title + (pr.body or '')).lower() or
-                        any('copilot' in comment.body.lower() for comment in pr.get_issue_comments()[:10])
-                    )
-                    
-                    if is_copilot_pr:
-                        logger.info(f"Found potential Copilot PR #{pr.number}: {pr.title}")
-                        
-                        # Try to find session ID for this PR
-                        proc = await asyncio.create_subprocess_exec(
-                            'gh', 'agent-task', 'view',
-                            str(pr.number),
-                            '-R', GITHUB_REPO,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=env
-                        )
-                        stdout, stderr = await proc.communicate()
-                        output = stdout.decode('utf-8', errors='replace')
-                        
-                        # Extract session ID from output
-                        import re
-                        uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
-                        matches = re.findall(uuid_pattern, output)
-                        
-                        if matches:
-                            session_id = matches[0]
-                            if session_id not in monitored_sessions:
-                                logger.info(f"Starting background capture for session {session_id} (PR #{pr.number})")
-                                monitored_sessions.add(session_id)
-                                monitored_prs.add(pr.number)
-                                
-                                # Start background log capture (no websocket needed)
-                                asyncio.create_task(
-                                    capture_session_logs_background(session_id, pr.number)
-                                )
-                        else:
-                            # Mark as checked even if no session found
-                            monitored_prs.add(pr.number)
-                            
-                except Exception as e:
-                    logger.warning(f"Error checking PR #{pr.number} for Copilot session: {e}")
-            
-            # 2. Check for recent @copilot comments
-            # Get recent issue comments (issues include PRs in GitHub API)
-            issues = repo.get_issues(state='open', sort='updated', direction='desc')
-            for issue in list(issues)[:30]:  # Check 30 most recent
-                try:
-                    comments = issue.get_comments()
-                    for comment in list(comments)[-5:]:  # Last 5 comments
-                        if '@copilot' in comment.body.lower():
-                            # This might have spawned a session
-                            pr_number = issue.number if issue.pull_request else None
-                            if pr_number and pr_number not in monitored_prs:
-                                logger.info(f"Found @copilot comment in PR #{pr_number}, checking for session...")
-                                monitored_prs.add(pr_number)
-                                
-                                # Check for session (same logic as above)
-                                proc = await asyncio.create_subprocess_exec(
-                                    'gh', 'agent-task', 'view',
-                                    str(pr_number),
-                                    '-R', GITHUB_REPO,
-                                    stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.PIPE,
-                                    env=env
-                                )
-                                stdout, stderr = await proc.communicate()
-                                output = stdout.decode('utf-8', errors='replace')
-                                
-                                matches = re.findall(uuid_pattern, output)
-                                if matches:
-                                    session_id = matches[0]
-                                    if session_id not in monitored_sessions:
-                                        logger.info(f"Starting background capture for @copilot session {session_id} (PR #{pr_number})")
-                                        monitored_sessions.add(session_id)
-                                        asyncio.create_task(
-                                            capture_session_logs_background(session_id, pr_number)
-                                        )
-                except Exception as e:
-                    logger.warning(f"Error checking issue #{issue.number} for @copilot comments: {e}")
-            
-            logger.debug(f"Background monitor: Tracking {len(monitored_sessions)} sessions, {len(monitored_prs)} PRs")
-            
-        except Exception as e:
-            logger.error(f"Error in monitor_copilot_sessions: {e}", exc_info=True)
-            await asyncio.sleep(check_interval)
-
-
-async def capture_session_logs_background(session_id: str, pr_number: int):
-    """
-    Capture logs for a Copilot session in the background (no WebSocket client needed).
-    Stores everything in the database for later retrieval.
-    
-    Args:
-        session_id: Copilot session ID
-        pr_number: Associated PR number
-    """
-    global monitored_sessions
-    
-    logger.info(f"Background log capture started for session {session_id} (PR #{pr_number})")
-    
-    try:
-        # Create session in database
-        copilot_db.create_session(session_id, pr_number)
-        
-        # Fetch and store historical logs
-        await fetch_and_store_session_logs(session_id, pr_number)
-        
-        logger.info(f"Background log capture completed for session {session_id}")
-        
-    except Exception as e:
-        logger.error(f"Error in background log capture for session {session_id}: {e}")
-    finally:
-        # Keep session in monitored_sessions so we don't try to capture it again
-        pass
 
 
 async def main():
@@ -7404,19 +8946,26 @@ async def main():
     logger.info(f"Starting backend server on {HOST}:{PORT}")
     logger.info(f"Frame saving: {'enabled' if SAVE_FRAMES else 'disabled'}")
     logger.info(f"GitHub issue creation: {'enabled' if GITHUB_TOKEN else 'disabled'}")
+    logger.info(
+        "[Streaming] streaming_executor=%s nvidia_hosted_active=%s "
+        "streaming_policy=%s",
+        STREAMING_EXECUTOR,
+        str(NVIDIA_HOSTED_ACTIVE).lower(),
+        STREAMING_EXECUTION_POLICY,
+    )
 
-    try:
-        await asyncio.to_thread(warm_streaming_frame_selector)
-    except Exception as exc:
-        logger.warning("[Streaming] CLIP warm-up failed; frame gating will fail open: %s", exc)
-
-    app = web.Application(client_max_size=20 * 1024 * 1024)
+    # 100MB — HTTP video-attachment uploads (/submit-creation, /submit-update)
+    # need more headroom than the 20MB WebSocket frame limit; a phone
+    # recording a minute or two at default camera quality can exceed 20MB.
+    app = web.Application(client_max_size=100 * 1024 * 1024)
     app.router.add_get('/', websocket_handler)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_post('/test-door-recognition', test_door_recognition)
     app.router.add_post('/submit-creation', handle_creation_submit)
     app.router.add_post('/brainstorm-next-question', handle_brainstorm_next_question)
     app.router.add_post('/submit-update', handle_update_submit)
+    app.router.add_get('/claude-progress', handle_claude_progress)
+    app.router.add_get('/implementation-history', handle_implementation_history)
     app.router.add_post('/test-video-summary', handle_test_video_summary)
     app.router.add_post('/offer', webrtc_offer_handler)  # WebRTC signaling
 
@@ -7433,10 +8982,15 @@ async def main():
     # Start background tasks independently for resilience
     asyncio.create_task(broadcast_stats())
     asyncio.create_task(monitor_text_pause())
-    # Background Copilot monitoring disabled - we poll specific PRs when user comments with @copilot
 
     # Keep server running
-    await asyncio.Future()  # Run forever
+    try:
+        await asyncio.Future()  # Run forever
+    finally:
+        for client_id in list(active_hosted_nvidia_sessions):
+            await _cleanup_hosted_nvidia_session(client_id, reason='server_shutdown')
+        await hosted_nvidia_client.close()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":

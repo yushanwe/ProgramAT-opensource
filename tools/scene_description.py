@@ -20,7 +20,6 @@ Audio Output:
 import cv2
 import numpy as np
 from typing import Dict, Optional, Any
-import os
 import base64
 import io
 from PIL import Image
@@ -30,7 +29,14 @@ from litellm_utils import (
     extract_text,
     pil_image_to_data_uri,
 )
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
+
+TOOL_NAME = "scene_description"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = (
+    "Describe the scene concisely for a blind or low-vision user, prioritizing people, obstacles, "
+    "important objects, and spatial relationships. If the scene is unclear, say what cannot be determined."
+)
 
 # Constants
 GEMINI_CONFIDENCE_SCORE = 0.9
@@ -262,7 +268,6 @@ def format_description_for_audio(
 
 def analyze_scene(
     image: np.ndarray,
-    api_key: Optional[str] = None,
     detail_level: str = 'standard',
     focus: str = 'general',
 ) -> Dict[str, Any]:
@@ -271,7 +276,6 @@ def analyze_scene(
     
     Args:
         image: OpenCV image (numpy array in BGR format)
-        api_key: Gemini API key (uses env var if not provided)
         detail_level: 'brief', 'standard', or 'detailed'
         focus: 'general', 'people', 'objects', 'text', or 'navigation'
     
@@ -305,7 +309,7 @@ def analyze_scene(
             capability='general_reasoning',
             messages=[{'role': 'user', 'content': prompt}],
             images=[image_data_uri],
-            metadata={'api_key': api_key},
+            metadata={'tool_name': TOOL_NAME},
         )
         
         # Extract description
@@ -347,7 +351,6 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Dict[str, Any]
             - 'detail_level': 'brief', 'standard', or 'detailed' (default: 'standard')
             - 'focus': 'general', 'people', 'objects', 'text', or 'navigation' (default: 'general')
             - 'style': 'narrative' or 'concise' (default: 'narrative')
-            - 'api_key': Optional API key override
     
     Returns:
         For simple string return (audio-friendly):
@@ -391,11 +394,9 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Dict[str, Any]
     detail_level = input_data.get('detail_level', 'standard')
     focus = input_data.get('focus', 'general')
     style = input_data.get('style', 'narrative')
-    api_key = input_data.get('api_key')
     # Analyze scene
     result = analyze_scene(
         image=image,
-        api_key=api_key,
         detail_level=detail_level,
         focus=focus,
     )

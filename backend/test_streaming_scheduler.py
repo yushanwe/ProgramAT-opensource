@@ -8,11 +8,54 @@ from pathlib import Path
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import stream_server
+
+
+class TestDisabledPlannerToolPrompt(unittest.TestCase):
+    def test_resolves_declared_tool_prompt(self):
+        tool_code = '''
+TOOL_PROMPT = "Identify the medicine label and read the dosage."
+
+def main(image):
+    return copilot_llm_call(
+        capability="ocr",
+        messages=[{"role": "user", "content": TOOL_PROMPT}],
+        images=[image],
+    )
+'''
+        self.assertEqual(
+            stream_server._resolve_tool_prompt(tool_code),
+            "Identify the medicine label and read the dosage.",
+        )
+
+    def test_disabled_planner_passes_tool_prompt_through_copilot_call(self):
+        config = {
+            "planner_enabled": False,
+            "routing_enabled": False,
+            "default_llm_when_routing_disabled": "gemini_flash_lite",
+        }
+        tool_code = 'TOOL_PROMPT = "Read only the nearest street sign."'
+        expected = {"response": "Main Street"}
+        with patch.object(stream_server, "load_global_execution_config", return_value=config), \
+             patch.object(stream_server, "tool_copilot_llm_call", return_value=expected) as call, \
+             self.assertLogs(stream_server.logger, level="INFO") as logs:
+            result = stream_server._single_stage_tool_result(
+                "street_sign", tool_code, "Describe the scene", b"image"
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(
+            call.call_args.kwargs["messages"],
+            [{"role": "user", "content": "Read only the nearest street sign."}],
+        )
+        output = "\n".join(logs.output)
+        self.assertIn("planner_enabled=false routing_enabled=false", output)
+        self.assertIn("selected_model=gemini_flash_lite", output)
+        self.assertIn("prompt_source=tool_prompt", output)
 
 
 class TestMobileResponseBoundary(unittest.TestCase):
@@ -60,11 +103,10 @@ class TestMobileResponseBoundary(unittest.TestCase):
         self.assertNotIn("metadata", payload["audio"])
         self.assertNotIn("debug print", payload["result"])
 
-    def test_unwraps_python_repr_and_json_execution_results(self):
-        expected = "Walk straight ahead toward the wooden door. The door handle is located at 2 o'clock."
+    def test_string_model_output_is_not_decoded_or_rewritten(self):
         structured = {
-            "response": expected,
-            "artifact": {"text": expected},
+            "response": "Walk straight ahead toward the wooden door.",
+            "artifact": {"text": "internal"},
             "implementation": "gemini",
             "capability": "navigation",
         }
@@ -73,9 +115,8 @@ class TestMobileResponseBoundary(unittest.TestCase):
             payload = stream_server._build_mobile_tool_response(
                 "tool_result", "locate_nearest_exit", serialized, datetime(2026, 7, 1)
             )
-            self.assertEqual(payload["result"], expected)
-            self.assertEqual(payload["audio"]["text"], expected)
-            self.assertNotIn("artifact", payload["result"])
+            self.assertEqual(payload["result"], serialized)
+            self.assertEqual(payload["audio"]["text"], serialized)
 
     def test_unknown_object_is_not_stringified_into_mobile_payload(self):
         opaque = SimpleNamespace(artifact={"secret": "internal"})
@@ -195,6 +236,95 @@ class TestStreamingScheduler(unittest.IsolatedAsyncioTestCase):
         output = "\n".join(logs.output)
         self.assertIn("[Streaming] skipped frame (already running)", output)
         self.assertIn("[Streaming] execution finished", output)
+        self.assertIn("streaming_executor=hosted_video_streaming", output)
+        self.assertIn("nvidia_hosted_active=true", output)
+
+    async def test_c3_streaming_result_is_dropped_when_session_is_superseded(self):
+        tool_config = {
+            "generation": 4,
+            "current_execution_id": 9,
+            "tool": {
+                "name": "describe",
+                "language": "python",
+                "code": 'TOOL_PROMPT = "Original fused streaming prompt."',
+                "input": {},
+            },
+            "exec_env": {
+                "parsed_input": {},
+                "common_modules": {},
+                "stdout_capture": __import__("io").StringIO(),
+                "exec_globals_base": {},
+            },
+        }
+        stream_server.active_streaming_tools["client"] = tool_config
+        websocket = AsyncMock()
+
+        def finish_after_restart(*args, **kwargs):
+            self.assertEqual(args[3], "streaming")
+            self.assertEqual(args[4], "9")
+            stream_server.active_streaming_tools["client"] = {
+                "generation": 5, "tool": tool_config["tool"]
+            }
+            return "Completed old-frame policy result"
+
+        with patch.object(
+            stream_server, "_run_take_photo_vlm", side_effect=finish_after_restart
+        ) as cascade, patch.object(
+            stream_server.asyncio, "to_thread", side_effect=self._to_thread_inline
+        ), self.assertLogs(stream_server.logger, level="INFO") as logs:
+            sent = await stream_server._execute_streaming_tools_unlocked(
+                websocket, "client", b"frame", "base64-frame"
+            )
+
+        self.assertFalse(sent)
+        cascade.assert_called_once()
+        websocket.send.assert_not_awaited()
+        self.assertIn("tool policy result discarded as stale", "\n".join(logs.output))
+
+    async def test_streaming_sends_only_final_policy_cascade_result(self):
+        tool_config = {
+            "generation": 4,
+            "current_execution_id": 10,
+            "tool": {
+                "name": "describe",
+                "language": "python",
+                "code": 'TOOL_PROMPT = "Original fused streaming prompt."',
+                "input": {},
+            },
+            "exec_env": {
+                "parsed_input": {},
+                "common_modules": {},
+                "stdout_capture": __import__("io").StringIO(),
+                "exec_globals_base": {},
+            },
+        }
+        stream_server.active_streaming_tools["client"] = tool_config
+        websocket = AsyncMock()
+
+        with patch.object(
+            stream_server,
+            "_run_take_photo_vlm",
+            return_value="Final accepted cascade answer",
+        ) as cascade, patch.object(
+            stream_server.asyncio, "to_thread", side_effect=self._to_thread_inline
+        ):
+            sent = await stream_server._execute_streaming_tools_unlocked(
+                websocket, "client", b"selected-frame", "base64-frame"
+            )
+
+        self.assertTrue(sent)
+        cascade.assert_called_once_with(
+            "describe",
+            'TOOL_PROMPT = "Original fused streaming prompt."',
+            b"selected-frame",
+            "streaming",
+            "10",
+        )
+        websocket.send.assert_awaited_once()
+        payload = json.loads(websocket.send.await_args.args[0])
+        self.assertEqual(payload["result"], "Final accepted cascade answer")
+        self.assertEqual(payload["audio"]["text"], "Final accepted cascade answer")
+        self.assertEqual(payload["execution_id"], 10)
 
     async def test_stable_candidate_too_similar_to_last_sent_is_skipped(self):
         now = asyncio.get_running_loop().time()

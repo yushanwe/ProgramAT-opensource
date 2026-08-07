@@ -44,50 +44,31 @@ The server uses environment variables for configuration:
 
 ### Required for AI-Powered Template Filling
 
-- `global.system_model` in `backend/execution_policy.yaml`: fixed implementation used for parsing, template filling, issue generation, and other ProgramAT internal LLM work.
+- `SYSTEM_MODEL` in `backend/model_registry.py`: fixed model used for internal LLM work.
 
-- Provider credentials: the default system model uses `GROQ_API_KEY`; reasoning uses `MOONDREAM_API_KEY`, `GEMINI_API_KEY`, and `OPENAI_API_KEY`; OCR uses `MISTRAL_API_KEY` and optionally `MISTRAL_OCR_MODEL` (default `mistral-ocr-latest`), with Google Application Default Credentials from `GOOGLE_APPLICATION_CREDENTIALS` for the Google Vision fallback.
+- Provider credentials depend on the models selected by a tool policy; the fixed system model uses `GROQ_API_KEY`.
   - System calls use the fixed system model.
-  - Detection uses one implementation. OCR tries Mistral OCR before Google Vision. Reasoning capabilities try Moondream Cloud, Gemini Flash Lite, and GPT-4o in order, escalating on provider failure or when the evaluator finds a response insufficient.
+  - The default take-photo policy makes one Gemini 3.1 Flash Lite call.
 
 ### LLM Interfaces
 
-ProgramAT separates fixed infrastructure LLM calls from take-photo capability execution.
+ProgramAT separates fixed infrastructure LLM calls from executable generated
+tools. New tools implement lifecycle hooks and directly choose their models,
+prompts, frames, orchestration, and output timing. The backend supplies bounded
+frame history, isolated state, cancellation, validation, and result transport.
 
-Infrastructure/system work such as text parsing, command extraction, issue generation, metadata generation, and internal assistant logic should call `system_llm_call(...)` from `model_router.py`. This uses `global.system_model` and bypasses capability routing.
+Infrastructure/system work should call `system_llm_call(...)` from `tool_policy_runtime.py`.
 
-Take-photo model-backed work should call `copilot_llm_call(...)` through `model_router_client.py`. The declared capability selects its configured policy:
-
-```yaml
-cascade_profiles:
-  default_reasoning:
-    candidates: [moondream_cloud, gemini_flash_lite, gpt4o]
-    evaluator: gpt4o-mini
-  ocr:
-    candidates: [mistral_ocr, google_vision]
-    evaluator: gpt4o-mini
-
-navigation:
-  cascade: default_reasoning
-
-ocr:
-  cascade: ocr
-```
-
-Edit `backend/execution_policy.yaml` to toggle routing, change system/default models, reorder cascade candidates, switch evaluators, or choose a fixed implementation. No Python change is required; concrete implementation metadata lives in the same file.
-
-Execution modes are distinct:
-
-- `planner_enabled: false`, `routing_enabled: false`: bypass generated tool stages and call `default_llm_when_routing_disabled` once with the original image.
-- `planner_enabled: true`, `routing_enabled: false`: execute planned stages; fixed detector/OCR stages remain specialized, while every model stage uses `default_llm_when_routing_disabled` without a cascade.
-- `planner_enabled: true`, `routing_enabled: true`: execute planned stages using their configured fixed implementations or cascades.
-
-`copilot_llm_call(...)` returns a dictionary containing `response`, `artifact`, `implementation`, and `capability`. Generated tools execute planner-produced stages as explicit ordered calls and decide which artifact fields to pass to each subsequent call. The backend does not run capability sequences.
+Generated tools call `call_model(...)`, `extract_text(...)`, or, where needed,
+`call_openai_responses_model(...)` from `litellm_utils.py`. Models are written
+explicitly into the tool source. `model_registry.py` is advisory authoring
+information and is still used by the temporary declarative-tool compatibility
+path; new executable hooks do not use backend model selection.
 
 ### Optional
 
-- `ENABLE_MOONDREAM_CLOUD`: Enable the execution-policy candidate (`true` by default).
-- `MOONDREAM_MODEL`: Cloud model (`moondream/moondream3-preview` from `execution_policy.yaml` by default).
+- `ENABLE_MOONDREAM_CLOUD`: Enable Moondream when an explicit policy selects it (`true` by default).
+- `MOONDREAM_MODEL`: Cloud model (`moondream/moondream3-preview` by default).
 - `MOONDREAM_TIMEOUT_SECONDS`: Per-request timeout (`2.0` by default).
 - `MOONDREAM_MAX_IMAGE_DIMENSION`: Moondream-only resize bound (`768` by default).
 - `MOONDREAM_JPEG_QUALITY`: Moondream-only RGB JPEG quality (`75` by default).

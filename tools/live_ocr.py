@@ -41,7 +41,7 @@ Configuration Options (via input_data):
 
 Building Block Functions:
 This tool exports several functions that can be used by other tools:
-- detect_text_google_vision(image, api_key, language_hints) -> List[Dict]
+- detect_text_google_vision(image, credential_source, language_hints) -> List[Dict]
 - calculate_text_similarity(text1, text2) -> float
 - chunk_text_for_audio(text, chunk_size) -> List[str]
 - format_text_for_speech(text) -> str
@@ -50,10 +50,17 @@ This tool exports several functions that can be used by other tools:
 import cv2
 import numpy as np
 from typing import Dict, List, Optional, Any
-import os
 import re
 import base64
 from collections import deque
+
+TOOL_NAME = "live_ocr"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = (
+    "Read the visible text accurately for a blind or low-vision user and return only the text "
+    "in a concise, natural order suitable for speech. If no text is readable, say "
+    "'No readable text.'"
+)
 
 # Default configuration
 DEFAULT_CHUNK_SIZE = 6  # words per chunk (balanced for audio delivery and context switching)
@@ -67,7 +74,7 @@ _last_spoken_text = ""
 _frame_counter = 0
 _ocr_unavailable_notified = False  # Track if we've already notified about OCR unavailability
 _vision_client = None  # Cache the Vision API client to avoid recreating it
-_vision_client_key = None  # Track which API key was used for the client
+_vision_client_source = None  # Track which credential source was used for the client
 
 # Try to import Google Cloud Vision
 try:
@@ -79,19 +86,16 @@ except ImportError:
 
 def detect_text_google_vision(
     image: np.ndarray,
-    api_key: Optional[str] = None,
-    language_hints: List[str] = ['en']
+    credential_source: Optional[str] = None,
+    language_hints: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Detect text in an image using Google Cloud Vision API.
     
     Args:
         image: OpenCV image (numpy array in BGR format)
-        api_key: Path to credentials JSON file, credentials as JSON string, or API key
-                 If not provided, checks environment variables in order:
-                 1. GOOGLE_APPLICATION_CREDENTIALS (path to JSON file)
-                 2. GOOGLE_CLOUD_VISION_API_KEY (API key string)
-                 3. GOOGLE_API_KEY (fallback API key)
+        credential_source: Optional service-account JSON text or file path.
+            When omitted, the default Google client configuration is used.
         language_hints: List of language codes to hint the OCR engine
         
     Returns:
@@ -108,64 +112,37 @@ def detect_text_google_vision(
         print(f"VisionAPI unavailable. Using Tesseract.")
         # Fallback to Tesseract OCR if available
         return _detect_text_tesseract(image)
-    
-    # Get API key or credentials file path
-    if api_key is None:
-        # First, check for GOOGLE_APPLICATION_CREDENTIALS (standard Google Cloud variable)
-        api_key = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', '')
-        print(f"finding credentials google application credentials")
-        if not api_key:
-            # Fall back to GOOGLE_CLOUD_VISION_API_KEY
-            api_key = os.environ.get('GOOGLE_CLOUD_VISION_API_KEY', '')
-            print(f"finding credentials google application api key")
-        if not api_key:
-            # Fall back to GOOGLE_API_KEY
-            api_key = os.environ.get('GOOGLE_API_KEY', '')
-            print(f"finding credentials google application api key")
 
-    if not api_key:
-        # No API key configured - try Tesseract fallback
-        print(f"unable to find api key")
-        return _detect_text_tesseract(image)
-    
-    
     try:
         # Cache Vision API client to avoid recreating it on every call (expensive operation)
-        # Google Cloud Vision supports multiple authentication methods:
-        # 1. GOOGLE_APPLICATION_CREDENTIALS pointing to a service account JSON file
-        # 2. JSON credentials passed directly as a string
-        # 3. API key (less common for Vision API)
         from google.oauth2 import service_account
         import json
-        from pathlib import Path
         
-        global _vision_client, _vision_client_key
+        global _vision_client, _vision_client_source
         
         client = None
+        if language_hints is None:
+            language_hints = ['en']
         
         # Check if we can reuse cached client
-        if _vision_client and _vision_client_key == api_key:
+        if _vision_client and _vision_client_source == credential_source:
             client = _vision_client
         else:
             # Need to create new client
-            # Check if api_key is a file path (for GOOGLE_APPLICATION_CREDENTIALS)
-            if os.path.isfile(api_key):
-                # It's a file path - load credentials from file
-                credentials = service_account.Credentials.from_service_account_file(api_key)
-                client = vision.ImageAnnotatorClient(credentials=credentials)
-            elif api_key.startswith('{'):
-                # It's JSON credentials as a string
-                credentials_dict = json.loads(api_key)
-                credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+            if credential_source:
+                source_text = credential_source.lstrip()
+                if source_text.startswith('{'):
+                    credentials_dict = json.loads(credential_source)
+                    credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+                else:
+                    credentials = service_account.Credentials.from_service_account_file(credential_source)
                 client = vision.ImageAnnotatorClient(credentials=credentials)
             else:
-                # It's an API key or unknown format - try default client
-                # The default client will use GOOGLE_APPLICATION_CREDENTIALS env var if set
                 client = vision.ImageAnnotatorClient()
             
             # Cache the client
             _vision_client = client
-            _vision_client_key = api_key
+            _vision_client_source = credential_source
         
         # Convert image to bytes
         success, encoded_image = cv2.imencode('.jpg', image)
@@ -275,7 +252,7 @@ def _detect_text_tesseract(image: np.ndarray) -> List[Dict[str, Any]]:
         
     except ImportError:
         # Return special error indicator - OCR is completely unavailable
-        return [{'error': 'OCR not available. Please set GOOGLE_APPLICATION_CREDENTIALS environment variable or install Tesseract.'}]
+        return [{'error': 'OCR not available. Configure Google Vision on the backend or install Tesseract.'}]
     except Exception as e:
         print(f"⚠️  Tesseract OCR error: {e}")
         return []
@@ -466,7 +443,7 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
             - track_mode: Enable text tracking (default True)
             - language: Language hint for OCR (default 'en')
             - reset: Reset text tracking (default False)
-            - api_key: Optional Google Cloud Vision API key override
+            - credentials: Optional service-account JSON text or file path override
     
     Returns:
         Audio-friendly text string or dictionary with audio configuration.
@@ -491,7 +468,7 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
     min_confidence = config.get('min_confidence', DEFAULT_MIN_CONFIDENCE)
     track_mode = config.get('track_mode', True)
     language = config.get('language', 'en')
-    api_key = config.get('api_key')
+    credential_source = config.get('credentials')
     
     # Handle reset request
     if config.get('reset', False):
@@ -502,7 +479,7 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Any:
     # Detect text
     detections = detect_text_google_vision(
         image,
-        api_key=api_key,
+        credential_source=credential_source,
         language_hints=[language]
     )
     

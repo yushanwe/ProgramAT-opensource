@@ -42,6 +42,15 @@ import cv2
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 
+TOOL_NAME = "camera_aiming"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = (
+    "For a blind or low-vision user, identify the main object and give one concise movement "
+    "instruction using left/right, up/down, or clock direction to center and frame it clearly. "
+    "Do not rely on color-only landmarks. If no suitable object is visible, ask the user to "
+    "slowly move the camera to locate it."
+)
+
 # Framing constants
 DEFAULT_CONFIDENCE = 0.5
 CENTERING_TOLERANCE = 0.15  # 15% tolerance from center

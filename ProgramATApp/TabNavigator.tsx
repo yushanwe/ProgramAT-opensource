@@ -23,6 +23,7 @@ interface Tool {
   pr_number?: number;
   pr_title?: string;
   branch_name?: string;
+  source?: string;
 }
 
 interface TabNavigatorProps {
@@ -36,6 +37,7 @@ interface TabNavigatorProps {
   copilotSummaries?: any[];
   copilotLogs?: any[];
   onClearCopilotData?: () => void;
+  onToolRunnerVisibilityChange?: (visible: boolean) => void;
 }
 
 type TabName = 'prs' | 'tools' | 'settings' | 'chat';
@@ -54,7 +56,8 @@ export default function TabNavigator({
   copilotSessions = [],
   copilotSummaries = [],
   copilotLogs = [],
-  onClearCopilotData
+  onClearCopilotData,
+  onToolRunnerVisibilityChange,
 }: TabNavigatorProps) {
   const { theme } = useTheme();
   const [appMode, setAppMode] = useState<AppMode>(Config.APP_MODE);
@@ -97,6 +100,7 @@ export default function TabNavigator({
               productionMode={true}
               isActive={true}
               selectedIssue={selectedIssue}
+              onRunnerVisibilityChange={onToolRunnerVisibilityChange}
             />
           );
         }
@@ -123,6 +127,7 @@ export default function TabNavigator({
             productionMode={appMode === 'production'}
             isActive={activeTab === 'tools'}
             selectedIssue={selectedIssue}
+            onRunnerVisibilityChange={onToolRunnerVisibilityChange}
             onNavigateToChat={(conversationId) => {
               setPendingConversationId(conversationId || null);
               setActiveTab('chat');
@@ -148,7 +153,7 @@ export default function TabNavigator({
               onClearCopilotData={onClearCopilotData}
               appMode={appMode}
             />
-          : <ToolsAndRunner issueTools={issueTools} productionMode={true} isActive={true} selectedIssue={selectedIssue} onNavigateToChat={(conversationId) => {
+          : <ToolsAndRunner issueTools={issueTools} productionMode={true} isActive={true} selectedIssue={selectedIssue} onRunnerVisibilityChange={onToolRunnerVisibilityChange} onNavigateToChat={(conversationId) => {
               setPendingConversationId(conversationId || null);
               setActiveTab('chat');
             }} />;

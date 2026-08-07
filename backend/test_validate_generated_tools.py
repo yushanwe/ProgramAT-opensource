@@ -32,9 +32,9 @@ Capability: navigation
         path.write_text(text, encoding="utf-8")
         return path
 
-    def test_rejects_local_router_and_direct_provider_patterns(self):
+    def test_allows_local_detector_and_model_constants(self):
         path = self._write_temp_tool(
-            "bad_generated_tool.py",
+            "good_generated_tool.py",
             """
 from ultralytics import YOLO
 
@@ -50,22 +50,13 @@ def detect_vehicles(image):
 """,
         )
 
-        failures = validate_generated_tools.validate_files([path])
+        self.assertEqual(validate_generated_tools.validate_files([path]), [])
 
-        self.assertTrue(any("direct ultralytics import" in failure for failure in failures))
-        self.assertTrue(any("direct YOLO import" in failure for failure in failures))
-        self.assertTrue(any("direct YOLO call" in failure for failure in failures))
-        self.assertTrue(any("hardcoded YOLO model name" in failure for failure in failures))
-        self.assertTrue(any("DEFAULT_MODEL constant" in failure for failure in failures))
-        self.assertTrue(any("local ModelRouter class" in failure for failure in failures))
-        self.assertTrue(any("COCO class list" in failure for failure in failures))
-        self.assertTrue(any("model file reference" in failure for failure in failures))
-
-    def test_allows_model_router_client_import(self):
+    def test_allows_tool_policy_client_import(self):
         path = self._write_temp_tool(
             "good_generated_tool.py",
             """
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 TASK_CATEGORY = "general_reasoning"
 
@@ -85,7 +76,7 @@ def main(image, input_data=None):
         path = self._write_temp_tool(
             "good_ocr_tool.py",
             '''
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     result = copilot_llm_call(capability="ocr", images=[image])
@@ -100,7 +91,7 @@ def main(image, input_data=None):
             path = self._write_temp_tool(
                 "stringified_result_tool.py",
                 f'''
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     guidance = copilot_llm_call(
@@ -119,7 +110,7 @@ def main(image, input_data=None):
         path = self._write_temp_tool(
             "response_field_tool.py",
             '''
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     guidance = copilot_llm_call(
@@ -133,50 +124,11 @@ def main(image, input_data=None):
 
         self.assertEqual(validate_generated_tools.validate_files([path]), [])
 
-    def test_rejects_non_canonical_task_category_visual_reasoning(self):
-        path = self._write_temp_tool(
-            "bad_visual_reasoning_tool.py",
-            """
-from model_router_client import copilot_llm_call
-
-def main(image, input_data=None):
-    return copilot_llm_call(
-        task_category="visual_reasoning",
-        messages=[{"role": "user", "content": "Find my Uber and guide me."}],
-        images=[image],
-        metadata={"tool_name": "bad_visual_reasoning_tool"},
-    )
-""",
-        )
-
-        failures = validate_generated_tools.validate_files([path])
-        self.assertTrue(any("non-canonical capability 'visual_reasoning'" in failure for failure in failures))
-
-    def test_rejects_independent_call_when_issue_has_three_stages(self):
-        path = self._write_temp_tool(
-            "uber_single_call_tool.py",
-            """
-from model_router_client import copilot_llm_call
-
-def main(image, input_data=None):
-    return copilot_llm_call(
-        task_category="general_reasoning",
-        messages=[{"role": "user", "content": "Handle all Uber steps in one call."}],
-        images=[image],
-        metadata={"tool_name": "uber_single_call_tool"},
-    )
-""",
-        )
-
-        failures = validate_generated_tools.validate_files([path], issue_text=self.UBER_STAGE_ISSUE)
-
-        self.assertTrue(any("ordered copilot_llm_call capabilities" in failure for failure in failures))
-
     def test_allows_explicit_calls_matching_uber_stage_capabilities(self):
         path = self._write_temp_tool(
             "uber_three_stage_tool.py",
             """
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 def main(image, input_data=None):
     vehicle = copilot_llm_call(
@@ -201,6 +153,271 @@ def main(image, input_data=None):
 
         failures = validate_generated_tools.validate_files([path], issue_text=self.UBER_STAGE_ISSUE)
         self.assertEqual(failures, [])
+
+    def test_static_contract_rejects_video_config(self):
+        """Legacy declarative take-photo tools retain their compatibility rules."""
+        issue = "## Mode\n\ntake_photo\n"
+        tool = '''
+from model_execution import execute_tool_policy
+TOOL_NAME = "hand_identifier"
+EXECUTION_MODE = "take_photo"
+VIDEO_CONFIG = {"window_seconds": 6}
+TOOL_PROMPT = "Identify the current hand."
+TOOL_POLICY = {"strategy": "single", "models": ["gemini-3.1-flash-lite"]}
+def main(image, input_data):
+    return execute_tool_policy(image=image, prompt=TOOL_PROMPT, policy=TOOL_POLICY, tool_name=TOOL_NAME)
+'''
+        failures = validate_generated_tools.validate_take_photo_tool(
+            tool, issue, Path("tools/hand_identifier.py")
+        )
+        self.assertTrue(any("must not declare" in failure for failure in failures))
+
+    def test_lifecycle_tool_supports_both_entry_points_without_mode_or_policy(self):
+        tool = '''
+import asyncio
+from litellm_utils import call_model, extract_text
+
+TOOL_NAME = "exit_finder"
+TOOL_PROMPT = "Find the nearest visible exit and give concise accessible guidance."
+
+async def analyze(image):
+    response = await asyncio.to_thread(
+        call_model,
+        "gemini/gemini-3.1-flash-lite",
+        [{"role": "user", "content": TOOL_PROMPT}],
+        [image],
+    )
+    return extract_text(response)
+
+async def on_take_photo(runtime, image, input_data):
+    return await analyze(image)
+
+async def on_stream_start(runtime, input_data):
+    runtime.set_state("last_frame_id", 0)
+
+async def on_frame(runtime, frame):
+    if frame.frame_id == runtime.get_state("last_frame_id"):
+        return
+    runtime.set_state("last_frame_id", frame.frame_id)
+    await runtime.emit(await analyze(frame.image), final=True, replace=True)
+
+async def on_stream_stop(runtime):
+    runtime.clear_state()
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_take_photo_tool(
+                tool, "", Path("tools/exit_finder.py")
+            ),
+            [],
+        )
+
+    def test_on_frame_rejects_await_before_in_flight_claim(self):
+        # Mirrors a real incident: on_frame awaited an embedding computation
+        # directly, before recording any state, so overlapping frames could
+        # all pass the same "scene changed" check and relaunch duplicate
+        # model calls before any of them committed a claim.
+        tool = '''
+import asyncio
+from litellm_utils import call_model, extract_text
+
+TOOL_NAME = "scene_watcher"
+TOOL_PROMPT = "Describe the scene."
+
+async def on_stream_start(runtime, input_data):
+    runtime.set_state("scene_generation", 0)
+
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+    embedding = await asyncio.to_thread(lambda: frame.image)
+    generation = int(runtime.get_state("scene_generation", 0))
+    runtime.set_state("scene_generation", generation + 1)
+
+async def on_stream_stop(runtime):
+    runtime.clear_state()
+'''
+        failures = validate_generated_tools.validate_take_photo_tool(
+            tool, "", Path("tools/scene_watcher.py")
+        )
+        self.assertTrue(
+            any("awaits before recording any runtime.set_state" in f for f in failures),
+            failures,
+        )
+
+    def test_on_frame_allows_claim_before_await(self):
+        tool = '''
+import asyncio
+from litellm_utils import call_model, extract_text
+
+TOOL_NAME = "scene_watcher"
+TOOL_PROMPT = "Describe the scene."
+
+async def on_stream_start(runtime, input_data):
+    runtime.set_state("analyzing", False)
+
+async def on_frame(runtime, frame):
+    if runtime.is_cancelled():
+        return
+    if runtime.get_state("analyzing"):
+        return
+    runtime.set_state("analyzing", True)
+    try:
+        await asyncio.to_thread(lambda: frame.image)
+    finally:
+        runtime.set_state("analyzing", False)
+
+async def on_stream_stop(runtime):
+    runtime.clear_state()
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_take_photo_tool(
+                tool, "", Path("tools/scene_watcher.py")
+            ),
+            [],
+        )
+
+    def test_lifecycle_tool_requires_one_shared_prompt(self):
+        tool = '''
+TOOL_NAME = "gesture_identifier"
+TOOL_PROMPT = "Identify the visible gesture without inventing motion."
+TEMPORAL_PROMPT = "Track motion."
+
+async def on_take_photo(runtime, image, input_data):
+    return "uncertain"
+
+async def on_frame(runtime, frame):
+    return None
+'''
+        failures = validate_generated_tools.validate_take_photo_tool(
+            tool, "", Path("tools/gesture_identifier.py")
+        )
+        self.assertTrue(any("one shared TOOL_PROMPT" in failure for failure in failures))
+
+    def test_temporal_contract_requires_complete_window_and_temporal_prompt(self):
+        issue = "## Mode\n\nhosted_video_streaming\n"
+        incomplete = '''
+TOOL_NAME = "door_change"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {"window_seconds": 6}
+TOOL_PROMPT = "Describe the door."
+'''
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
+            incomplete, issue, Path("tools/door_change.py")
+        )
+        self.assertTrue(any("VIDEO_CONFIG is missing" in failure for failure in failures))
+        self.assertTrue(any("chronological or state-change" in failure for failure in failures))
+
+        complete = '''
+TOOL_NAME = "door_change"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 5,
+    "minimum_unique_frames": 12,
+}
+TOOL_PROMPT = "Compare chronological early and late frames and report whether the door changed."
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_temporal_streaming_tool(
+                complete, issue, Path("tools/door_change.py")
+            ),
+            [],
+        )
+
+    def test_temporal_sign_language_tool_validates_as_ordered_video(self):
+        issue = """## Task
+Understand a temporal short sign-language gesture from recent hand movements.
+
+## Expected output
+Identify the sign or short signed phrase they just made, including signs lasting seconds.
+
+## Mode
+
+hosted_video_streaming
+"""
+        tool = '''
+TOOL_NAME = "recent_sign_language"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 4,
+    "minimum_unique_frames": 8,
+}
+OUTPUT_CONFIG = {"deduplicate": True}
+TOOL_PROMPT = (
+    "Inspect the four chronological frames from early to late. Track the signer's "
+    "hand shapes, orientation, location, and motion sequence over the recent interval, "
+    "then identify the completed sign or short signed phrase."
+)
+'''
+        self.assertEqual(
+            validate_generated_tools.validate_temporal_streaming_tool(
+                tool, issue, Path("tools/recent_sign_language.py")
+            ),
+            [],
+        )
+
+    def test_validation_follows_copilot_declaration_not_parser_mode_suggestion(self):
+        issue_with_wrong_suggestion = """## Task
+Identify the signed phrase from recent movement.
+
+## Mode
+
+take_photo
+"""
+        temporal_tool = '''
+TOOL_NAME = "recent_sign_language"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 4,
+    "minimum_unique_frames": 8,
+}
+TOOL_PROMPT = "Compare chronological early and late hand movement and identify the signed phrase."
+'''
+        path = Path("tools/recent_sign_language.py")
+        self.assertEqual(
+            validate_generated_tools.validate_take_photo_tool(
+                temporal_tool, issue_with_wrong_suggestion, path
+            ),
+            [],
+        )
+        self.assertEqual(
+            validate_generated_tools.validate_temporal_streaming_tool(
+                temporal_tool, issue_with_wrong_suggestion, path
+            ),
+            [],
+        )
+
+    def test_sign_language_tool_cannot_reuse_played_card_schema(self):
+        issue = "## Mode\n\nhosted_video_streaming\n"
+        tool = '''
+TOOL_NAME = "recent_sign_language"
+EXECUTION_MODE = "hosted_video_streaming"
+VIDEO_CONFIG = {
+    "window_seconds": 6,
+    "interval_seconds": 3,
+    "minimum_span_seconds": 4,
+    "minimum_unique_frames": 8,
+}
+OUTPUT_CONFIG = {"schema": "played_card_event"}
+TOOL_PROMPT = "Inspect chronological hand motion and identify the signed phrase."
+'''
+        failures = validate_generated_tools.validate_temporal_streaming_tool(
+            tool, issue, Path("tools/recent_sign_language.py")
+        )
+        self.assertTrue(any("card-specific prompt" in failure for failure in failures))
+
+    def test_checked_in_tools_pass_static_guardrails(self):
+        tool_paths = [
+            path
+            for path in validate_generated_tools.TOOLS_DIR.glob("*.py")
+            if path.name not in validate_generated_tools.ALLOWED_SHARED_TOOL_FILES
+        ]
+        self.assertEqual(validate_generated_tools.validate_files(tool_paths), [])
 
 
 if __name__ == "__main__":

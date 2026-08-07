@@ -11,13 +11,13 @@ import {
   View,
   ScrollView,
   AccessibilityInfo,
-  findNodeHandle,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Config from './config';
 import WebSocketService from './WebSocketService';
 import BeepService from './BeepService';
 import { useTheme } from './ThemeContext';
+import { RuntimeInputDefinition } from './runtimeInput';
 
 interface Tool {
   name: string;
@@ -32,6 +32,8 @@ interface Tool {
   gpt_query?: string;
   system_instruction?: string;
   query_interval?: number;
+  source?: string;
+  runtime_input?: RuntimeInputDefinition;
 }
 
 interface ToolSelectorProps {
@@ -48,19 +50,12 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
   const [loading, setLoading] = useState(true);
   const [expectingNewTools, setExpectingNewTools] = useState(false);
   const [loadingStartTime, setLoadingStartTime] = useState<number>(0); // Track when loading started
-  const headerRef = useRef<Text>(null);
-
   console.log('[ToolSelector] Rendered - productionMode:', productionMode, 'issueTools:', issueTools.length);
 
-  // Set accessibility focus to header when component mounts
+  // Announce the screen title when entering the tool selector.
   useEffect(() => {
     const timeout = setTimeout(() => {
-      if (headerRef.current) {
-        const reactTag = findNodeHandle(headerRef.current);
-        if (reactTag) {
-          AccessibilityInfo.setAccessibilityFocus(reactTag);
-        }
-      }
+      AccessibilityInfo.announceForAccessibility('Tools');
     }, 100); // Small delay to ensure component is rendered
     
     return () => clearTimeout(timeout);
@@ -76,6 +71,11 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     if (issueTools.length > 0) {
       console.log('[ToolSelector] Received tools:', issueTools.length);
       console.log('[ToolSelector] Tool names:', issueTools.map(t => t.name));
+      issueTools.forEach(tool => {
+        console.log(
+          `[Runtime Input] tool=${tool.path || tool.name} enabled=${tool.runtime_input ? 'true' : 'false'}`,
+        );
+      });
       
       // Update the tools
       setTools(issueTools);
@@ -181,7 +181,6 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     <SafeAreaView style={[styles.container, { backgroundColor: theme.backgroundSecondary }]} edges={[]} accessible={false}>
       <View style={[styles.header, { backgroundColor: theme.background, borderBottomColor: theme.border }]} accessible={false}>
         <Text 
-          ref={headerRef}
           style={[styles.headerText, { color: theme.text }]}
           accessible={true}
           accessibilityRole="header"

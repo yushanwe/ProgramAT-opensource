@@ -12,7 +12,30 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-MODEL = 'gemini-3-flash-preview'
+RETRYABLE_CODES = {503, 429}
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 2.0  # seconds, doubles each attempt
+
+
+async def _with_retry(func, *args, **kwargs):
+    """Run a blocking Gemini SDK call in a thread, retrying on transient errors."""
+    from google.genai import errors  # noqa: PLC0415
+
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(func, *args, **kwargs)
+        except errors.APIError as exc:
+            if exc.code not in RETRYABLE_CODES or attempt == RETRY_ATTEMPTS - 1:
+                raise
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "Gemini call failed with %s (attempt %d/%d) — retrying in %.0fs",
+                exc.code, attempt + 1, RETRY_ATTEMPTS, delay,
+            )
+            await asyncio.sleep(delay)
+
+
+MODEL = 'gemini-3.1-flash-lite-preview'
 PROMPT = (
     "This video should provide an example of how a hypothetical tool for visual assistance should work"
     "Summarize what is happening in this video, including any relevant audio context. "
@@ -21,8 +44,31 @@ PROMPT = (
     "If the user specifies a particular relationship between an action they take/a thing that comes onscreen and an output produced, include that relationship in your description"
     "Conclude with a sentence summarizing the key functionality and behavior of the desired tool"
 )
+ITERATION_PROMPT = (
+    "This video shows a case of an existing tool for visual assistance recently running, not a hypothetical example. "
+    "Summarize what is happening in this video, including any relevant audio context, so it can be used to contextualize a request to iterate on or change this tool. "
+    "Describe what the tool actually did, and any behavior the user reacted to or commented on, so its relevance to the requested change is clear. "
+    "In the event the user is describing a hypothetical scenario/pretending with things in their environment, your description should match what they are pretending things are, not the actual item in the mock up. "
+    "If the user specifies a particular relationship between an action they take/a thing that comes onscreen and an output produced, include that relationship in your description. "
+    "Conclude with a sentence summarizing what the tool did during this run and how it relates to the requested iteration."
+)
 POLL_INTERVAL = 2.0   # seconds between file-state checks
 POLL_TIMEOUT  = 120.0  # max seconds to wait for file to become ACTIVE
+_video_inference_client = None
+
+PLAYED_CARD_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["event_detected", "before_cards", "after_cards", "played_card", "confidence", "evidence"],
+    "properties": {
+        "event_detected": {"type": "boolean"},
+        "before_cards": {"type": "array", "items": {"type": "string"}},
+        "after_cards": {"type": "array", "items": {"type": "string"}},
+        "played_card": {"type": ["string", "null"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "evidence": {"type": "string"},
+    },
+}
 
 # Mime types recognised as video
 _VIDEO_MIME = {
@@ -50,6 +96,47 @@ def _make_client():
         return None
 
 
+def _make_video_inference_client():
+    """Reuse one Google GenAI client for hosted streaming requests."""
+    global _video_inference_client
+    if _video_inference_client is None:
+        _video_inference_client = _make_client()
+    return _video_inference_client
+
+
+def _image_generation_config(output_schema: str | None = None):
+    from google.genai import types
+    kwargs = dict(
+        temperature=0,
+        tools=[],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+    if output_schema == "played_card_event":
+        kwargs.update(
+            response_mime_type="application/json",
+            response_json_schema=PLAYED_CARD_RESPONSE_SCHEMA,
+        )
+    return types.GenerateContentConfig(**kwargs)
+
+
+async def infer_images_with_gemini(
+    images: list[bytes], prompt: str, model: str, output_schema: str | None = None
+):
+    """Send ordered JPEG bytes directly to Gemini and return text plus usage."""
+    from google.genai import types
+    client = _make_video_inference_client()
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini image inference")
+    parts = [types.Part.from_bytes(data=image, mime_type="image/jpeg") for image in images]
+    response = await _with_retry(
+        client.models.generate_content,
+        model=model.removeprefix('gemini/'),
+        contents=[prompt, *parts],
+        config=_image_generation_config(output_schema),
+    )
+    return (response.text or '').strip(), getattr(response, 'usage_metadata', None)
+
+
 def _make_vertex_client():
     """Return a google-genai Client configured for Vertex AI, or None if unavailable."""
     try:
@@ -70,7 +157,39 @@ def _is_active(file_obj) -> bool:
     return str(state) in ('ACTIVE', 'FileState.ACTIVE')
 
 
-async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
+async def infer_mp4_with_gemini(path: Path, prompt: str, model: str):
+    """Upload one MP4, run one Gemini request, and return text plus usage metadata."""
+    client = _make_client()
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini video inference")
+    loop = asyncio.get_running_loop()
+    uploaded = None
+    try:
+        uploaded = await _with_retry(client.files.upload, file=path)
+        deadline = loop.time() + POLL_TIMEOUT
+        while not _is_active(uploaded):
+            state = getattr(getattr(uploaded, 'state', None), 'name', str(getattr(uploaded, 'state', '')))
+            if state == 'FAILED':
+                raise RuntimeError("Gemini rejected the uploaded MP4 during processing")
+            if loop.time() >= deadline:
+                raise TimeoutError("Gemini MP4 processing timed out")
+            await asyncio.sleep(POLL_INTERVAL)
+            uploaded = await _with_retry(client.files.get, name=uploaded.name)
+        response = await _with_retry(
+            client.models.generate_content,
+            model=model.removeprefix('gemini/'),
+            contents=[prompt, uploaded],
+        )
+        return (response.text or '').strip(), getattr(response, 'usage_metadata', None)
+    finally:
+        if uploaded is not None and getattr(uploaded, 'name', None):
+            try:
+                await asyncio.to_thread(client.files.delete, name=uploaded.name)
+            except Exception as exc:
+                logger.warning("Could not delete Gemini temporary file %s: %s", uploaded.name, exc)
+
+
+async def _summarize_via_gcs(path: Path, mime_type: str, loop, prompt: str = PROMPT) -> str:
     """
     Upload video to GCS and summarize via Vertex AI using a gs:// URI.
     Reads BUCKET_NAME and PROJECT_ID from env. Deletes the GCS object after use.
@@ -114,10 +233,10 @@ async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
             part = types.Part.from_uri(file_uri=gs_uri, mime_type=mime_type)
             return client.models.generate_content(
                 model=MODEL,
-                contents=[part, PROMPT],
+                contents=[part, prompt],
             )
 
-        response = await loop.run_in_executor(None, _generate)
+        response = await _with_retry(_generate)
         summary = (response.text or "").strip()
         logger.info("GCS video summary generated (%d chars)", len(summary))
         return summary
@@ -141,7 +260,7 @@ async def _summarize_via_gcs(path: Path, mime_type: str, loop) -> str:
             logger.warning("Could not delete GCS object: %s", gs_uri, exc_info=True)
 
 
-async def summarize_video(video_path: str) -> str:
+async def summarize_video(video_path: str, prompt: str = PROMPT) -> str:
     """
     Summarize a local video file using Gemini.
 
@@ -167,14 +286,12 @@ async def summarize_video(video_path: str) -> str:
 
             logger.info("Uploading %s to Gemini Files API (%s) …", path.name, mime_type)
 
-            uploaded_file = await loop.run_in_executor(
-                None,
-                lambda: client.files.upload(
-                    file=str(path),
-                    config=types.UploadFileConfig(
-                        mime_type=mime_type,
-                        display_name=path.name,
-                    ),
+            uploaded_file = await _with_retry(
+                client.files.upload,
+                file=str(path),
+                config=types.UploadFileConfig(
+                    mime_type=mime_type,
+                    display_name=path.name,
                 ),
             )
 
@@ -188,21 +305,15 @@ async def summarize_video(video_path: str) -> str:
                     raise TimeoutError("File API polling timed out")
                 await asyncio.sleep(POLL_INTERVAL)
                 elapsed += POLL_INTERVAL
-                uploaded_file = await loop.run_in_executor(
-                    None,
-                    lambda n=file_name: client.files.get(name=n),
-                )
+                uploaded_file = await _with_retry(client.files.get, name=file_name)
                 logger.debug("File state: %s (%.0fs elapsed)", uploaded_file.state, elapsed)
 
             logger.info("File ACTIVE — generating summary …")
 
-            file_ref = uploaded_file
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.models.generate_content(
-                    model=MODEL,
-                    contents=[file_ref, PROMPT],
-                ),
+            response = await _with_retry(
+                client.models.generate_content,
+                model=MODEL,
+                contents=[uploaded_file, prompt],
             )
 
             summary = (response.text or "").strip()
@@ -223,4 +334,4 @@ async def summarize_video(video_path: str) -> str:
 
     # --- Fallback: GCS + Vertex AI ---
     logger.info("Attempting GCS fallback for video summarization")
-    return await _summarize_via_gcs(path, mime_type, loop)
+    return await _summarize_via_gcs(path, mime_type, loop, prompt)

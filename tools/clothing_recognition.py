@@ -12,9 +12,15 @@ import numpy as np
 from PIL import Image
 
 from litellm_utils import extract_text, pil_image_to_data_uri
-from model_router_client import copilot_llm_call
+from tool_policy_client import copilot_llm_call
 
 TOOL_NAME = "clothing_recognition"
+EXECUTION_MODE = "take_photo"
+TOOL_PROMPT = (
+    "For a blind or low-vision user, identify the most prominent clothing item and briefly "
+    "state its category, color, pattern, and other useful visible features. Return only a "
+    "concise spoken description. If no clothing is clearly visible, say so."
+)
 TASK_CATEGORY = "general_reasoning"
 
 
@@ -107,7 +113,6 @@ def build_clothing_prompt(detail_level: str = 'standard') -> str:
 
 def analyze_clothing(
     image: np.ndarray,
-    api_key: Optional[str] = None,
     detail_level: str = 'standard',
 ) -> Dict[str, Any]:
     """
@@ -115,7 +120,6 @@ def analyze_clothing(
     
     Args:
         image: OpenCV image (numpy array in BGR format)
-        api_key: Gemini API key (uses env var if not provided)
         detail_level: 'brief', 'standard', or 'detailed'
     
     Returns:
@@ -143,8 +147,6 @@ def analyze_clothing(
             'tool_name': TOOL_NAME,
             'route_text': 'identify the most prominent clothing item and describe visual features concisely',
         }
-        if api_key:
-            metadata['api_key'] = api_key
 
         result = copilot_llm_call(
             capability=TASK_CATEGORY,
@@ -223,7 +225,6 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Dict[str, Any]
         image: Camera frame as numpy array (BGR format from OpenCV)
         input_data: Optional configuration dictionary:
             - 'detail_level': 'brief', 'standard', or 'detailed' (default: 'standard')
-            - 'api_key': Optional API key override
     
     Returns:
         Dictionary with analysis results and audio configuration:
@@ -266,11 +267,9 @@ def main(image: np.ndarray, input_data: Optional[Dict] = None) -> Dict[str, Any]
         input_data = {}
     
     detail_level = input_data.get('detail_level', 'standard')
-    api_key = input_data.get('api_key')
     # Analyze clothing
     result = analyze_clothing(
         image=image,
-        api_key=api_key,
         detail_level=detail_level,
     )
     

@@ -10,8 +10,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-import yaml
-
+from policy_executor import ToolPolicyError, validate_tool_policy
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = REPO_ROOT / "tools"
@@ -19,66 +18,24 @@ TOOLS_DIR = REPO_ROOT / "tools"
 FORBIDDEN_PATTERNS = [
     ("import litellm", re.compile(r"^\s*(?:import|from)\s+litellm\b", re.MULTILINE)),
     ("litellm.completion", re.compile(r"\blitellm\s*\.\s*completion\s*\(")),
-    ("direct ultralytics import", re.compile(r"^\s*(?:import\s+ultralytics\b|from\s+ultralytics\s+import\b)", re.MULTILINE)),
-    ("direct YOLO import", re.compile(r"^\s*(?:import\s+YOLO\b|from\s+\S+\s+import\s+.*\bYOLO\b)", re.MULTILINE)),
-    ("direct YOLO call", re.compile(r"\bYOLO\s*\(")),
-    ("hardcoded YOLO model name", re.compile(r"\byolo11\w*\b", re.IGNORECASE)),
-    ("direct Google Vision import", re.compile(r"^\s*(?:import\s+google\.cloud\.vision\b|from\s+google\.cloud\s+import\s+vision\b)", re.MULTILINE)),
-    ("direct provider SDK import", re.compile(r"^\s*(?:import|from)\s+(?:openai|anthropic|google\.genai|google\.generativeai)\b", re.MULTILINE)),
-    ("DEFAULT_MODEL constant", re.compile(r"\bDEFAULT_MODEL\b")),
-    ("local ModelRouter class", re.compile(r"\bclass\s+ModelRouter\b")),
-    ("COCO class list", re.compile(r"\bCOCO_CLASSES\b")),
-    ("model registry", re.compile(r"\b(?:MODEL_REGISTRY|model_registry|available_models|provider_registry)\b")),
-    ("provider fallback logic", re.compile(r"\b(?:fallback_models|fallback_model|provider_fallback|fallback_provider)\b")),
-    ("model file reference", re.compile(r"\.pt\b|['\"][^'\"]+\.pt['\"]")),
+    ("backend policy orchestration", re.compile(r"\bexecute_resolved_tool_policy\b")),
+    ("unsafe process import", re.compile(r"^\s*(?:import|from)\s+(?:subprocess|multiprocessing)\b", re.MULTILINE)),
+    ("unsafe environment access", re.compile(r"^\s*(?:import|from)\s+(?:os|dotenv)\b|\bos\s*\.\s*(?:environ|getenv)\b", re.MULTILINE)),
+    ("unsafe dynamic import", re.compile(r"\b(?:__import__|import_module)\s*\(")),
+    ("unsafe backend import", re.compile(r"^\s*(?:import|from)\s+(?:stream_server|generated_tool_runtime|tool_policy_runtime)\b", re.MULTILINE)),
+    ("unsafe socket import", re.compile(r"^\s*(?:import|from)\s+socket\b", re.MULTILINE)),
+    ("custom output transport import", re.compile(r"^\s*(?:import|from)\s+(?:websockets?|aiohttp|requests|httpx|urllib|http\.client)\b", re.MULTILINE)),
+    ("custom output transport", re.compile(r"\b(?:websocket|event_emitter|result_callback|response_callback|on_progress)\b", re.IGNORECASE)),
+    ("raw credential access", re.compile(r"\b(?:api_key|explicit_api_key|GEMINI_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY)\b")),
+    ("filesystem access", re.compile(r"\b(?:open|Path)\s*\(|\.(?:write_text|write_bytes|unlink|mkdir|rename|replace)\s*\(")),
     ("model file discovery", re.compile(r"\b(?:glob|rglob)\s*\([^)]*\.pt[^)]*\)|os\.walk\s*\(")),
 ]
 
 ALLOWED_SHARED_TOOL_FILES = {
     "litellm_utils.py",
-    "model_router_client.py",
+    "tool_policy_client.py",
+    "model_execution.py",
 }
-
-CAPABILITY_PROFILES_PATH = REPO_ROOT / "backend" / "capability_profiles.yaml"
-
-
-def _load_canonical_task_categories() -> frozenset[str]:
-    with CAPABILITY_PROFILES_PATH.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    capabilities = data.get("capabilities", {})
-    if not isinstance(capabilities, dict) or not capabilities:
-        raise ValueError(f"No capabilities configured in {CAPABILITY_PROFILES_PATH}")
-    return frozenset(str(name) for name in capabilities)
-
-
-CANONICAL_TASK_CATEGORIES = _load_canonical_task_categories()
-
-
-def _extract_task_stages_section(issue_text: str) -> str:
-    match = re.search(r"^##\s+Task\s+Stages\s*$", issue_text, re.IGNORECASE | re.MULTILINE)
-    if not match:
-        return ""
-
-    start = match.end()
-    remainder = issue_text[start:]
-    next_header = re.search(r"^##\s+", remainder, re.MULTILINE)
-    if next_header:
-        return remainder[: next_header.start()]
-    return remainder
-
-
-def extract_stage_capabilities(issue_text: str) -> List[str]:
-    section = _extract_task_stages_section(issue_text)
-    if not section:
-        return []
-
-    capabilities: List[str] = []
-    for cap in re.findall(r"^\s*(?:[-*]\s*)?Capability\s*:\s*`?([a-z_]+)`?\s*$", section, re.IGNORECASE | re.MULTILINE):
-        capability = cap.strip()
-        if capability in CANONICAL_TASK_CATEGORIES:
-            capabilities.append(capability)
-    return capabilities
-
 
 def _extract_string_constants(tree: ast.AST) -> dict[str, str]:
     constants: dict[str, str] = {}
@@ -90,6 +47,23 @@ def _extract_string_constants(tree: ast.AST) -> dict[str, str]:
             target = node.targets[0]
             if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 constants[target.id] = node.value.value
+    return constants
+
+
+def _extract_literal_constants(tree: ast.AST) -> dict[str, object]:
+    constants: dict[str, object] = {}
+    if not isinstance(tree, ast.Module):
+        return constants
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        try:
+            constants[target.id] = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            continue
     return constants
 
 
@@ -178,40 +152,365 @@ def validate_no_stringified_copilot_results(tool_text: str, rel_path: Path) -> L
     return failures
 
 
-def validate_stage_enforcement(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
-    failures: List[str] = []
-    stage_capabilities = extract_stage_capabilities(issue_text)
-    if not stage_capabilities:
-        return failures
+def validate_on_frame_guards_before_await(tool_text: str, rel_path: Path) -> List[str]:
+    """Require on_frame() to claim its in-flight guard before its first await.
 
-    actual_capabilities = extract_copilot_llm_task_categories(tool_text)
-    if actual_capabilities != stage_capabilities:
-        failures.append(
-            f"{rel_path}: ordered copilot_llm_call capabilities {actual_capabilities} do not match "
-            f"Task Stages {stage_capabilities}."
+    on_frame is re-entered on every delivered frame with no backend-owned
+    throttle (see tools/CLAUDE.md); guarding against duplicate/overlapping
+    work is the tool's own responsibility. A tool that awaits expensive work
+    (an embedding computation, a model call) directly in on_frame's body
+    before recording any runtime.set_state(...) claim lets several
+    overlapping on_frame calls all pass the same stale-state check before
+    any of them commits its claim, so they independently relaunch the same
+    unit of work. This mirrors a real incident: three of four recently
+    generated streaming tools shipped this exact race.
+    """
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+
+    on_frame = next(
+        (
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_frame"
+        ),
+        None,
+    )
+    if on_frame is None:
+        return []
+
+    def is_runtime_set_state(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set_state"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "runtime"
         )
 
+    def is_runtime_is_cancelled_check(node: ast.AST) -> bool:
+        # `if runtime.is_cancelled(): return` at the top is a cancellation
+        # check, not the work this rule is trying to gate; ignore any
+        # Await nested only inside such a guard's own test expression.
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "is_cancelled"
+        )
+
+    # Walk on_frame's own statements (not nested function/lambda bodies —
+    # a helper wrapped in asyncio.create_task is exactly the sanctioned
+    # pattern and its internal awaits are not on_frame's own suspension
+    # points) in source order, looking for the first bare Await and the
+    # first set_state call among direct descendants of on_frame's body.
+    def walk_own_scope(node: ast.AST):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+                continue  # nested scope; its awaits/claims are its own
+            yield child
+            yield from walk_own_scope(child)
+
+    first_set_state_line: Optional[int] = None
+    first_await_line: Optional[int] = None
+    for node in walk_own_scope(on_frame):
+        if first_set_state_line is None and is_runtime_set_state(node):
+            first_set_state_line = node.lineno
+        if first_await_line is None and isinstance(node, ast.Await):
+            if is_runtime_is_cancelled_check(node.value):
+                continue
+            first_await_line = node.lineno
+        if first_set_state_line is not None and first_await_line is not None:
+            break
+
+    if first_await_line is None:
+        return []  # on_frame never suspends directly; nothing to race.
+    if first_set_state_line is None or first_set_state_line > first_await_line:
+        return [
+            f"{rel_path}:{first_await_line}: on_frame() awaits before recording any "
+            "runtime.set_state(...) claim. Record an in-flight/generation claim with "
+            "runtime.set_state(...) before this await, or move the awaited work into "
+            "a helper wrapped in asyncio.create_task(...) — see CLAUDE.md's "
+            "'Assume on_frame() may run again while earlier async work is still "
+            "running' section."
+        ]
+    return []
+
+
+def validate_take_photo_tool(tool_text: str, issue_text: str, rel_path: Path) -> List[str]:
+    """Validate the executable lifecycle contract and legacy take-photo fallback."""
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+    constants = _extract_literal_constants(tree)
+    lifecycle = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"on_take_photo", "on_stream_start", "on_frame", "on_stream_stop"}
+    }
+    if lifecycle:
+        failures = []
+        if "on_take_photo" not in lifecycle and "on_frame" not in lifecycle:
+            failures.append(
+                f"{rel_path}: executable tools require on_take_photo() or on_frame()."
+            )
+        if "TOOL_POLICY" in constants:
+            failures.append(
+                f"{rel_path}: executable lifecycle tools must not declare TOOL_POLICY. "
+                "Implement model strategy directly in on_take_photo() or on_frame() "
+                "using asyncio.create_task and runtime.emit()."
+            )
+        if not isinstance(constants.get("TOOL_NAME"), str):
+            failures.append(f"{rel_path}: executable tools require one string TOOL_NAME.")
+        if not isinstance(constants.get("TOOL_PROMPT"), str) or not str(
+            constants.get("TOOL_PROMPT") or ""
+        ).strip():
+            failures.append(
+                f"{rel_path}: executable tools require one non-empty string TOOL_PROMPT."
+            )
+        mode_prompt_names = {
+            "TAKE_PHOTO_PROMPT", "STREAMING_PROMPT", "TEMPORAL_PROMPT"
+        }
+        found_mode_prompts = sorted(mode_prompt_names & set(constants))
+        if found_mode_prompts:
+            failures.append(
+                f"{rel_path}: use one shared TOOL_PROMPT instead of mode-specific prompts: "
+                + ", ".join(found_mode_prompts)
+            )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            call_name = (
+                node.func.id if isinstance(node.func, ast.Name)
+                else node.func.attr if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if call_name not in {"call_model", "call_openai_responses_model"}:
+                continue
+            if not node.args and not any(keyword.arg == "model_name" for keyword in node.keywords):
+                failures.append(
+                    f"{rel_path}:{node.lineno}: model calls require an explicit model name."
+                )
+        failures.extend(validate_on_frame_guards_before_await(tool_text, rel_path))
+        return failures
+
+    if constants.get('EXECUTION_MODE') != 'take_photo':
+        return []
+
+    policy_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "execute_tool_policy"
+        )
+    ]
+    failures = []
+    if any(isinstance(node, (ast.AsyncFunctionDef, ast.Yield, ast.YieldFrom)) for node in ast.walk(tree)):
+        failures.append(
+            f"{rel_path}: generated take-photo tools must use synchronous single-return functions; "
+            "progressive execution is runtime-owned."
+        )
+    if "call_take_photo_vlm" in {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}:
+        failures.append(f"{rel_path}: generated tools must not use call_take_photo_vlm().")
+    if len(policy_calls) != 1:
+        failures.append(
+            f"{rel_path}: take-photo tools require exactly one execute_tool_policy() call; "
+            f"found {len(policy_calls)}."
+        )
+    generated_policy_keywords = {"image", "prompt", "policy", "tool_name"}
+    for call in policy_calls:
+        unsupported_keywords = sorted(
+            keyword.arg for keyword in call.keywords
+            if keyword.arg is not None and keyword.arg not in generated_policy_keywords
+        )
+        if unsupported_keywords:
+            failures.append(
+                f"{rel_path}:{call.lineno}: generated tools cannot pass runtime-owned "
+                f"execution controls: {unsupported_keywords}."
+            )
+    parent_by_child = {
+        child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+    }
+    for call in policy_calls:
+        parent = parent_by_child.get(call)
+        while parent is not None:
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)):
+                failures.append(
+                    f"{rel_path}:{call.lineno}: execute_tool_policy() must not run inside a custom routing loop."
+                )
+                break
+            parent = parent_by_child.get(parent)
+    tool_prompt = constants.get("TOOL_PROMPT")
+    if tool_prompt is None:
+        failures.append(f"{rel_path}: take-photo tools require one string TOOL_PROMPT constant.")
+    if "TOOL_NAME" not in constants:
+        failures.append(f"{rel_path}: take-photo tools require one string TOOL_NAME constant.")
+    if constants.get('EXECUTION_MODE') != 'take_photo':
+        failures.append(f"{rel_path}: static tools require EXECUTION_MODE = 'take_photo'.")
+    if 'VIDEO_CONFIG' in constants:
+        failures.append(f"{rel_path}: static tools must not declare temporal VIDEO_CONFIG.")
+    prompt_uses = []
+    for call in policy_calls:
+        prompt_keyword = next((kw for kw in call.keywords if kw.arg == "prompt"), None)
+        prompt_uses.append(
+            prompt_keyword is not None
+            and isinstance(prompt_keyword.value, ast.Name)
+            and prompt_keyword.value.id == "TOOL_PROMPT"
+        )
+    if prompt_uses != [True]:
+        failures.append(f"{rel_path}: take-photo tools must pass TOOL_PROMPT directly as the helper prompt.")
+    tool_name_uses = []
+    for call in policy_calls:
+        keyword = next((kw for kw in call.keywords if kw.arg == "tool_name"), None)
+        tool_name_uses.append(
+            keyword is not None
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "TOOL_NAME"
+        )
+    if tool_name_uses != [True]:
+        failures.append(f"{rel_path}: take-photo tools must pass TOOL_NAME directly as tool_name.")
+    if extract_copilot_llm_task_categories(tool_text):
+        failures.append(f"{rel_path}: take-photo tools must not call copilot_llm_call().")
+    if "TOOL_POLICY" in constants:
+        try:
+            validate_tool_policy(constants["TOOL_POLICY"])
+        except (ToolPolicyError, TypeError) as exc:
+            failures.append(f"{rel_path}: invalid TOOL_POLICY: {exc}.")
+        policy_uses = []
+        for call in policy_calls:
+            keyword = next((kw for kw in call.keywords if kw.arg == "policy"), None)
+            policy_uses.append(
+                keyword is not None and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "TOOL_POLICY"
+            )
+        if policy_uses != [True]:
+            failures.append(
+                f"{rel_path}: tools declaring TOOL_POLICY must pass policy=TOOL_POLICY "
+                "to execute_tool_policy()."
+            )
+    elif any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(isinstance(target, ast.Name) and target.id == "TOOL_POLICY" for target in (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        ))
+        for node in tree.body
+    ):
+        failures.append(f"{rel_path}: TOOL_POLICY must be static literal data.")
+    else:
+        failures.append(f"{rel_path}: new take-photo tools require a literal TOOL_POLICY constant.")
     return failures
 
 
-def validate_canonical_task_categories(tool_text: str, rel_path: Path) -> List[str]:
-    failures: List[str] = []
-    categories = extract_copilot_llm_task_categories(tool_text)
-    unresolved_indexes = [index + 1 for index, category in enumerate(categories) if category is None]
-
-    if unresolved_indexes:
+def validate_temporal_streaming_tool(
+    tool_text: str, issue_text: str, rel_path: Path
+) -> List[str]:
+    """Require hosted-video tools to remain declarative and runtime-owned."""
+    try:
+        tree = ast.parse(tool_text)
+    except SyntaxError:
+        return []
+    constants = _extract_literal_constants(tree)
+    if any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"on_take_photo", "on_stream_start", "on_frame", "on_stream_stop"}
+        for node in tree.body
+    ):
+        return []
+    if constants.get('EXECUTION_MODE') != 'hosted_video_streaming':
+        return []
+    failures = []
+    if not isinstance(constants.get('TOOL_NAME'), str):
+        failures.append(f"{rel_path}: temporal tools require one string TOOL_NAME.")
+    if not isinstance(constants.get('TOOL_PROMPT'), str) or not constants.get('TOOL_PROMPT', '').strip():
+        failures.append(f"{rel_path}: temporal tools require one non-empty string TOOL_PROMPT.")
+    video_config = constants.get('VIDEO_CONFIG')
+    required_settings = {
+        'window_seconds', 'interval_seconds', 'minimum_span_seconds',
+        'minimum_unique_frames',
+    }
+    if not isinstance(video_config, dict):
+        failures.append(f"{rel_path}: temporal tools require a literal VIDEO_CONFIG dictionary.")
+    else:
+        missing = sorted(required_settings - set(video_config))
+        if missing:
+            failures.append(f"{rel_path}: temporal VIDEO_CONFIG is missing: {', '.join(missing)}.")
+        else:
+            try:
+                window = float(video_config['window_seconds'])
+                interval = float(video_config['interval_seconds'])
+                minimum_span = float(video_config['minimum_span_seconds'])
+                minimum_frames = int(video_config['minimum_unique_frames'])
+                if (window <= 0 or interval <= 0 or minimum_span <= 0
+                        or minimum_span > window or minimum_frames < 2):
+                    raise ValueError
+            except (TypeError, ValueError):
+                failures.append(f"{rel_path}: temporal VIDEO_CONFIG settings are invalid.")
+    prompt = str(constants.get('TOOL_PROMPT') or '').casefold()
+    temporal_terms = (
+        'chronological', 'early', 'late', 'before', 'after', 'sequence',
+        'duration', 'state change', 'changed', 'recent frames', 'video',
+        'what just happened', 'history', 'multiple moments',
+    )
+    if prompt and not any(term in prompt for term in temporal_terms):
         failures.append(
-            f"{rel_path}: copilot_llm_call() missing resolvable capability at call(s) {unresolved_indexes}."
+            f"{rel_path}: temporal TOOL_PROMPT must explain chronological or state-change evidence."
         )
-
-    for index, category in enumerate(categories):
-        if category is None:
-            continue
-        if category not in CANONICAL_TASK_CATEGORIES:
+    output_config = constants.get('OUTPUT_CONFIG') or {}
+    if isinstance(output_config, dict) and output_config.get('schema') == 'played_card_event':
+        card_terms = ('played card', 'played_card', 'before_cards', 'after_cards')
+        if not any(term in prompt for term in card_terms):
             failures.append(
-                f"{rel_path}: non-canonical capability '{category}' in copilot_llm_call #{index + 1}."
+                f"{rel_path}: played_card_event may only be used by a card-specific prompt."
             )
-
+    forbidden = {
+        'call_take_photo_vlm', 'copilot_llm_call', 'RtspPublisher',
+        'NvidiaRtviClient', 'asyncio', 're', 'requests', 'aiohttp', 'ffmpeg',
+    }
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    found = sorted(forbidden & used)
+    imported = {
+        alias.name.split('.')[0]
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    found = sorted(set(found) | (forbidden & imported))
+    if found:
+        failures.append(
+            f"{rel_path}: temporal streaming runtime owns execution; forbidden tool symbols: "
+            + ', '.join(found)
+        )
+    module_state = [
+        target.id
+        for node in tree.body if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name)
+        and target.id not in {
+            'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'TOOL_POLICY', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
+        }
+    ]
+    if module_state:
+        failures.append(f"{rel_path}: temporal tools must not keep module state: {module_state}")
+    allowed_names = {
+        'TOOL_NAME', 'EXECUTION_MODE', 'TOOL_PROMPT', 'TOOL_POLICY', 'VIDEO_CONFIG', 'OUTPUT_CONFIG'
+    }
+    non_declarative = []
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if isinstance(node, ast.Assign) and all(
+            isinstance(target, ast.Name) and target.id in allowed_names
+            for target in node.targets
+        ):
+            continue
+        non_declarative.append(type(node).__name__)
+    if non_declarative:
+        failures.append(
+            f"{rel_path}: temporal tools may contain only declarative constants: "
+            + ', '.join(non_declarative)
+        )
     return failures
 
 
@@ -256,11 +555,29 @@ def validate_files(paths: Iterable[Path], issue_text: Optional[str] = None) -> L
                 line_number = text.count("\n", 0, match.start()) + 1
                 failures.append(f"{rel_path}:{line_number}: forbidden generated-tool pattern: {label}")
 
-        failures.extend(validate_canonical_task_categories(text, rel_path))
         failures.extend(validate_no_stringified_copilot_results(text, rel_path))
         if issue_text:
-            failures.extend(validate_stage_enforcement(text, issue_text, rel_path))
+            failures.extend(validate_take_photo_tool(text, issue_text, rel_path))
+            failures.extend(validate_temporal_streaming_tool(text, issue_text, rel_path))
 
+    return failures
+
+
+def validate_generated_tool_source(
+    tool_text: str, rel_path: Path = Path("tools/generated_tool.py")
+) -> List[str]:
+    """Validate executable source immediately before the backend loads it."""
+    failures: List[str] = []
+    for label, pattern in FORBIDDEN_PATTERNS:
+        match = pattern.search(tool_text)
+        if match:
+            line_number = tool_text.count("\n", 0, match.start()) + 1
+            failures.append(
+                f"{rel_path}:{line_number}: forbidden generated-tool pattern: {label}"
+            )
+    failures.extend(validate_no_stringified_copilot_results(tool_text, rel_path))
+    failures.extend(validate_take_photo_tool(tool_text, "runtime", rel_path))
+    failures.extend(validate_temporal_streaming_tool(tool_text, "runtime", rel_path))
     return failures
 
 
@@ -269,7 +586,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("paths", nargs="*", help="Specific tool files to validate.")
     parser.add_argument("--changed", metavar="BASE_REF", help="Validate changed tools relative to BASE_REF.")
     parser.add_argument("--all", action="store_true", help="Validate all Python tool files.")
-    parser.add_argument("--issue-file", help="Optional issue markdown/body file used for Task Stages validation.")
+    parser.add_argument("--issue-file", help="Optional issue markdown/body used for mode validation.")
     args = parser.parse_args(argv)
 
     paths: List[Path] = []
@@ -286,17 +603,13 @@ def main(argv: List[str] | None = None) -> int:
 
     failures = validate_files(paths, issue_text=issue_text)
     if failures:
-        print("Generated tools must use model_router_client capability interfaces for LLM/VLM operations.")
-        print("Do not implement detection, OCR, VLM, LLM, model loading, provider calls, or model discovery in tool files.")
-        print(
-            "When Task Stages are provided, compose one ordered copilot_llm_call() per stage."
-        )
+        print("Generated tool validation failed.")
         print()
         for failure in failures:
             print(failure)
         return 1
 
-    print("Generated tool router guardrails passed.")
+    print("Generated tool guardrails passed.")
     return 0
 
 
