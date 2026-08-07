@@ -201,7 +201,7 @@ Before finishing, verify:
 
 When Claude is working through the repository workflow, maintain the same single GitHub progress comment that the workflow already updates in place. Do not create a growing thread of separate status comments.
 
-Keep a compact checklist for high-level milestones, but also provide concise implementation detail updates after meaningful work. Update the comment after events such as:
+Keep in-progress updates very short and user-readable. Prefer a compact checklist for major done/current steps, followed by a brief plain-language note about what Claude found or why the current change is being made. Update the comment after events such as:
 
 - reading the issue, PR, or `CLAUDE.md`
 - inspecting relevant runtime interfaces or existing tool patterns
@@ -221,6 +221,6 @@ Use short sections such as:
 
 Overwrite the evolving sections instead of appending unlimited history. Preserve durable decisions in `Implementation decisions`, updating them only when the design changes materially.
 
-Explain observable work and decisions only. Do not expose raw command logs, token details, or long internal traces. Keep each update readable for a non-developer or blind/low-vision user with short paragraphs and concise bullets.
+Explain observable work and decisions only. Do not expose raw command logs, token details, long internal traces, exhaustive file lists, or low-level implementation detail. Keep each update readable for a non-developer or blind/low-vision user with short paragraphs and concise bullets.
 
 When finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
