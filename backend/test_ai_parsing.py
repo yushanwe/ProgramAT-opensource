@@ -292,6 +292,7 @@ class TestBrainstormingHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PR number: 88", captured["prompt"])
         self.assertIn("Current tool: uber_car_identifier", captured["prompt"])
         self.assertIn("User update request: Add a streaming mode.", captured["prompt"])
+        self.assertIn("Do not ask generic questions such as", captured["prompt"])
 
     def test_build_clarified_update_request_combines_answers(self):
         clarified = build_clarified_update_request(

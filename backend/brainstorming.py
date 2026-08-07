@@ -21,6 +21,11 @@ UPDATE_BRAINSTORM_PROMPT_EXTENSION = (
     "Use the repository, issue, PR, current tool, Claude summary, action log, and update request "
     "to understand the current implementation. Ask only clarification questions that would materially "
     "affect the requested change. Preserve existing behavior unless the user explicitly asks to change it. "
+    "Do not ask generic questions such as \"What existing behavior should remain unchanged?\" "
+    "Existing behavior should be assumed preserved by default. Only ask about preservation when there is "
+    "a specific ambiguity or conflict in the requested update, and name the concrete behavior involved. "
+    "Ground questions in the actual implementation context when possible, such as runtime input, streaming behavior, "
+    "output timing, model choice, failure handling, or another specific existing behavior visible in the context. "
     "Do not redesign the entire tool or ask for information already available in the context.\n\n"
 )
 
@@ -30,7 +35,7 @@ DEFAULT_CREATE_FALLBACK_QUESTION = (
 )
 
 DEFAULT_UPDATE_FALLBACK_QUESTION = (
-    "What existing behavior must stay the same while adding this update?"
+    "Should this update change any specific streaming behavior, spoken output timing, or runtime input handling?"
 )
 
 _KEEP_LINE_PATTERNS = [

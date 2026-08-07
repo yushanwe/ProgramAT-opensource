@@ -5870,78 +5870,6 @@ async def generate_ranked_question_queue(
     if video_summary:
         video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
 
-    brainstorm_section = ''
-    if brainstorm_context:
-        brainstorm_pairs = []
-        for qa_pair in brainstorm_context:
-            q = qa_pair.get('question', '').strip()
-            a = qa_pair.get('answer', '').strip()
-            if q and a:
-                brainstorm_pairs.append(f"Q: {q}\nA: {a}")
-        if brainstorm_pairs:
-            brainstorm_section = "\n\nPrevious brainstorming rounds:\n" + "\n\n".join(brainstorm_pairs)
-
-    prompt = (
-        "You are helping a blind or low-vision user design a camera-based assistive tool. "
-        "They have described the tool they want. Your job is to ask them ONE concise, "
-        "open-ended question that helps them think more deeply about their idea — "
-        "such as an edge case, an environmental condition, or how the tool should behave "
-        "when something goes wrong. Do not ask about things already answered below or in previous rounds. "
-        "Return only the question itself, nothing else.\n\n"
-        f"Tool title: {title}\n"
-        f"Description: {description}\n"
-        f"Proposed solution: {solution}\n"
-        f"Example usage: {example_usage}"
-        f"{video_section}"
-        f"{brainstorm_section}"
-    )
-
-    try:
-        response = await asyncio.to_thread(
-            system_llm_call,
-            messages=[{'role': 'user', 'content': prompt}],
-        )
-        question = extract_text(response).strip()
-        if question:
-            return question
-    except Exception:
-        logger.warning("generate_ideation_question failed", exc_info=True)
-
-    return "Is there anything specific about how the tool should behave in difficult conditions, like low lighting or a cluttered background?"
-
-
-async def generate_ranked_question_queue(
-    parsed_data: dict,
-    video_summary: str,
-    brainstorm_history: list = None,
-    existing_queue: list = None,
-    max_queue_size: int = 8,
-) -> list:
-    """
-    Generate 3 new brainstorming questions using Gemini, merge them with any
-    existing unasked questions from a previous batch, re-rank the combined list
-    by relevance given the full Q&A history, and return it ordered
-    most-to-least relevant.
-
-    Args:
-        parsed_data: The parsed issue data.
-        video_summary: Optional video summary string.
-        brainstorm_history: Previous Q&A pairs, newest last.
-        existing_queue: Unasked questions carried over from earlier batches.
-        max_queue_size: Cap on total queue length returned (default 8).
-
-    Returns a list of question strings, most relevant first.
-    Falls back to built-in defaults on any error or unparseable response.
-    """
-    title = parsed_data.get('title', '')
-    description = parsed_data.get('description', '')
-    solution = parsed_data.get('solution', '')
-    example_usage = parsed_data.get('example_usage', '')
-
-    video_section = ''
-    if video_summary:
-        video_section = f"\n\nVideo demonstration summary:\n{video_summary}"
-
     history_section = ''
     if brainstorm_history:
         pairs = []
@@ -5990,9 +5918,12 @@ async def generate_ranked_question_queue(
             "2. Do not ask about tool UI, display, interface, or presentation.\n"
             "3. Do not ask for information already available in the issue, PR, metadata, source, action log, or previous answers.\n"
             "4. Preserve existing behavior unless the requested update explicitly changes it.\n"
-            "5. Combine these 3 new questions with any existing unasked questions listed above.\n"
-            "6. Rank ALL questions (new + existing) from MOST to LEAST relevant.\n"
-            f"7. Return the final ranked list as a plain numbered list (at most {max_queue_size} questions), one question per line, most relevant first. No explanations, no headings.\n\n"
+            "5. Do not ask generic preservation questions such as \"What existing behavior must stay the same?\" Existing behavior should be assumed preserved by default.\n"
+            "6. Only ask about preservation when there is a specific ambiguity or conflict in the requested update, and name the concrete behavior involved.\n"
+            "7. Prefer questions grounded in the implementation context, such as runtime input, streaming behavior, output timing, model choice, failure handling, or another specific current behavior visible in the source, metadata, or logs.\n"
+            "8. Combine these 3 new questions with any existing unasked questions listed above.\n"
+            "9. Rank ALL questions (new + existing) from MOST to LEAST relevant.\n"
+            f"10. Return the final ranked list as a plain numbered list (at most {max_queue_size} questions), one question per line, most relevant first. No explanations, no headings.\n\n"
             "Format exactly:\n"
             "1. [question]\n"
             "2. [question]\n"
@@ -6033,6 +5964,74 @@ async def generate_ranked_question_queue(
         "Are there particular situations where you would want the tool to stay silent "
         "rather than speak?",
     ]
+    if mode == 'update':
+        fallback = [
+            "Should this update change any specific streaming behavior, such as when the tool speaks or stays silent?",
+            "Does this update need to change any runtime input handling, or should the current input flow stay as it is?",
+            "Are there any specific failure cases or edge conditions where the updated behavior should differ from the current tool?",
+        ]
+
+    asked_questions = [
+        qa.get('question', '').strip()
+        for qa in (brainstorm_history or [])
+        if qa.get('question', '').strip()
+    ]
+
+    def _normalize_question(text: str) -> str:
+        normalized = re.sub(r'[^a-z0-9\s]+', ' ', (text or '').lower())
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        return normalized
+
+    def _is_similar_question(left: str, right: str) -> bool:
+        left_norm = _normalize_question(left)
+        right_norm = _normalize_question(right)
+        if not left_norm or not right_norm:
+            return False
+        if left_norm == right_norm:
+            return True
+        if left_norm in right_norm or right_norm in left_norm:
+            return True
+        return SequenceMatcher(None, left_norm, right_norm).ratio() >= 0.84
+
+    def _is_generic_update_preservation_question(question: str) -> bool:
+        normalized = _normalize_question(question)
+        if not normalized:
+            return False
+        mentions_behavior = "behavior" in normalized
+        mentions_preserve = any(
+            phrase in normalized
+            for phrase in (
+                "stay the same",
+                "remain unchanged",
+                "remain the same",
+                "keep the same",
+                "should stay unchanged",
+            )
+        )
+        mentions_update_scope = any(
+            phrase in normalized
+            for phrase in (
+                "this update",
+                "adding this update",
+                "during this update",
+            )
+        )
+        return mentions_behavior and mentions_preserve and mentions_update_scope
+
+    def _dedupe_questions(questions: list) -> list:
+        unique = []
+        seen = asked_questions[:]
+        for question in questions:
+            cleaned = question.strip()
+            if len(cleaned) <= 10:
+                continue
+            if mode == 'update' and _is_generic_update_preservation_question(cleaned):
+                continue
+            if any(_is_similar_question(cleaned, prior) for prior in seen):
+                continue
+            unique.append(cleaned)
+            seen.append(cleaned)
+        return unique
 
     try:
         response = await asyncio.to_thread(
@@ -6050,12 +6049,15 @@ async def generate_ranked_question_queue(
             cleaned = re.sub(r'^\d+[\.\)\-]\s*', '', line).strip()
             if cleaned and len(cleaned) > 10:
                 questions.append(cleaned)
-        if questions:
-            return questions[:max_queue_size]
+        merged_questions = questions + list(existing_queue or [])
+        deduped_questions = _dedupe_questions(merged_questions)
+        if deduped_questions:
+            return deduped_questions[:max_queue_size]
     except Exception:
         logger.warning("generate_ranked_question_queue failed", exc_info=True)
 
-    return fallback[:max_queue_size]
+    deduped_fallback = _dedupe_questions(fallback)
+    return deduped_fallback[:max_queue_size]
 
 
 def _build_update_issue_parsed_data(selected_issue_title: str, update_request: str, video_summary: str = '') -> Dict[str, str]:
