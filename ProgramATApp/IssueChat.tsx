@@ -1002,57 +1002,6 @@ export default function IssueChat({
     }
   };
 
-  const handleTalkToAgent = () => {
-    if (!activeToken) return;
-    resolveLatestChoicePrompt();
-    append({
-      kind: 'user-choice',
-      id: nextId('user-choice'),
-      ts: new Date(),
-      choice: 'ask_agent',
-      label: '💬 Talk to Agent',
-    });
-    setAwaiting('clarification');
-  };
-
-  const sendAgentQuestion = async (question: string, token: string) => {
-    const trimmed = question.trim();
-    if (!trimmed) return;
-    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
-    setComposeText('');
-    Keyboard.dismiss();
-    setAwaiting(null);
-    setIsSending(true);
-    inFlightRef.current = true;
-    try {
-      const result = await submitUpdate({ text, issueNumber: selectedIssue.number, videoUri, brainstormingEnabled: brainstormingActive });
-      if (result.status === 'updated') {
-        const videoSummarySkipped = !!videoUri && !result.video_summary;
-        append({
-          kind: 'assistant-updated',
-          id: nextId('assistant-updated'),
-          ts: new Date(),
-          issueNumber: result.issue_number,
-          issueUrl: result.issue_url,
-          videoSummarySkipped,
-        });
-      } else {
-        append({
-          kind: 'assistant-error',
-          id: nextId('assistant-error'),
-          ts: new Date(),
-          text: result.error,
-          retry: { op: 'update', text, videoUri, issueNumber: selectedIssue.number },
-        });
-      }
-      handleUpdateResponse(result, { op: 'update', text, videoUri, issueNumber: selectedIssue.number });
-    } finally {
-      inFlightRef.current = false;
-      setProgressText(null);
-      setIsSending(false);
-    }
-  };
-
   const sendUpdate = async (text: string, videoUri: string | null) => {
     if (!selectedIssue) return;
     if (videoUri) {
