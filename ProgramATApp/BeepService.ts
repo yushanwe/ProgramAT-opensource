@@ -13,6 +13,7 @@ class BeepService {
   private audioContext: AudioContext | null = null;
   private isPlaying: boolean = false;
   private pendingBeep: { frequency: number; duration: number } | null = null;
+  private loadingPlaybackToken: number = 0;
 
   constructor() {
     this.initialize();
@@ -136,11 +137,23 @@ class BeepService {
   /**
    * Play a sequence of beeps
    */
-  async playBeepSequence(pattern: Array<{frequency: number, duration: number, pause?: number}>): Promise<void> {
+  async playBeepSequence(
+    pattern: Array<{frequency: number, duration: number, pause?: number}>,
+    token?: number,
+  ): Promise<void> {
     for (const beep of pattern) {
+      if (token !== undefined && token !== this.loadingPlaybackToken) {
+        return;
+      }
       await this.playBeep(beep.frequency, beep.duration);
+      if (token !== undefined && token !== this.loadingPlaybackToken) {
+        return;
+      }
       if (beep.pause) {
         await new Promise<void>(resolve => setTimeout(resolve, beep.pause));
+        if (token !== undefined && token !== this.loadingPlaybackToken) {
+          return;
+        }
       }
     }
   }
@@ -151,13 +164,14 @@ class BeepService {
    */
   async playLoadingSound(): Promise<void> {
     console.log('[Beep] Playing iOS loading sound...');
+    const token = this.loadingPlaybackToken;
     const clickPattern = [
       { frequency: 800, duration: 50, pause: 100 },
       { frequency: 900, duration: 50, pause: 100 },
       { frequency: 1000, duration: 50, pause: 150 },
     ];
     
-    await this.playBeepSequence(clickPattern);
+    await this.playBeepSequence(clickPattern, token);
   }
 
   /**
@@ -179,6 +193,8 @@ class BeepService {
   }
 
   stopLoadingSound(): void {
+    this.loadingPlaybackToken += 1;
+    this.pendingBeep = null;
     if (this.loadingInterval) {
       console.log('[Beep] Stopping loading sound...');
       clearInterval(this.loadingInterval);

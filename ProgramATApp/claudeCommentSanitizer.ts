@@ -1,4 +1,6 @@
 const IMAGE_MARKDOWN_RE = /!\[[^\]]*]\(([^)]+)\)/gi;
+const LINK_MARKDOWN_RE = /\[([^\]]+)\]\(([^)]+)\)/gi;
+const ANCHOR_TAG_RE = /<a\b[^>]*href=["'][^"']+["'][^>]*>([\s\S]*?)<\/a>/gi;
 const IMG_TAG_RE = /<img\b[^>]*>/gi;
 const HTML_TAG_RE = /<\/?(?:div|span|p|br|details|summary|picture|source)\b[^>]*>/gi;
 const GENERIC_HTML_RE = /<\/?[^>]+>/g;
@@ -41,6 +43,9 @@ export function sanitizeClaudeCommentBody(body: string | undefined | null): stri
     return '';
   });
 
+  cleaned = cleaned.replace(LINK_MARKDOWN_RE, (_match, label: string) => label || '');
+  cleaned = cleaned.replace(ANCHOR_TAG_RE, (_match, innerText: string) => innerText || '');
+
   cleaned = cleaned.replace(/^\s*Create a PR\s*$/gim, '');
   cleaned = cleaned.replace(/^\s*https:\/\/github\.com\/[^\s]+\/compare\/[^\s]+\s*$/gim, '');
 
@@ -55,9 +60,10 @@ export function sanitizeClaudeCommentBody(body: string | undefined | null): stri
   cleaned = cleaned.replace(GENERIC_HTML_RE, '');
   cleaned = decodeHtmlEntities(cleaned);
 
-  cleaned = cleaned.replace(RAW_URL_RE, (url) => (removedMediaUrls.has(url) || isMediaUrl(url) ? '' : url));
+  cleaned = cleaned.replace(RAW_URL_RE, () => '');
   cleaned = cleaned.replace(/[ \t]+\n/g, '\n');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
 
   return cleaned.trim();
 }
@@ -83,7 +89,14 @@ export interface ClaudeAccessibilityBlock {
   label: string;
 }
 
+export interface ClaudeAccessibilitySection {
+  heading: string | null;
+  label: string;
+  lines: ClaudeRenderLine[];
+}
+
 const SECTION_HEADINGS = new Set([
+  'progress',
   'current analysis',
   'implementation decisions',
   'recent work',
@@ -175,6 +188,12 @@ export function parseClaudeRenderLines(body: string | undefined | null): ClaudeR
 }
 
 function normalizeSectionText(line: string): string {
+  const compactMatch = line.match(CHECKLIST_LINE_COMPACT_RE);
+  const standardMatch = line.match(CHECKLIST_LINE_RE);
+  const task = compactMatch?.[1] || standardMatch?.[2];
+  if (task) {
+    return stripInlineMarkdownPunctuation(task);
+  }
   return stripInlineMarkdownPunctuation(line)
     .replace(/^\s*[-*]\s*/, '')
     .replace(/\s+/g, ' ')
@@ -196,6 +215,16 @@ function flushSectionBlock(
     kind: 'section',
     label: parts.join('. ').trim(),
   });
+}
+
+function buildSectionLabel(heading: string | null, lines: string[]): string | null {
+  const normalizedHeading = heading ? stripInlineMarkdownPunctuation(heading) : '';
+  const normalizedLines = lines
+    .map(normalizeSectionText)
+    .filter(Boolean);
+  const parts = [normalizedHeading, ...normalizedLines].filter(Boolean);
+  if (parts.length === 0) return null;
+  return parts.join('. ').trim();
 }
 
 export function buildClaudeAccessibilityBlocks(body: string | undefined | null): ClaudeAccessibilityBlock[] {
@@ -255,6 +284,90 @@ export function buildClaudeAccessibilityBlocks(body: string | undefined | null):
 
   flush();
   return blocks;
+}
+
+export function buildClaudeAccessibilitySections(body: string | undefined | null): ClaudeAccessibilitySection[] {
+  const sanitized = sanitizeClaudeCommentBody(body);
+  if (!sanitized) return [];
+
+  const sourceLines = sanitized.split('\n');
+  const renderLines = parseClaudeRenderLines(body);
+  const sections: ClaudeAccessibilitySection[] = [];
+  let renderIndex = 0;
+  let currentHeading: string | null = null;
+  let currentLabelLines: string[] = [];
+  let currentRenderLines: ClaudeRenderLine[] = [];
+  let uncheckedSeen = 0;
+
+  const flush = () => {
+    const label = buildSectionLabel(currentHeading, currentLabelLines);
+    if (!label || currentRenderLines.length === 0) {
+      currentHeading = null;
+      currentLabelLines = [];
+      currentRenderLines = [];
+      return;
+    }
+    sections.push({
+      heading: currentHeading,
+      label,
+      lines: currentRenderLines,
+    });
+    currentHeading = null;
+    currentLabelLines = [];
+    currentRenderLines = [];
+  };
+
+  for (const rawLine of sourceLines) {
+    const trimmedEnd = rawLine.trimEnd();
+    const trimmed = trimmedEnd.trim();
+    const lineRender = renderLines[renderIndex];
+    if (!lineRender) break;
+    renderIndex += 1;
+
+    if (!trimmed) {
+      if (currentRenderLines.length > 0) {
+        currentRenderLines.push(lineRender);
+      }
+      continue;
+    }
+
+    const headingMatch = trimmed.match(HEADING_RE);
+    if (headingMatch) {
+      if (currentRenderLines.length > 0) {
+        flush();
+      }
+      currentHeading = headingMatch[1];
+      currentLabelLines = [];
+      currentRenderLines = [lineRender];
+      continue;
+    }
+
+    const compactMatch = trimmed.match(CHECKLIST_LINE_COMPACT_RE);
+    const standardMatch = trimmed.match(CHECKLIST_LINE_RE);
+    const task = compactMatch?.[1] || standardMatch?.[2];
+    if (task) {
+      const checked = compactMatch ? false : (standardMatch?.[1] || '').toLowerCase() === 'x';
+      if (!checked) uncheckedSeen += 1;
+      const prefix = checked ? 'Finished' : uncheckedSeen === 1 ? 'Ongoing' : 'To do';
+      if (currentRenderLines.length === 0) {
+        currentRenderLines = [lineRender];
+      } else {
+        currentRenderLines.push(lineRender);
+      }
+      currentLabelLines.push(`${prefix}: ${stripInlineMarkdownPunctuation(task)}`);
+      continue;
+    }
+
+    if (currentRenderLines.length === 0) {
+      currentRenderLines = [lineRender];
+    } else {
+      currentRenderLines.push(lineRender);
+    }
+    currentLabelLines.push(trimmed);
+  }
+
+  flush();
+  return sections;
 }
 
 function sectionBodyMap(body: string | undefined | null): Record<string, string> {

@@ -199,28 +199,14 @@ Before finishing, verify:
 
 ## GitHub Progress Comment
 
-When Claude is working through the repository workflow, maintain the same single GitHub progress comment that the workflow already updates in place. Do not create a growing thread of separate status comments.
+## GitHub Progress Comment
 
-Keep a compact checklist for high-level milestones, but also provide concise implementation detail updates after meaningful work. Update the comment after events such as:
+Maintain the same single GitHub progress comment and update it in place.
 
-- reading the issue, PR, or `CLAUDE.md`
-- inspecting relevant runtime interfaces or existing tool patterns
-- choosing a model, detector, execution mode, frame strategy, or runtime input shape
-- rejecting a nontrivial alternative and deciding why
-- discovering uncertainty, a bug, or a validation failure worth surfacing
-- completing the main implementation
-- running validation or focused tests
-- fixing a failure
-- committing and pushing
+During work, keep a detailed progress checklist at the top. Break the work into concrete, meaningful steps so the checklist reflects what Claude has inspected, verified, changed, and tested, rather than only a few high-level phases. Update it frequently as work progresses.
 
-Use short sections such as:
+Below the checklist, write 1–4 short first-person progress sentences such as “I found…”, “I’m fixing…”, “I’m checking…”, or “I’m trying… next.” Briefly explain what Claude has just learned, why it matters, what it is doing now, and what it plans to check next. Prefer frequent incremental updates over long explanations.
 
-- `### Progress`
-- `### Current analysis`
-- `### Implementation decisions`
+Do not add headings like `Current analysis` or `Working on...`. Avoid raw command logs, token details, exhaustive implementation dumps, or raw chain-of-thought.
 
-Overwrite the evolving sections instead of appending unlimited history. Preserve durable decisions in `Implementation decisions`, updating them only when the design changes materially.
-
-Explain observable work and decisions only. Do not expose raw command logs, token details, or long internal traces. Keep each update readable for a non-developer or blind/low-vision user with short paragraphs and concise bullets.
-
-When finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
+When finished and only when finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.

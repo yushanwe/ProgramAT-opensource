@@ -1,12 +1,12 @@
 import React from 'react';
 import ReactTestRenderer, { act } from 'react-test-renderer';
-import { AccessibilityInfo, TextInput, TouchableOpacity } from 'react-native';
-import IssueChat from '../IssueChat';
+import { AccessibilityInfo, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import IssueChat, { shouldAutoScrollForNewItems } from '../IssueChat';
 import PRsAndText from '../PRsAndText';
 import { ThemeProvider } from '../ThemeContext';
 import {
-  buildClaudeAccessibilityBlocks,
   buildClaudeAccessibilityLabel,
+  buildClaudeAccessibilitySections,
   getChangedClaudeAnnouncement,
   parseClaudeRenderLines,
   sanitizeClaudeCommentBody,
@@ -77,8 +77,22 @@ jest.mock('../IssueSubmissionService', () => ({
 
 const announceSpy = jest.spyOn(AccessibilityInfo, 'announceForAccessibility').mockImplementation(jest.fn());
 
+const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+const mountedRenderers: ReactTestRenderer.ReactTestRenderer[] = [];
+
 function renderWithTheme(element: React.ReactElement) {
-  return ReactTestRenderer.create(<ThemeProvider>{element}</ThemeProvider>);
+  const renderer = ReactTestRenderer.create(<ThemeProvider>{element}</ThemeProvider>, {
+    createNodeMock: (node) => {
+      if (node.type === TextInput) {
+        return {
+          focus: jest.fn(),
+        };
+      }
+      return {};
+    },
+  });
+  mountedRenderers.push(renderer);
+  return renderer;
 }
 
 describe('IssueChat progress', () => {
@@ -93,7 +107,22 @@ describe('IssueChat progress', () => {
     mockStopLoadingSound.mockReset();
   });
 
-  test('polls for Claude progress every 10 seconds and cleans up on unmount', async () => {
+  afterEach(async () => {
+    while (mountedRenderers.length > 0) {
+      const renderer = mountedRenderers.pop();
+      if (renderer) {
+        await act(async () => {
+          renderer.unmount();
+        });
+      }
+    }
+    jest.clearAllTimers();
+  });
+
+  const count100msTimeouts = () => setTimeoutSpy.mock.calls.filter((call) => call[1] === 100).length;
+  const count6000msTimeouts = () => setTimeoutSpy.mock.calls.filter((call) => call[1] === 6000).length;
+
+  test('polls for Claude progress every 5 seconds and cleans up on unmount', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 42,
@@ -131,7 +160,7 @@ describe('IssueChat progress', () => {
     expect(initialCallCount).toBeGreaterThanOrEqual(1);
 
     await act(async () => {
-      jest.advanceTimersByTime(9999);
+      jest.advanceTimersByTime(4999);
     });
     expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(initialCallCount);
 
@@ -146,13 +175,13 @@ describe('IssueChat progress', () => {
       renderer!.unmount();
     });
     await act(async () => {
-      jest.advanceTimersByTime(10000);
+      jest.advanceTimersByTime(5000);
     });
 
     expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(callCountBeforeUnmount);
   });
 
-  test('renders separate VoiceOver labels for progress steps and announces active step once', async () => {
+  test('renders section-level VoiceOver nodes for Claude progress and announces active step once', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 7,
@@ -201,14 +230,22 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
 
-    const finishedLabel = renderer!.root.findAll((node) => node.props?.accessibilityLabel === 'Finished: Read issue and repository CLAUDE.md');
-    const ongoingLabel = renderer!.root.findAll((node) => node.props?.accessibilityLabel === 'Ongoing: Implement tool.py');
-    expect(finishedLabel.length).toBeGreaterThan(0);
-    expect(ongoingLabel.length).toBeGreaterThan(0);
+    const progressSection = renderer!.root.findAll((node) =>
+      node.type === View
+      && node.props?.accessible === true
+      && node.props?.accessibilityLabel === 'Progress. Finished: Read issue and repository CLAUDE.md. Ongoing: Implement tool.py'
+    );
+    const recentWorkSection = renderer!.root.findAll((node) =>
+      node.type === View
+      && node.props?.accessible === true
+      && node.props?.accessibilityLabel === 'Recent work. Inspected runtime input handling.'
+    );
+    expect(progressSection).toHaveLength(1);
+    expect(recentWorkSection).toHaveLength(1);
     expect(announceSpy).toHaveBeenCalledWith('Recent Work: Inspected runtime input handling.');
 
     await act(async () => {
-      jest.advanceTimersByTime(10000);
+      jest.advanceTimersByTime(5000);
     });
     expect(announceSpy.mock.calls.filter((call) => call[0] === 'In progress: Building the tool')).toHaveLength(1);
   });
@@ -283,11 +320,11 @@ describe('IssueChat progress', () => {
       sendButton!.props.onPress();
     });
     await act(async () => {
-      jest.advanceTimersByTime(10000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
     await act(async () => {
-      jest.advanceTimersByTime(10000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
 
@@ -297,7 +334,231 @@ describe('IssueChat progress', () => {
     expect(JSON.stringify(renderer!.toJSON())).toContain('Final Claude update after review');
   });
 
-  test('keeps polling after completed-looking text but stops loading sound on terminal backend status', async () => {
+  test('appending a normal new message still triggers the auto-scroll decision', () => {
+    expect(
+      shouldAutoScrollForNewItems(
+        { itemCount: 2, lastItemId: 'assistant-created-1' },
+        { itemCount: 3, lastItemId: 'user-text-2' },
+      ),
+    ).toBe(true);
+  });
+
+  test('first Claude insertion is allowed to auto-follow once and later polling never scrolls again', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 55,
+      issue_url: 'https://github.test/issues/55',
+      video_summary: '',
+      pr_number: 55,
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:00Z',
+        body: '### Progress\n- [ ] Build tool',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:10Z',
+        body: '### Progress\n- [x] Build tool\n\n### Recent work\nValidated output.',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 55, title: 'PR 55' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+
+    await act(async () => {
+      input.props.onChangeText('Initial user message');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    const baseline100msTimeouts = count100msTimeouts();
+
+    await act(async () => {
+      sendButton!.props.onPress();
+      jest.advanceTimersByTime(150);
+      await Promise.resolve();
+    });
+
+    const timeoutCountBeforeClaudePolling = count100msTimeouts();
+    expect(timeoutCountBeforeClaudePolling).toBeGreaterThan(baseline100msTimeouts);
+
+    const timeoutCountAfterFirstClaudeInsert = timeoutCountBeforeClaudePolling;
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+
+    expect(count100msTimeouts()).toBe(timeoutCountAfterFirstClaudeInsert);
+  });
+
+  test('updating the existing Claude progress message does not trigger the auto-scroll decision and keeps a stable message id', async () => {
+    expect(
+      shouldAutoScrollForNewItems(
+        { itemCount: 4, lastItemId: 'claude-progress-stable' },
+        { itemCount: 4, lastItemId: 'claude-progress-stable' },
+      ),
+    ).toBe(false);
+
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 55,
+      issue_url: 'https://github.test/issues/55',
+      video_summary: '',
+      pr_number: 55,
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:00Z',
+        body: '### Progress\n- [ ] Build tool',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:10Z',
+        body: '### Progress\n- [x] Build tool\n\n### Recent work\nValidated output.',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 55, title: 'PR 55' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(150);
+      await Promise.resolve();
+    });
+
+    const firstContainer = renderer!.root.findAll((node) => typeof node.props?.testID === 'string' && node.props.testID.startsWith('claude-progress-'))[0];
+    const stableTestId = firstContainer.props.testID;
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+
+    const secondContainer = renderer!.root.findAll((node) => typeof node.props?.testID === 'string' && node.props.testID.startsWith('claude-progress-'))[0];
+    expect(secondContainer.props.testID).toBe(stableTestId);
+  });
+
+  test('starting a new conversation resets the Claude auto-follow session flag', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 77,
+      issue_url: 'https://github.test/issues/77',
+      video_summary: '',
+      pr_number: 77,
+    });
+    mockFetchClaudeProgress.mockResolvedValue({
+      status: 'available',
+      issue_number: 77,
+      comment_id: 701,
+      updated_at: '2026-08-07T11:00:00Z',
+      body: '### Progress\n- [ ] Build tool',
+      message: 'Claude comment available.',
+      steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+    });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 77, title: 'PR 77' }} />);
+    });
+
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('First request');
+    });
+    const sendButton = () => renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text')!;
+    const baseline100msTimeouts = count100msTimeouts();
+
+    await act(async () => {
+      sendButton().props.onPress();
+      jest.advanceTimersByTime(150);
+      await Promise.resolve();
+    });
+    const firstSessionTimeoutCount = count100msTimeouts();
+    expect(firstSessionTimeoutCount).toBeGreaterThan(baseline100msTimeouts);
+
+    const newConversationButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Start a new conversation');
+    await act(async () => {
+      newConversationButton!.props.onPress();
+    });
+
+    await act(async () => {
+      input.props.onChangeText('Second request');
+    });
+    await act(async () => {
+      sendButton().props.onPress();
+      jest.advanceTimersByTime(150);
+      await Promise.resolve();
+    });
+
+    expect(count100msTimeouts()).toBeGreaterThan(firstSessionTimeoutCount);
+  });
+
+  test('manual ScrollView scrolling remains enabled after Claude appears', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 91,
+      issue_url: 'https://github.test/issues/91',
+      video_summary: '',
+      pr_number: 91,
+    });
+    mockFetchClaudeProgress.mockResolvedValue({
+      status: 'available',
+      issue_number: 91,
+      comment_id: 991,
+      body: '### Progress\n- [ ] Build tool',
+      message: 'Claude comment available.',
+      steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+    });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 91, title: 'PR 91' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+
+    const messageScrollView = renderer!.root.findAllByType(ScrollView).find((node) => node.props?.keyboardShouldPersistTaps === 'handled');
+    expect(messageScrollView).toBeTruthy();
+    expect(messageScrollView!.props.scrollEnabled).not.toBe(false);
+    expect(messageScrollView!.props.accessibilityElementsHidden).toBeUndefined();
+    expect(messageScrollView!.props.importantForAccessibility).toBeUndefined();
+  });
+
+  test('keeps polling after completion-like Claude text but stops loading sound', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
       issue_number: 21,
@@ -310,12 +571,15 @@ describe('IssueChat progress', () => {
         status: 'available',
         issue_number: 21,
         comment_id: 401,
-        body: '### Progress\n- [x] Build tool\n\n### Implementation summary\nCompleted summary while Claude is still reviewing.',
+        body: '### Progress\n- [x] Build tool\n- [ ] Run validation\n\n### Recent work\nValidation is still running.',
         message: 'Claude comment available.',
-        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
+        steps: [
+          { id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' },
+          { id: 'step_2', label: 'Run validation', raw_label: 'Run validation', status: 'in_progress' },
+        ],
       })
       .mockResolvedValueOnce({
-        status: 'completed',
+        status: 'available',
         issue_number: 21,
         comment_id: 401,
         body: 'Done\n- [x] Build tool',
@@ -339,19 +603,20 @@ describe('IssueChat progress', () => {
     expect(mockPlayLoadingSound).toHaveBeenCalled();
 
     await act(async () => {
-      jest.advanceTimersByTime(10000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
+
+    expect(mockStopLoadingSound).toHaveBeenCalled();
 
     await act(async () => {
       await Promise.resolve();
     });
     await act(async () => {
-      jest.advanceTimersByTime(10000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
     expect(mockFetchClaudeProgress.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(mockStopLoadingSound).toHaveBeenCalled();
     await act(async () => {
       renderer!.unmount();
     });
@@ -399,7 +664,7 @@ describe('IssueChat progress', () => {
     });
 
     await act(async () => {
-      jest.advanceTimersByTime(10000);
+      jest.advanceTimersByTime(5000);
       await Promise.resolve();
     });
 
@@ -474,6 +739,84 @@ describe('IssueChat progress', () => {
     expect(updateJson).toContain('Issue #13 updated.');
     expect(updateJson).toContain('Claude update progress');
   });
+
+  test('does not overlap loading audio while the previous audio is still playing', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 66,
+      issue_url: 'https://github.test/issues/66',
+      video_summary: '',
+      pr_number: 66,
+    });
+    let resolveLoadingSound: (() => void) | null = null;
+    mockPlayLoadingSound.mockImplementation(() => new Promise<void>((resolve) => {
+      resolveLoadingSound = resolve;
+    }));
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 66,
+        comment_id: 901,
+        updated_at: '2026-08-07T12:00:00Z',
+        body: '### Progress\n- [ ] Build tool',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 66,
+        comment_id: 901,
+        updated_at: '2026-08-07T12:00:06Z',
+        body: '### Progress\n- [ ] Build tool\n\n### Recent work\nStill running.',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 66, title: 'PR 66' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+
+    expect(mockPlayLoadingSound).toHaveBeenCalledTimes(1);
+    expect(count6000msTimeouts()).toBe(0);
+
+    await act(async () => {
+      jest.advanceTimersByTime(6000);
+      await Promise.resolve();
+    });
+
+    expect(mockPlayLoadingSound).toHaveBeenCalledTimes(1);
+    expect(count6000msTimeouts()).toBe(0);
+
+    await act(async () => {
+      resolveLoadingSound?.();
+      await Promise.resolve();
+    });
+
+    expect(count6000msTimeouts()).toBeGreaterThan(0);
+
+    await act(async () => {
+      jest.advanceTimersByTime(5999);
+      await Promise.resolve();
+    });
+
+    expect(mockPlayLoadingSound).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+
+    expect(mockPlayLoadingSound).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('sanitizeClaudeCommentBody', () => {
@@ -483,10 +826,12 @@ describe('sanitizeClaudeCommentBody', () => {
   });
 
   test('preserves meaningful text and checklist content', () => {
-    const input = `### Progress\n<div>Working on validation</div>\n- [x] Read issue\n- [ ] Validate tool\nPR: https://github.com/example/repo/pull/5`;
+    const input = `### Progress\n<div>Working on validation</div>\n- [x] Read issue\n- [ ] Validate tool\nPR: https://github.com/example/repo/pull/5\nSee [the pull request](https://github.com/example/repo/pull/5)`;
     expect(sanitizeClaudeCommentBody(input)).toContain('### Progress');
     expect(sanitizeClaudeCommentBody(input)).toContain('- [x] Read issue');
-    expect(sanitizeClaudeCommentBody(input)).toContain('PR: https://github.com/example/repo/pull/5');
+    expect(sanitizeClaudeCommentBody(input)).toContain('Working on validation');
+    expect(sanitizeClaudeCommentBody(input)).toContain('See the pull request');
+    expect(sanitizeClaudeCommentBody(input)).not.toContain('https://github.com/example/repo/pull/5');
   });
 
   test('removes raw media attachment urls and unsupported html', () => {
@@ -503,7 +848,16 @@ describe('sanitizeClaudeCommentBody', () => {
     expect(output).not.toContain('Create a PR');
     expect(output).not.toContain('/compare/main...very-long-branch');
     expect(output).toContain('Useful summary');
-    expect(output).toContain('/pull/5');
+    expect(output).not.toContain('/pull/5');
+  });
+
+  test('preserves anchor text while removing html links and raw urls', () => {
+    const input = `Review <a href="https://github.com/example/repo/pull/5">this fix</a> next.\nMore context: https://example.com/details`;
+    const output = sanitizeClaudeCommentBody(input);
+    expect(output).toContain('Review this fix next.');
+    expect(output).toContain('More context:');
+    expect(output).not.toContain('https://github.com/example/repo/pull/5');
+    expect(output).not.toContain('https://example.com/details');
   });
 });
 
@@ -534,20 +888,141 @@ describe('Claude accessibility helpers', () => {
     expect(lines[2].kind).toBe('paragraph');
   });
 
-  test('groups major markdown sections for VoiceOver while keeping checklist items separate', () => {
-    const blocks = buildClaudeAccessibilityBlocks(`### Implementation decisions
+  test('groups major markdown sections into one accessibility node each', () => {
+    const sections = buildClaudeAccessibilitySections(`### Progress
+
+- [x] Read issue and repository \`CLAUDE.md\`
+- [ ] Add focused tests
+
+### Current analysis
+
+Ordinary text for current analysis.
+
+### Implementation decisions
 
 - Model choice: \`Gemini 3.1 Flash Lite\`
 - Frame strategy: latest-frame streaming
 - Runtime input: expected vehicle details
 
-- [x] Read issue and repository \`CLAUDE.md\`
-- [ ] Add focused tests
+### Recent work
+
+Validated the generated tool.
+
+### Next step
+
+Commit and push.
+
+### Implementation summary
+
+Validation passed and PR prepared.
 `);
-    expect(blocks[0].label).toBe(
+    expect(sections[0].label).toBe('Progress. Finished: Read issue and repository CLAUDE.md. Ongoing: Add focused tests');
+    expect(sections[1].label).toBe(
+      'Current analysis. Ordinary text for current analysis.'
+    );
+    expect(sections[2].label).toBe(
       'Implementation decisions. Model choice: Gemini 3.1 Flash Lite. Frame strategy: latest-frame streaming. Runtime input: expected vehicle details'
     );
-    expect(blocks[1].label).toBe('Finished: Read issue and repository CLAUDE.md');
-    expect(blocks[2].label).toBe('Ongoing: Add focused tests');
+    expect(sections[3].label).toBe('Recent work. Validated the generated tool.');
+    expect(sections[4].label).toBe('Next step. Commit and push.');
+    expect(sections[5].label).toBe('Implementation summary. Validation passed and PR prepared.');
+  });
+});
+
+describe('IssueChat Claude accessibility tree', () => {
+  test('renders one accessible node per Claude major section without whole-message hiding', async () => {
+    const claudeBody = `### Progress
+
+- [x] Inspected the existing tool
+- [x] Selected Gemini
+- [ ] Updating streaming behavior
+- [ ] Run validation
+
+### Current analysis
+
+Working through the rendered output.
+
+### Implementation decisions
+
+**Model:** Gemini 3.1 Flash Lite
+**Strategy:** single-frame VLM
+**Runtime input:** search criteria
+
+### Recent work
+
+Adjusted session-level auto-follow.
+
+### Next step
+
+Run focused validation.
+
+### Implementation summary
+
+No visual markdown changes.
+`;
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 88,
+      issue_url: 'https://github.test/issues/88',
+      video_summary: '',
+      pr_number: 88,
+    });
+    mockFetchClaudeProgress.mockResolvedValue({
+      status: 'available',
+      issue_number: 88,
+      comment_id: 801,
+      updated_at: '2026-08-07T12:00:00Z',
+      body: claudeBody,
+      message: 'Claude comment available.',
+      steps: [],
+    });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 88, title: 'PR 88' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+
+    const expectedSectionLabels = buildClaudeAccessibilitySections(claudeBody).map((section) => section.label);
+    const sectionNodes = renderer!.root.findAll((node) =>
+      node.type === View
+      && node.props?.accessible === true
+      && typeof node.props?.accessibilityLabel === 'string'
+      && expectedSectionLabels.includes(node.props.accessibilityLabel)
+    );
+
+    expect(sectionNodes).toHaveLength(6);
+    sectionNodes.forEach((node) => {
+      expect(node.props.accessibilityElementsHidden).toBeUndefined();
+      expect(node.props.importantForAccessibility).toBeUndefined();
+    });
+
+    const claudeHeader = renderer!.root.findAll((node) => node.type === Text && node.props?.accessibilityLabel === 'Claude');
+    expect(claudeHeader).toHaveLength(1);
+
+    const claudeContainer = renderer!.root.findAll((node) =>
+      node.type === View
+      && typeof node.props?.testID === 'string'
+      && node.props.testID.startsWith('claude-progress-')
+    )[0];
+
+    expect(claudeContainer.props.accessibilityElementsHidden).toBeUndefined();
+    expect(claudeContainer.props.importantForAccessibility).toBeUndefined();
+
+    const giantClaudeMessageNode = renderer!.root.findAll((node) =>
+      node.type === View
+      && node.props?.accessible === true
+      && typeof node.props?.accessibilityLabel === 'string'
+      && node.props.accessibilityLabel.includes('Progress.')
+      && node.props.accessibilityLabel.includes('Implementation summary.')
+    );
+    expect(giantClaudeMessageNode).toHaveLength(0);
   });
 });
