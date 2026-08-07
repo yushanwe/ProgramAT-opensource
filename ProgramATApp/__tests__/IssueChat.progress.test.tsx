@@ -826,10 +826,12 @@ describe('sanitizeClaudeCommentBody', () => {
   });
 
   test('preserves meaningful text and checklist content', () => {
-    const input = `### Progress\n<div>Working on validation</div>\n- [x] Read issue\n- [ ] Validate tool\nPR: https://github.com/example/repo/pull/5`;
+    const input = `### Progress\n<div>Working on validation</div>\n- [x] Read issue\n- [ ] Validate tool\nPR: https://github.com/example/repo/pull/5\nSee [the pull request](https://github.com/example/repo/pull/5)`;
     expect(sanitizeClaudeCommentBody(input)).toContain('### Progress');
     expect(sanitizeClaudeCommentBody(input)).toContain('- [x] Read issue');
-    expect(sanitizeClaudeCommentBody(input)).toContain('PR: https://github.com/example/repo/pull/5');
+    expect(sanitizeClaudeCommentBody(input)).toContain('Working on validation');
+    expect(sanitizeClaudeCommentBody(input)).toContain('See the pull request');
+    expect(sanitizeClaudeCommentBody(input)).not.toContain('https://github.com/example/repo/pull/5');
   });
 
   test('removes raw media attachment urls and unsupported html', () => {
@@ -846,7 +848,16 @@ describe('sanitizeClaudeCommentBody', () => {
     expect(output).not.toContain('Create a PR');
     expect(output).not.toContain('/compare/main...very-long-branch');
     expect(output).toContain('Useful summary');
-    expect(output).toContain('/pull/5');
+    expect(output).not.toContain('/pull/5');
+  });
+
+  test('preserves anchor text while removing html links and raw urls', () => {
+    const input = `Review <a href="https://github.com/example/repo/pull/5">this fix</a> next.\nMore context: https://example.com/details`;
+    const output = sanitizeClaudeCommentBody(input);
+    expect(output).toContain('Review this fix next.');
+    expect(output).toContain('More context:');
+    expect(output).not.toContain('https://github.com/example/repo/pull/5');
+    expect(output).not.toContain('https://example.com/details');
   });
 });
 

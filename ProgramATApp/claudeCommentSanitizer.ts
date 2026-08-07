@@ -1,4 +1,6 @@
 const IMAGE_MARKDOWN_RE = /!\[[^\]]*]\(([^)]+)\)/gi;
+const LINK_MARKDOWN_RE = /\[([^\]]+)\]\(([^)]+)\)/gi;
+const ANCHOR_TAG_RE = /<a\b[^>]*href=["'][^"']+["'][^>]*>([\s\S]*?)<\/a>/gi;
 const IMG_TAG_RE = /<img\b[^>]*>/gi;
 const HTML_TAG_RE = /<\/?(?:div|span|p|br|details|summary|picture|source)\b[^>]*>/gi;
 const GENERIC_HTML_RE = /<\/?[^>]+>/g;
@@ -41,6 +43,9 @@ export function sanitizeClaudeCommentBody(body: string | undefined | null): stri
     return '';
   });
 
+  cleaned = cleaned.replace(LINK_MARKDOWN_RE, (_match, label: string) => label || '');
+  cleaned = cleaned.replace(ANCHOR_TAG_RE, (_match, innerText: string) => innerText || '');
+
   cleaned = cleaned.replace(/^\s*Create a PR\s*$/gim, '');
   cleaned = cleaned.replace(/^\s*https:\/\/github\.com\/[^\s]+\/compare\/[^\s]+\s*$/gim, '');
 
@@ -55,9 +60,10 @@ export function sanitizeClaudeCommentBody(body: string | undefined | null): stri
   cleaned = cleaned.replace(GENERIC_HTML_RE, '');
   cleaned = decodeHtmlEntities(cleaned);
 
-  cleaned = cleaned.replace(RAW_URL_RE, (url) => (removedMediaUrls.has(url) || isMediaUrl(url) ? '' : url));
+  cleaned = cleaned.replace(RAW_URL_RE, () => '');
   cleaned = cleaned.replace(/[ \t]+\n/g, '\n');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
 
   return cleaned.trim();
 }

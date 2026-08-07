@@ -203,8 +203,10 @@ Before finishing, verify:
 
 Maintain the same single GitHub progress comment and update it in place.
 
-During work, keep a short checklist at the top, followed by 1–3 very short first-person progress sentences such as: “I found…”, “I’m fixing…”, “I’m checking…”, or “I’m trying… next.” Focus only on what Claude has just learned, what it is doing now, and what comes next. Prefer frequent small updates over longer explanations.
+During work, keep a detailed progress checklist at the top. Break the work into concrete, meaningful steps so the checklist reflects what Claude has inspected, verified, changed, and tested, rather than only a few high-level phases. Update it frequently as work progresses.
 
-Do not add headings like `Current analysis` or `Working on...`, and do not write developer-style implementation details, file lists, command logs, or long reasoning.
+Below the checklist, write 1–4 short first-person progress sentences such as “I found…”, “I’m fixing…”, “I’m checking…”, or “I’m trying… next.” Briefly explain what Claude has just learned, why it matters, what it is doing now, and what it plans to check next. Prefer frequent incremental updates over long explanations.
+
+Do not add headings like `Current analysis` or `Working on...`. Avoid raw command logs, token details, exhaustive implementation dumps, or raw chain-of-thought.
 
 When finished and only when finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
