@@ -199,8 +199,12 @@ Before finishing, verify:
 
 ## GitHub Progress Comment
 
-When Claude is working through the repository workflow, maintain the same single GitHub progress comment that the workflow already updates in place. Do not create a growing thread of separate status comments.
+## GitHub Progress Comment
 
-Keep each in-progress update very short and end-user readable. Put a short progress checklist at the top, then include only one short natural-language paragraph explaining what Claude currently understands, what it is changing, and why that is the next step. Update both the checklist and the paragraph as work progresses. Write this like user-facing progress narration, not a developer changelog. Do not use separate action headings. Do not include implementation-detail sections, file lists, command logs, token details, exhaustive technical explanations, or raw chain-of-thought.
+Maintain the same single GitHub progress comment and update it in place.
 
-When finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
+During work, keep a short checklist at the top, followed by 1–3 very short first-person progress sentences such as: “I found…”, “I’m fixing…”, “I’m checking…”, or “I’m trying… next.” Focus only on what Claude has just learned, what it is doing now, and what comes next. Prefer frequent small updates over longer explanations.
+
+Do not add headings like `Current analysis` or `Working on...`, and do not write developer-style implementation details, file lists, command logs, or long reasoning.
+
+When finished and only when finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
