@@ -1,12 +1,13 @@
 /**
  * IssueSubmissionService
  * HTTP layer for the chat-style issue creation/update flow. Every call in
- * this module hits the existing /submit-creation, /submit-update, and
- * /brainstorm-next-question REST endpoints — no backend changes.
+ * this module hits the existing /submit-creation, /submit-update,
+ * /brainstorm-next-question, and /brainstorm-ask-agent REST endpoints — no
+ * backend changes.
  */
 
 import WebSocketService from './WebSocketService';
-import { CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
+import { AskAgentResponse, CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
 
 const REQUEST_TIMEOUT_MS = 120_000; // text-only requests: brainstorm question, no video
 const VIDEO_REQUEST_TIMEOUT_MS = 300_000; // video upload + summarization + two Gemini calls; uploads over a tunnel (e.g. ngrok) can be slow
@@ -152,6 +153,27 @@ export async function nextBrainstormQuestion(token: string): Promise<NextQuestio
     return result as NextQuestionResponse;
   } catch (e) {
     console.log('[IssueSubmissionService] brainstorm-next-question threw:', String(e));
+    return { status: 'error', error: 'Network error. Please try again.' };
+  }
+}
+
+export async function askBrainstormAgent(token: string, question: string): Promise<AskAgentResponse> {
+  const baseUrl = getHttpBaseUrl();
+  if (!baseUrl) {
+    return { status: 'error', error: 'Server URL not configured' };
+  }
+
+  try {
+    const response = await postWithTimeout(
+      `${baseUrl}/brainstorm-ask-agent`,
+      JSON.stringify({ token, question }),
+      { 'Content-Type': 'application/json' },
+    );
+    const result = await response.json();
+    console.log('[IssueSubmissionService] brainstorm-ask-agent response:', JSON.stringify(result));
+    return result as AskAgentResponse;
+  } catch (e) {
+    console.log('[IssueSubmissionService] brainstorm-ask-agent threw:', String(e));
     return { status: 'error', error: 'Network error. Please try again.' };
   }
 }

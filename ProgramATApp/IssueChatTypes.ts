@@ -9,14 +9,16 @@ export type RetryDescriptor =
   | { op: 'update'; text: string; videoUri: string | null; issueNumber: number }
   | { op: 'ideation-answer'; text: string; token: string }
   | { op: 'next-question'; token: string }
-  | { op: 'start-building'; token: string };
+  | { op: 'start-building'; token: string }
+  | { op: 'ask-agent'; token: string; question: string };
 
 export type IssueChatItem =
   | { kind: 'user-text'; id: string; ts: Date; text: string }
   | { kind: 'user-video'; id: string; ts: Date; videoUri: string; caption: string }
-  | { kind: 'user-choice'; id: string; ts: Date; choice: 'keep_brainstorming' | 'start_building'; label: string }
+  | { kind: 'user-choice'; id: string; ts: Date; choice: 'keep_brainstorming' | 'start_building' | 'ask_agent'; label: string }
   | { kind: 'assistant-question'; id: string; ts: Date; question: string; token: string }
   | { kind: 'assistant-choice-prompt'; id: string; ts: Date; text: string; token: string; resolved: boolean }
+  | { kind: 'assistant-clarification-answer'; id: string; ts: Date; question: string; answer: string; token: string }
   | { kind: 'assistant-created'; id: string; ts: Date; issueNumber: number; issueUrl: string; videoSummarySkipped: boolean }
   | { kind: 'assistant-updated'; id: string; ts: Date; issueNumber: number; issueUrl: string; videoSummarySkipped: boolean }
   | { kind: 'assistant-error'; id: string; ts: Date; text: string; retry?: RetryDescriptor };
@@ -33,4 +35,8 @@ export type UpdateResponse =
 
 export type NextQuestionResponse =
   | { status: 'ideation'; question: string; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
+  | { status: 'error'; error: string };
+
+export type AskAgentResponse =
+  | { status: 'clarification'; token: string; answer: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string };

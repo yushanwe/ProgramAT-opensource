@@ -34,7 +34,7 @@ import WebSocketService from './WebSocketService';
 import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { IssueChatItem, RetryDescriptor } from './IssueChatTypes';
-import { submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
+import { submitCreation, submitUpdate, nextBrainstormQuestion, askBrainstormAgent } from './IssueSubmissionService';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
 import RayBanRecorderModal from './RayBanRecorderModal';
@@ -47,7 +47,7 @@ interface IssueChatProps {
   showBackButton?: boolean;
 }
 
-type Awaiting = 'answer' | 'choice' | null;
+type Awaiting = 'answer' | 'choice' | 'clarification' | null;
 
 function extractCreateToolName(summary: string | null): string | null {
   if (!summary) return null;
@@ -187,6 +187,12 @@ export default function IssueChat({
       // are handled here regardless of how the question arrived.
       AccessibilityInfo.announceForAccessibility(last.question);
       BeepService.playBeep(880, 120);
+    } else if (last.kind === 'assistant-clarification-answer') {
+      lastAnnouncedIdRef.current = last.id;
+      // Same earcon as a structured question — this is equally new
+      // assistant-originated spoken content the user should notice.
+      AccessibilityInfo.announceForAccessibility(last.answer);
+      BeepService.playBeep(880, 120);
     } else if (last.kind === 'assistant-choice-prompt') {
       lastAnnouncedIdRef.current = last.id;
       // Announce the choice prompt. Summary card is silently updated and
@@ -208,6 +214,13 @@ export default function IssueChat({
   // should be able to answer immediately without hunting for the input.
   useEffect(() => {
     if (awaiting === 'answer') {
+      const timeout = setTimeout(() => composeInputRef.current?.focus(), 150);
+      return () => clearTimeout(timeout);
+    } else if (awaiting === 'clarification') {
+      // No new chat bubble carries this mode switch, so announce it
+      // explicitly — otherwise a screen-reader user won't know the compose
+      // bar's purpose just changed.
+      AccessibilityInfo.announceForAccessibility('Ask the agent a question. Type your question and press send.');
       const timeout = setTimeout(() => composeInputRef.current?.focus(), 150);
       return () => clearTimeout(timeout);
     }
@@ -533,6 +546,67 @@ export default function IssueChat({
     }
   };
 
+  const handleTalkToAgent = () => {
+    if (!activeToken) return;
+    resolveLatestChoicePrompt();
+    append({
+      kind: 'user-choice',
+      id: nextId('user-choice'),
+      ts: new Date(),
+      choice: 'ask_agent',
+      label: '💬 Talk to Agent',
+    });
+    setAwaiting('clarification');
+  };
+
+  const sendAgentQuestion = async (question: string, token: string) => {
+    const trimmed = question.trim();
+    if (!trimmed) return;
+    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
+    setComposeText('');
+    Keyboard.dismiss();
+    setAwaiting(null);
+    setIsSending(true);
+    inFlightRef.current = true;
+    try {
+      const result = await askBrainstormAgent(token, trimmed);
+      if (result.status === 'clarification') {
+        brainstormHistoryRef.current = result.brainstorm_history || [];
+        if (result.summary) setUnderstandingSummary(result.summary);
+        if (result.integration_note) setLastIntegrated(result.integration_note);
+        append({
+          kind: 'assistant-clarification-answer',
+          id: nextId('assistant-clarification-answer'),
+          ts: new Date(),
+          question: trimmed,
+          answer: result.answer,
+          token,
+        });
+        setActiveToken(token);
+        append({
+          kind: 'assistant-choice-prompt',
+          id: nextId('assistant-choice-prompt'),
+          ts: new Date(),
+          text: 'Anything else? You can keep brainstorming, start building, or ask another question.',
+          token,
+          resolved: false,
+        });
+      } else {
+        append({
+          kind: 'assistant-error',
+          id: nextId('assistant-error'),
+          ts: new Date(),
+          text: result.error || 'Failed to get an answer',
+          retry: { op: 'ask-agent', token, question: trimmed },
+        });
+      }
+    } finally {
+      inFlightRef.current = false;
+      setProgressText(null);
+      setIsSending(false);
+    }
+  };
+
   const sendUpdate = async (text: string, videoUri: string | null) => {
     if (!selectedIssue) return;
     if (videoUri) {
@@ -593,12 +667,20 @@ export default function IssueChat({
       case 'start-building':
         handleStartBuilding();
         return;
+      case 'ask-agent':
+        sendAgentQuestion(retry.question, retry.token);
+        return;
     }
   };
 
   const handleSend = () => {
     const text = composeText.trim();
     if (!text && !stagedVideoUri) return;
+
+    if (awaiting === 'clarification' && activeToken) {
+      sendAgentQuestion(text, activeToken);
+      return;
+    }
 
     if (awaiting === 'answer' && activeToken) {
       sendIdeationAnswer(text, activeToken);
@@ -634,7 +716,9 @@ export default function IssueChat({
     (stagedVideoUri ? !composeText.trim() : !composeText.trim());
 
   const placeholder =
-    awaiting === 'answer'
+    awaiting === 'clarification'
+      ? 'Ask the agent a question…'
+      : awaiting === 'answer'
       ? 'Type your answer…'
       : stagedVideoUri
       ? 'Add a short description of the video…'
@@ -725,6 +809,25 @@ export default function IssueChat({
             </Text>
           </View>
         );
+      case 'assistant-clarification-answer':
+        return (
+          <View
+            key={item.id}
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text
+              style={[styles.messageText, { color: theme.text }]}
+              selectable={true}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={`Assistant answered: ${item.answer}`}
+              accessibilityHint="Long press to copy text">
+              {item.answer}
+            </Text>
+            <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
+              {item.ts.toLocaleTimeString()}
+            </Text>
+          </View>
+        );
       case 'assistant-choice-prompt':
         return (
           <View
@@ -767,6 +870,21 @@ export default function IssueChat({
                     <ActivityIndicator size="small" color="#fff" />
                   ) : (
                     <Text style={styles.brainstormButtonText}>🚀 Start Building</Text>
+                  )}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.brainstormButton, { backgroundColor: theme.info }]}
+                  onPress={handleTalkToAgent}
+                  disabled={isSending}
+                  accessible={true}
+                  accessibilityLabel="Talk to agent"
+                  accessibilityHint="Ask a free-form question about your tool and get an answer, then return to this menu"
+                  accessibilityRole="button"
+                  accessibilityState={{ disabled: isSending }}>
+                  {isSending ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={styles.brainstormButtonText}>💬 Talk to Agent</Text>
                   )}
                 </TouchableOpacity>
               </View>
