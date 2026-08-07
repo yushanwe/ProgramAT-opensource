@@ -447,13 +447,13 @@ export default function IssueSelector({
             }}
             accessible={true}
             accessibilityRole="button"
-            accessibilityLabel="Create new issue instead"
-            accessibilityHint="Double tap to close this screen and return to creating a new issue">
+            accessibilityLabel="Create new tool instead"
+            accessibilityHint="Double tap to close this screen and return to creating a new tool">
             <Text 
               style={styles.createNewButtonText}
               accessible={false}
               importantForAccessibility="no-hide-descendants">
-              Create New Issue Instead
+              Create New Tool Instead
             </Text>
           </TouchableOpacity>
           )}

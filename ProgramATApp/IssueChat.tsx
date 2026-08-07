@@ -25,6 +25,7 @@ import {
   AccessibilityInfo,
   Modal,
   NativeModules,
+  Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { launchImageLibrary } from 'react-native-image-picker';
@@ -33,7 +34,7 @@ import WebSocketService from './WebSocketService';
 import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
-import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion } from './IssueSubmissionService';
+import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion, askBrainstormAgent } from './IssueSubmissionService';
 import {
   buildClaudeAccessibilitySections,
   buildClaudeAccessibilityLabel,
@@ -42,6 +43,7 @@ import {
 } from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
 import BeepService from './BeepService';
+import RayBanRecorderModal from './RayBanRecorderModal';
 
 interface IssueChatProps {
   serverFeedback?: string;
@@ -51,7 +53,7 @@ interface IssueChatProps {
   showBackButton?: boolean;
 }
 
-type Awaiting = 'answer' | 'choice' | null;
+type Awaiting = 'answer' | 'choice' | 'clarification' | null;
 type ProgressTarget = {
   mode: 'create' | 'update';
   issueNumber?: number | null;
@@ -126,6 +128,8 @@ const { ScreenRecordingModule } = NativeModules as {
   };
 };
 
+const hasRayBan = !!(NativeModules as any).MetaWearablesModule?.startRayBanStream;
+
 /**
  * Build the short VoiceOver announcement for the "What I understand" card.
  * On first arrival (no integration note) we extract just the first sentence.
@@ -155,7 +159,9 @@ export default function IssueChat({
   const [items, setItems] = useState<IssueChatItem[]>([]);
   const [composeText, setComposeText] = useState('');
   const [stagedVideoUri, setStagedVideoUri] = useState<string | null>(null);
+  const [stagedVideoSource, setStagedVideoSource] = useState<'phone' | 'rayban' | 'library' | null>(null);
   const [isVideoRecorderOpen, setIsVideoRecorderOpen] = useState(false);
+  const [isRayBanRecorderOpen, setIsRayBanRecorderOpen] = useState(false);
   const [isPickingFromLibrary, setIsPickingFromLibrary] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [progressText, setProgressText] = useState<string | null>(null);
@@ -257,6 +263,22 @@ export default function IssueChat({
     lastAutoScrollStateRef.current = nextState;
   }, [items, progressText, isSending]);
 
+  // Loading sound while a request is in flight — video uploads can take
+  // 15+ seconds to summarize, and the "Thinking…" bubble alone isn't audible.
+  // Starts immediately (no delay) since requests here are never near-instant
+  // and the user should hear confirmation from the moment they hit send.
+  useEffect(() => {
+    if (isSending) {
+      BeepService.startLoadingSound();
+    } else {
+      BeepService.stopLoadingSound();
+    }
+
+    return () => {
+      BeepService.stopLoadingSound();
+    };
+  }, [isSending]);
+
   // Announce new assistant-originated items. assistant-updated is skipped
   // because App.tsx's WS listener already speaks "Update sent to issue" for
   // the issue_updated broadcast that /submit-update still triggers.
@@ -268,6 +290,12 @@ export default function IssueChat({
       // Announce the question and play an earcon. All question announcements
       // are handled here regardless of how the question arrived.
       AccessibilityInfo.announceForAccessibility(last.question);
+      BeepService.playBeep(880, 120);
+    } else if (last.kind === 'assistant-clarification-answer') {
+      lastAnnouncedIdRef.current = last.id;
+      // Same earcon as a structured question — this is equally new
+      // assistant-originated spoken content the user should notice.
+      AccessibilityInfo.announceForAccessibility(last.answer);
       BeepService.playBeep(880, 120);
     } else if (last.kind === 'assistant-choice-prompt') {
       lastAnnouncedIdRef.current = last.id;
@@ -290,6 +318,13 @@ export default function IssueChat({
   // should be able to answer immediately without hunting for the input.
   useEffect(() => {
     if (awaiting === 'answer') {
+      const timeout = setTimeout(() => composeInputRef.current?.focus(), 150);
+      return () => clearTimeout(timeout);
+    } else if (awaiting === 'clarification') {
+      // No new chat bubble carries this mode switch, so announce it
+      // explicitly — otherwise a screen-reader user won't know the compose
+      // bar's purpose just changed.
+      AccessibilityInfo.announceForAccessibility('Ask the agent a question. Type your question and press send.');
       const timeout = setTimeout(() => composeInputRef.current?.focus(), 150);
       return () => clearTimeout(timeout);
     }
@@ -518,6 +553,7 @@ export default function IssueChat({
       const asset = result.assets[0];
       if (asset.uri) {
         setStagedVideoUri(asset.uri);
+        setStagedVideoSource('library');
       }
     } finally {
       setIsPickingFromLibrary(false);
@@ -529,6 +565,7 @@ export default function IssueChat({
       const path = await ScreenRecordingModule?.fetchMostRecentVideoPath?.();
       if (path) {
         setStagedVideoUri(path);
+        setStagedVideoSource('library');
       }
     } catch (error: any) {
       console.error('[IssueChat] Failed to attach recent session:', error);
@@ -541,6 +578,21 @@ export default function IssueChat({
           : 'Could not attach a recent recording.';
       AccessibilityInfo.announceForAccessibility(message);
     }
+  };
+
+  const handleAttachVideoMenu = () => {
+    const actions: any[] = [
+      { text: 'Record a new video', onPress: () => setIsVideoRecorderOpen(true) },
+    ];
+    if (hasRayBan) {
+      actions.push({ text: 'Record with Ray-Ban glasses', onPress: () => setIsRayBanRecorderOpen(true) });
+    }
+    actions.push(
+      { text: 'Choose from photo library', onPress: handlePickFromLibrary },
+      { text: 'Attach most recent recording', onPress: handleAttachRecentSession },
+      { text: 'Cancel', style: 'cancel' },
+    );
+    Alert.alert('Attach a video', 'Choose how to attach a video to this message.', actions);
   };
 
   // --- Turn dispatchers ---
@@ -565,6 +617,7 @@ export default function IssueChat({
     append({ kind: 'user-video', id: nextId('user-video'), ts: new Date(), videoUri, caption: text });
     setComposeText('');
     setStagedVideoUri(null);
+    setStagedVideoSource(null);
     Keyboard.dismiss();
     setIsSending(true);
     inFlightRef.current = true;
@@ -888,6 +941,118 @@ export default function IssueChat({
     }
   };
 
+  const handleTalkToAgent = () => {
+    if (!activeToken) return;
+    resolveLatestChoicePrompt();
+    append({
+      kind: 'user-choice',
+      id: nextId('user-choice'),
+      ts: new Date(),
+      choice: 'ask_agent',
+      label: '💬 Talk to Agent',
+    });
+    setAwaiting('clarification');
+  };
+
+  const sendAgentQuestion = async (question: string, token: string) => {
+    const trimmed = question.trim();
+    if (!trimmed) return;
+    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
+    setComposeText('');
+    Keyboard.dismiss();
+    setAwaiting(null);
+    setIsSending(true);
+    inFlightRef.current = true;
+    try {
+      const result = await askBrainstormAgent(token, trimmed);
+      if (result.status === 'clarification') {
+        brainstormHistoryRef.current = result.brainstorm_history || [];
+        if (result.summary) setUnderstandingSummary(result.summary);
+        if (result.integration_note) setLastIntegrated(result.integration_note);
+        append({
+          kind: 'assistant-clarification-answer',
+          id: nextId('assistant-clarification-answer'),
+          ts: new Date(),
+          question: trimmed,
+          answer: result.answer,
+          token,
+        });
+        setActiveToken(token);
+        append({
+          kind: 'assistant-choice-prompt',
+          id: nextId('assistant-choice-prompt'),
+          ts: new Date(),
+          text: 'Anything else? You can keep brainstorming, start building, or ask another question.',
+          token,
+          resolved: false,
+        });
+      } else {
+        append({
+          kind: 'assistant-error',
+          id: nextId('assistant-error'),
+          ts: new Date(),
+          text: result.error || 'Failed to get an answer',
+          retry: { op: 'ask-agent', token, question: trimmed },
+        });
+      }
+    } finally {
+      inFlightRef.current = false;
+      setProgressText(null);
+      setIsSending(false);
+    }
+  };
+
+  const handleTalkToAgent = () => {
+    if (!activeToken) return;
+    resolveLatestChoicePrompt();
+    append({
+      kind: 'user-choice',
+      id: nextId('user-choice'),
+      ts: new Date(),
+      choice: 'ask_agent',
+      label: '💬 Talk to Agent',
+    });
+    setAwaiting('clarification');
+  };
+
+  const sendAgentQuestion = async (question: string, token: string) => {
+    const trimmed = question.trim();
+    if (!trimmed) return;
+    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
+    setComposeText('');
+    Keyboard.dismiss();
+    setAwaiting(null);
+    setIsSending(true);
+    inFlightRef.current = true;
+    try {
+      const result = await submitUpdate({ text, issueNumber: selectedIssue.number, videoUri, brainstormingEnabled: brainstormingActive });
+      if (result.status === 'updated') {
+        const videoSummarySkipped = !!videoUri && !result.video_summary;
+        append({
+          kind: 'assistant-updated',
+          id: nextId('assistant-updated'),
+          ts: new Date(),
+          issueNumber: result.issue_number,
+          issueUrl: result.issue_url,
+          videoSummarySkipped,
+        });
+      } else {
+        append({
+          kind: 'assistant-error',
+          id: nextId('assistant-error'),
+          ts: new Date(),
+          text: result.error,
+          retry: { op: 'update', text, videoUri, issueNumber: selectedIssue.number },
+        });
+      }
+      handleUpdateResponse(result, { op: 'update', text, videoUri, issueNumber: selectedIssue.number });
+    } finally {
+      inFlightRef.current = false;
+      setProgressText(null);
+      setIsSending(false);
+    }
+  };
+
   const sendUpdate = async (text: string, videoUri: string | null) => {
     if (!selectedIssue) return;
     if (videoUri) {
@@ -933,12 +1098,20 @@ export default function IssueChat({
       case 'start-building':
         handleStartBuilding();
         return;
+      case 'ask-agent':
+        sendAgentQuestion(retry.question, retry.token);
+        return;
     }
   };
 
   const handleSend = () => {
     const text = composeText.trim();
     if (!text && !stagedVideoUri) return;
+
+    if (awaiting === 'clarification' && activeToken) {
+      sendAgentQuestion(text, activeToken);
+      return;
+    }
 
     if (awaiting === 'answer' && activeToken) {
       if (isCreateMode) {
@@ -965,6 +1138,7 @@ export default function IssueChat({
     setItems([]);
     setComposeText('');
     setStagedVideoUri(null);
+    setStagedVideoSource(null);
     setClaudeProgress(null);
     setProgressTarget(null);
     claudeProgressItemIdRef.current = null;
@@ -1001,7 +1175,9 @@ export default function IssueChat({
     (stagedVideoUri ? !composeText.trim() : !composeText.trim());
 
   const placeholder =
-    awaiting === 'answer'
+    awaiting === 'clarification'
+      ? 'Ask the agent a question…'
+      : awaiting === 'answer'
       ? 'Type your answer…'
       : stagedVideoUri
       ? 'Add a short description of the video…'
@@ -1092,6 +1268,25 @@ export default function IssueChat({
             </Text>
           </View>
         );
+      case 'assistant-clarification-answer':
+        return (
+          <View
+            key={item.id}
+            style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text
+              style={[styles.messageText, { color: theme.text }]}
+              selectable={true}
+              accessible={true}
+              accessibilityRole="text"
+              accessibilityLabel={`Assistant answered: ${item.answer}`}
+              accessibilityHint="Long press to copy text">
+              {item.answer}
+            </Text>
+            <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
+              {item.ts.toLocaleTimeString()}
+            </Text>
+          </View>
+        );
       case 'assistant-choice-prompt':
         return (
           <View
@@ -1134,6 +1329,21 @@ export default function IssueChat({
                     <ActivityIndicator size="small" color="#fff" />
                   ) : (
                     <Text style={styles.brainstormButtonText}>🚀 Start Building</Text>
+                  )}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.brainstormButton, { backgroundColor: theme.info }]}
+                  onPress={handleTalkToAgent}
+                  disabled={isSending}
+                  accessible={true}
+                  accessibilityLabel="Talk to agent"
+                  accessibilityHint="Ask a free-form question about your tool and get an answer, then return to this menu"
+                  accessibilityRole="button"
+                  accessibilityState={{ disabled: isSending }}>
+                  {isSending ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={styles.brainstormButtonText}>💬 Talk to Agent</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1245,10 +1455,11 @@ export default function IssueChat({
   };
 
   return (
-    <KeyboardAvoidingView
-      style={[styles.container, { backgroundColor: theme.background }]}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={['bottom']}>
+      <KeyboardAvoidingView
+        style={styles.container}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
         {modeBannerText && (
           <View
@@ -1431,11 +1642,21 @@ export default function IssueChat({
             accessibilityLabel="Video attached, ready to send">
             <Text style={[styles.videoChipText, { color: theme.text }]}>📹 Video attached</Text>
             <TouchableOpacity
-              onPress={() => setIsVideoRecorderOpen(true)}
+              onPress={() => {
+                if (stagedVideoSource === 'rayban') {
+                  setIsRayBanRecorderOpen(true);
+                } else if (stagedVideoSource === 'library') {
+                  handlePickFromLibrary();
+                } else {
+                  setIsVideoRecorderOpen(true);
+                }
+              }}
               accessible={true}
               accessibilityRole="button"
-              accessibilityLabel="Re-record video">
-              <Text style={[styles.videoActionText, { color: theme.primary }]}>Re-record</Text>
+              accessibilityLabel={stagedVideoSource === 'library' ? 'Pick a different video from library' : 'Re-record video'}>
+              <Text style={[styles.videoActionText, { color: theme.primary }]}>
+                {stagedVideoSource === 'library' ? 'Replace' : 'Re-record'}
+              </Text>
             </TouchableOpacity>
             <TouchableOpacity
               onPress={handlePickFromLibrary}
@@ -1445,7 +1666,7 @@ export default function IssueChat({
               <Text style={[styles.videoActionText, { color: theme.primary }]}>Library</Text>
             </TouchableOpacity>
             <TouchableOpacity
-              onPress={() => setStagedVideoUri(null)}
+              onPress={() => { setStagedVideoUri(null); setStagedVideoSource(null); }}
               accessible={true}
               accessibilityRole="button"
               accessibilityLabel="Remove video attachment">
@@ -1468,28 +1689,12 @@ export default function IssueChat({
             <View style={styles.attachButtons}>
               <TouchableOpacity
                 style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
-                onPress={() => setIsVideoRecorderOpen(true)}
+                onPress={handleAttachVideoMenu}
                 accessible={true}
                 accessibilityRole="button"
-                accessibilityLabel="Record a new video">
+                accessibilityLabel="Attach a video"
+                accessibilityHint="Opens a menu to record a new video, choose one from your photo library, or attach your most recent recording">
                 <Text style={styles.attachButtonText}>📹</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
-                onPress={handlePickFromLibrary}
-                accessible={true}
-                accessibilityRole="button"
-                accessibilityLabel="Choose a video from your photo library">
-                <Text style={styles.attachButtonText}>📁</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.attachButton, { backgroundColor: theme.backgroundSecondary, borderColor: theme.border }]}
-                onPress={handleAttachRecentSession}
-                accessible={true}
-                accessibilityRole="button"
-                accessibilityLabel="Attach most recent recording"
-                accessibilityHint="Attaches the most recent video from your camera roll">
-                <Text style={styles.attachButtonText}>🎬</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -1545,12 +1750,25 @@ export default function IssueChat({
           visible={isVideoRecorderOpen}
           onVideoRecorded={(path) => {
             setStagedVideoUri(path);
+            setStagedVideoSource('phone');
             setIsVideoRecorderOpen(false);
           }}
           onCancel={() => setIsVideoRecorderOpen(false)}
         />
       )}
-    </KeyboardAvoidingView>
+      {!basicMode && hasRayBan && (
+        <RayBanRecorderModal
+          visible={isRayBanRecorderOpen}
+          onVideoRecorded={(path) => {
+            setStagedVideoUri(path);
+            setStagedVideoSource('rayban');
+            setIsRayBanRecorderOpen(false);
+          }}
+          onCancel={() => setIsRayBanRecorderOpen(false)}
+        />
+      )}
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 

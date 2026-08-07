@@ -54,6 +54,21 @@ class ScreenRecordingModule: NSObject {
         try? FileManager.default.removeItem(at: url)
         self.outputURL = url
 
+        // Enabling the microphone makes ReplayKit activate an audio session
+        // that ducks other audio (including VoiceOver) by default. Configure
+        // the session ourselves first so recording mixes with — rather than
+        // silences — VoiceOver and other system audio for this blind-first app.
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(
+                .playAndRecord,
+                options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
+            )
+            try session.setActive(true, options: [])
+        } catch {
+            print("[ScreenRecordingModule] Failed to configure audio session:", error.localizedDescription)
+        }
+
         RPScreenRecorder.shared().startRecording(withMicrophoneEnabled: true) { error in
 
             if let error = error {
@@ -98,6 +113,13 @@ class ScreenRecordingModule: NSObject {
         RPScreenRecorder.shared().stopRecording(withOutput: url) { error in
 
             self.isRecording = false
+
+            // Release the recording session so the app's normal audio
+            // behavior (TTS, beeps) returns to whatever it was before.
+            try? AVAudioSession.sharedInstance().setActive(
+                false,
+                options: [.notifyOthersOnDeactivation]
+            )
 
             if let error = error {
                 reject(
