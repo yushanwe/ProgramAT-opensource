@@ -169,6 +169,8 @@ export interface FetchClaudeProgressArgs {
   issueNumber?: number | null;
   prNumber?: number | null;
   commentId?: number | null;
+  afterCommentId?: number | null;
+  afterTimestamp?: string | null;
 }
 
 export async function fetchClaudeProgress(args: FetchClaudeProgressArgs): Promise<ClaudeProgressResponse> {
@@ -185,6 +187,8 @@ export async function fetchClaudeProgress(args: FetchClaudeProgressArgs): Promis
   query.append(args.mode === 'update' ? 'pr_number' : 'issue_number', String(issueNumber));
   query.append('mode', args.mode);
   if (args.commentId) query.append('comment_id', String(args.commentId));
+  if (args.afterCommentId) query.append('after_comment_id', String(args.afterCommentId));
+  if (args.afterTimestamp) query.append('after_timestamp', args.afterTimestamp);
 
   try {
     const response = await fetch(`${baseUrl}/claude-progress?${query.toString()}`);

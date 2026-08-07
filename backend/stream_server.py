@@ -5283,7 +5283,9 @@ def build_copilot_comment(
 
 def resolve_claude_progress_comment(repo_name: str, number: int,
                                     comment_id: Optional[int] = None,
-                                    mode: str = 'create') -> tuple[object, object, list]:
+                                    mode: str = 'create',
+                                    after_comment_id: Optional[int] = None,
+                                    after_timestamp: Optional[str] = None) -> tuple[object, object, list]:
     g = Github(GITHUB_TOKEN)
     repo = g.get_repo(repo_name)
     issue = repo.get_issue(int(number))
@@ -5306,7 +5308,11 @@ def resolve_claude_progress_comment(repo_name: str, number: int,
             bool(getattr(comment, 'body', None)),
         )
     try:
-        selected = select_claude_progress_comment(comments)
+        selected = select_claude_progress_comment(
+            comments,
+            after_comment_id=after_comment_id,
+            after_timestamp=after_timestamp,
+        )
         logger.info("[Claude Comment] selected_id=%s", getattr(selected, 'id', None))
         return issue, selected, comments
     except LookupError:
@@ -5373,19 +5379,31 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         logger.info(decision_log)
         
         # Add comment to the issue/PR
-        issue.create_comment(final_comment)
+        issue_comment = issue.create_comment(final_comment)
         trigger_note = " with code-agent mention" if mention_added else ""
         _log_to_all_sessions("INFO", f"GitHub API: Added comment to #{issue_number}{trigger_note}")
         logger.info(f"Added comment to #{issue_number}{trigger_note}")
+        result = {
+            'issue_number': issue_number,
+            'issue_url': issue.html_url,
+            'issue_comment_id': getattr(issue_comment, 'id', None),
+            'issue_comment_created_at': getattr(issue_comment, 'created_at', None).isoformat() if getattr(issue_comment, 'created_at', None) else None,
+            'pr_number': pr_number,
+            'pr_url': pr_url,
+            'pr_comment_id': getattr(issue_comment, 'id', None) if is_pr else None,
+            'pr_comment_created_at': getattr(issue_comment, 'created_at', None).isoformat() if is_pr and getattr(issue_comment, 'created_at', None) else None,
+        }
         
         # Also preserve the update on the associated PR. For Claude, this is the
         # sole triggering mention so the same request cannot start two runs.
         if associated_pr is not None:
             try:
                 pr_comment, _ = build_copilot_comment(comment_text, trigger_required)
-                associated_pr.create_issue_comment(pr_comment)
+                pr_comment_obj = associated_pr.create_issue_comment(pr_comment)
                 _log_to_all_sessions("INFO", f"GitHub API: Added comment to associated PR #{pr_number}")
                 logger.info(f"Added comment to associated PR #{pr_number}")
+                result['pr_comment_id'] = getattr(pr_comment_obj, 'id', None)
+                result['pr_comment_created_at'] = getattr(pr_comment_obj, 'created_at', None).isoformat() if getattr(pr_comment_obj, 'created_at', None) else None
                 upsert_traceability_record(
                     mode='update',
                     issue_number=issue_number,
@@ -5409,6 +5427,7 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
             }
             await _broadcast_ws(success_data)
             # Detailed Claude logs remain authoritative in GitHub Actions.
+        return result
         
     except Exception as e:
         import traceback
@@ -5417,6 +5436,7 @@ async def update_github_issue(issue_number: int, comment_text: str, mention_copi
         _log_to_all_sessions("ERROR", tb)
         logger.error(f"Failed to update issue #{issue_number}: {e}")
         logger.error(tb)
+        raise
 
 
 def _build_issue_extraction_prompt(
@@ -7333,7 +7353,7 @@ async def handle_update_submit(request: web.Request) -> web.Response:
         # open PR (when present) instead of starting duplicate issue work.
         # Note: update_github_issue() already broadcasts issue_updated internally —
         # do NOT broadcast again here or the client hears "Update sent to issue" twice.
-        await update_github_issue(int(issue_number), comment, mention_copilot=True)
+        update_result = await update_github_issue(int(issue_number), comment, mention_copilot=True)
 
         def _get_issue_url():
             g = Github(GITHUB_TOKEN)
@@ -7360,6 +7380,8 @@ async def handle_update_submit(request: web.Request) -> web.Response:
             'issue_url': issue_url,
             'video_summary': video_summary,
             'pr_number': tracked_pr_number,
+            'comment_id': update_result.get('pr_comment_id') if update_result else None,
+            'comment_created_at': update_result.get('pr_comment_created_at') if update_result else None,
         })
 
     except Exception as e:
@@ -7376,6 +7398,8 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
       - pr_number (required for update mode)
       - mode (create|update)
       - comment_id (optional exact GitHub comment id)
+      - after_comment_id (optional boundary comment id for update polling)
+      - after_timestamp (optional boundary timestamp for update polling)
       - repo (optional owner/repo override, defaults to configured repo)
     """
     if not GITHUB_TOKEN:
@@ -7385,6 +7409,8 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
     mode = (request.query.get('mode') or ('update' if request.query.get('pr_number') else 'create')).strip().lower()
     issue_or_pr_number = request.query.get('pr_number') if mode == 'update' else request.query.get('issue_number')
     comment_id = request.query.get('comment_id')
+    after_comment_id_raw = request.query.get('after_comment_id')
+    after_timestamp = request.query.get('after_timestamp')
 
     if not repo_name:
         return web.json_response({'status': 'error', 'error': 'Repository is required'}, status=400)
@@ -7402,6 +7428,10 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
         exact_comment_id = int(comment_id) if comment_id else None
     except ValueError:
         return web.json_response({'status': 'error', 'error': 'comment_id must be an integer'}, status=400)
+    try:
+        after_comment_id = int(after_comment_id_raw) if after_comment_id_raw else None
+    except ValueError:
+        return web.json_response({'status': 'error', 'error': 'after_comment_id must be an integer'}, status=400)
 
     try:
         issue, comment, _comments = await asyncio.to_thread(
@@ -7410,6 +7440,8 @@ async def handle_claude_progress(request: web.Request) -> web.Response:
             issue_number,
             exact_comment_id,
             mode,
+            after_comment_id,
+            after_timestamp,
         )
     except LookupError:
         return web.json_response({

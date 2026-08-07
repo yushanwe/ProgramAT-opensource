@@ -30,7 +30,7 @@ export type CreationResponse =
   | { status: 'error'; error: string; video_failed?: boolean };
 
 export type UpdateResponse =
-  | { status: 'updated'; issue_number: number; issue_url: string; video_summary: string; pr_number?: number | null; comment_id?: number | null }
+  | { status: 'updated'; issue_number: number; issue_url: string; video_summary: string; pr_number?: number | null; comment_id?: number | null; comment_created_at?: string | null }
   | { status: 'ideation'; question: string; token: string; summary?: string; integration_note?: string }
   | { status: 'brainstorm_choice'; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string };

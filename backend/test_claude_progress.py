@@ -1,5 +1,6 @@
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,8 +13,14 @@ from claude_progress import (
 )
 
 
-def make_comment(comment_id: int, login: str, body: str):
-    return SimpleNamespace(id=comment_id, user=SimpleNamespace(login=login), body=body)
+def make_comment(comment_id: int, login: str, body: str, *, created_at=None, updated_at=None):
+    return SimpleNamespace(
+        id=comment_id,
+        user=SimpleNamespace(login=login),
+        body=body,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 class ClaudeProgressTests(unittest.TestCase):
@@ -75,6 +82,61 @@ class ClaudeProgressTests(unittest.TestCase):
     def test_comment_identity_does_not_require_checklist(self):
         comment = make_comment(22, "claude[bot]", "Working through the update request now.")
         self.assertTrue(looks_like_claude_progress_comment(comment))
+
+    def test_update_boundary_ignores_older_claude_comments(self):
+        comments = [
+            make_comment(
+                30,
+                "claude[bot]",
+                "Older Claude update",
+                created_at=datetime(2026, 8, 1, 10, 0, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 8, 1, 10, 5, tzinfo=timezone.utc),
+            ),
+            make_comment(
+                31,
+                "someone",
+                "User update request",
+                created_at=datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc),
+            ),
+        ]
+        with self.assertRaises(LookupError):
+            select_claude_progress_comment(
+                comments,
+                after_comment_id=31,
+                after_timestamp="2026-08-07T12:00:00+00:00",
+            )
+
+    def test_update_boundary_selects_newer_claude_comment(self):
+        comments = [
+            make_comment(
+                40,
+                "claude[bot]",
+                "Older Claude update",
+                created_at=datetime(2026, 8, 6, 10, 0, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 8, 6, 10, 5, tzinfo=timezone.utc),
+            ),
+            make_comment(
+                41,
+                "someone",
+                "User update request",
+                created_at=datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc),
+            ),
+            make_comment(
+                42,
+                "claude[bot]",
+                "New Claude progress comment",
+                created_at=datetime(2026, 8, 7, 12, 1, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 8, 7, 12, 2, tzinfo=timezone.utc),
+            ),
+        ]
+        selected = select_claude_progress_comment(
+            comments,
+            after_comment_id=41,
+            after_timestamp="2026-08-07T12:00:00+00:00",
+        )
+        self.assertEqual(selected.id, 42)
 
 
 if __name__ == "__main__":

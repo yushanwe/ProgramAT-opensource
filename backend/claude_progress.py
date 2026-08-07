@@ -1,3 +1,4 @@
+from datetime import datetime
 import re
 from typing import Optional
 
@@ -112,13 +113,53 @@ def looks_like_claude_progress_comment(comment) -> bool:
     return bool(CHECKLIST_LINE_RE.search(body)) or any(marker in lowered for marker in CLAUDE_PROGRESS_MARKERS)
 
 
-def select_claude_progress_comment(comments, comment_id: Optional[int] = None):
+def _parse_comment_timestamp(comment) -> Optional[datetime]:
+    for attr in ("updated_at", "created_at"):
+        value = getattr(comment, attr, None)
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+    return None
+
+
+def _is_after_boundary(comment, *, after_comment_id: Optional[int] = None,
+                       after_timestamp: Optional[str] = None) -> bool:
+    if after_comment_id is None and not after_timestamp:
+        return True
+
+    comment_id = getattr(comment, 'id', None)
+    if after_comment_id is not None and comment_id is not None and comment_id <= after_comment_id:
+        return False
+
+    if after_timestamp:
+        try:
+            boundary_time = datetime.fromisoformat(after_timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            boundary_time = None
+        comment_time = _parse_comment_timestamp(comment)
+        if boundary_time is not None and comment_time is not None and comment_time < boundary_time:
+            return False
+
+    return True
+
+
+def select_claude_progress_comment(comments, comment_id: Optional[int] = None,
+                                   after_comment_id: Optional[int] = None,
+                                   after_timestamp: Optional[str] = None):
     if comment_id is not None:
         for comment in comments:
             if getattr(comment, 'id', None) == comment_id:
                 return comment
         raise LookupError('Claude progress comment not found')
     for comment in reversed(list(comments)):
-        if looks_like_claude_progress_comment(comment):
+        if looks_like_claude_progress_comment(comment) and _is_after_boundary(
+            comment,
+            after_comment_id=after_comment_id,
+            after_timestamp=after_timestamp,
+        ):
             return comment
     raise LookupError('Claude progress comment not found')

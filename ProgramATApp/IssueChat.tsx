@@ -52,7 +52,14 @@ interface IssueChatProps {
 }
 
 type Awaiting = 'answer' | 'choice' | null;
-type ProgressTarget = { mode: 'create' | 'update'; issueNumber?: number | null; prNumber?: number | null; commentId?: number | null };
+type ProgressTarget = {
+  mode: 'create' | 'update';
+  issueNumber?: number | null;
+  prNumber?: number | null;
+  commentId?: number | null;
+  afterCommentId?: number | null;
+  afterTimestamp?: string | null;
+};
 const CLAUDE_POLL_INTERVAL_MS = 5000;
 const CLAUDE_LOADING_AUDIO_INTERVAL_MS = 6000;
 export interface AutoScrollState {
@@ -701,7 +708,13 @@ export default function IssueChat({
         issueUrl: result.issue_url,
         videoSummarySkipped,
       });
-      setProgressTarget({ mode: 'update', prNumber: result.pr_number ?? selectedIssue?.number, commentId: result.comment_id });
+      setProgressTarget({
+        mode: 'update',
+        prNumber: result.pr_number ?? selectedIssue?.number,
+        commentId: null,
+        afterCommentId: result.comment_id,
+        afterTimestamp: result.comment_created_at ?? null,
+      });
       resetConversation();
       return;
     }
@@ -849,7 +862,13 @@ export default function IssueChat({
             issueUrl: result.issue_url,
             videoSummarySkipped,
           });
-          setProgressTarget({ mode: 'update', prNumber: result.pr_number ?? selectedIssue.number, commentId: result.comment_id });
+          setProgressTarget({
+            mode: 'update',
+            prNumber: result.pr_number ?? selectedIssue.number,
+            commentId: null,
+            afterCommentId: result.comment_id,
+            afterTimestamp: result.comment_created_at ?? null,
+          });
           resetConversation();
         } else {
           const message = result.status === 'error' ? result.error : 'Failed to send update';

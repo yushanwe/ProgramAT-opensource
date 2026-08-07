@@ -181,6 +181,70 @@ describe('IssueChat progress', () => {
     expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(callCountBeforeUnmount);
   });
 
+  test('update polling passes the current update request boundary and waits quietly before a new Claude comment exists', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 142,
+      issue_url: 'https://github.test/issues/142',
+      video_summary: '',
+      pr_number: 242,
+      comment_id: 9001,
+      comment_created_at: '2026-08-07T12:00:00Z',
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'waiting_for_comment',
+        issue_number: 242,
+        comment_id: null,
+        body: '',
+        message: 'Claude progress comment has not been created yet.',
+        steps: [],
+        updated_at: null,
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 242,
+        comment_id: 9002,
+        updated_at: '2026-08-07T12:00:10Z',
+        body: 'New Claude update after this request',
+        message: 'Claude comment available.',
+        steps: [],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 142, title: 'PR 142' }} />);
+    });
+
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Please update the tool');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+
+    expect(mockFetchClaudeProgress).toHaveBeenCalledWith({
+      mode: 'update',
+      prNumber: 242,
+      commentId: null,
+      afterCommentId: 9001,
+      afterTimestamp: '2026-08-07T12:00:00Z',
+    });
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain('New Claude update after this request');
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+
+    const rendered = JSON.stringify(renderer!.toJSON());
+    expect(rendered).toContain('New Claude update after this request');
+    expect(rendered).not.toContain('Claude progress comment has not been created yet.');
+  });
+
   test('renders section-level VoiceOver nodes for Claude progress and announces active step once', async () => {
     mockSubmitUpdate.mockResolvedValue({
       status: 'updated',
@@ -738,6 +802,71 @@ describe('IssueChat progress', () => {
     const updateJson = JSON.stringify(updateRenderer!.toJSON());
     expect(updateJson).toContain('Issue #13 updated.');
     expect(updateJson).toContain('Claude update progress');
+  });
+
+  test('update continues using one in-flow Claude message while newer poll responses replace older waiting state', async () => {
+    mockSubmitUpdate.mockResolvedValue({
+      status: 'updated',
+      issue_number: 88,
+      issue_url: 'https://github.test/issues/88',
+      video_summary: '',
+      pr_number: 188,
+      comment_id: 5001,
+      comment_created_at: '2026-08-07T13:00:00Z',
+    });
+    mockFetchClaudeProgress
+      .mockResolvedValueOnce({
+        status: 'waiting_for_comment',
+        issue_number: 188,
+        comment_id: null,
+        body: '',
+        message: 'Claude progress comment has not been created yet.',
+        steps: [],
+        updated_at: null,
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 188,
+        comment_id: 5002,
+        updated_at: '2026-08-07T13:00:05Z',
+        body: '### Progress\n- [ ] Build tool',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'in_progress' }],
+      })
+      .mockResolvedValueOnce({
+        status: 'available',
+        issue_number: 188,
+        comment_id: 5002,
+        updated_at: '2026-08-07T13:00:15Z',
+        body: '### Progress\n- [x] Build tool\n\n### Recent work\nValidated output.',
+        message: 'Claude comment available.',
+        steps: [{ id: 'step_1', label: 'Build tool', raw_label: 'Build tool', status: 'completed' }],
+      });
+
+    let renderer: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = renderWithTheme(<IssueChat selectedIssue={{ number: 88, title: 'PR 88' }} />);
+    });
+    const input = renderer!.root.findByType(TextInput);
+    await act(async () => {
+      input.props.onChangeText('Update it');
+    });
+    const sendButton = renderer!.root.findAllByType(TouchableOpacity).find((node) => node.props.accessibilityLabel === 'Send text');
+    await act(async () => {
+      sendButton!.props.onPress();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+
+    const claudeLabels = renderer!.root.findAll((node) => node.type === 'Text' && node.props?.children === 'Claude');
+    expect(claudeLabels).toHaveLength(1);
+    expect(JSON.stringify(renderer!.toJSON())).toContain('Validated output.');
   });
 
   test('does not overlap loading audio while the previous audio is still playing', async () => {
