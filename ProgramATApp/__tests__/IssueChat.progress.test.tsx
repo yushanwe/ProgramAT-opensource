@@ -316,14 +316,18 @@ describe('IssueChat Claude progress', () => {
     expect(JSON.stringify(renderer.toJSON())).not.toContain('Added the split summary and expert rendering path.');
 
     const toggleButtons = renderer.root.findAllByType(TouchableOpacity)
-      .filter((node) => node.props.accessibilityRole === 'button' && /expert details/i.test(node.props.accessibilityLabel || ''));
+      .filter((node) => node.props.accessibilityRole === 'button' && /expand|collapse/i.test(node.props.accessibilityLabel || ''));
     expect(toggleButtons).toHaveLength(2);
+    expect(toggleButtons[0].props.accessibilityLabel).toBe('Expand');
     expect(toggleButtons[0].props.accessibilityState).toEqual({ expanded: false });
 
     await act(async () => {
       toggleButtons[0].props.onPress();
     });
 
+    const expandedButtons = renderer.root.findAllByType(TouchableOpacity)
+      .filter((node) => node.props.accessibilityRole === 'button' && /expand|collapse/i.test(node.props.accessibilityLabel || ''));
+    expect(expandedButtons[0].props.accessibilityLabel).toBe('Collapse');
     expect(JSON.stringify(renderer.toJSON())).toContain('Comparing the polling flow now.');
     expect(JSON.stringify(renderer.toJSON())).not.toContain('Added the split summary and expert rendering path.');
   });

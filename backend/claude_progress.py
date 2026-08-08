@@ -48,6 +48,9 @@ def _extract_delimited_section(body: str, start_marker: str, end_marker: str) ->
 def _split_progress_content(body: str) -> tuple[Optional[str], Optional[str]]:
     summary_text = _extract_delimited_section(body, USER_SUMMARY_START, USER_SUMMARY_END)
     expert_markdown = _extract_delimited_section(body, EXPERT_DETAIL_START, EXPERT_DETAIL_END)
+    if summary_text is None and expert_markdown is not None:
+        summary_prefix = body.split(EXPERT_DETAIL_START, 1)[0].strip()
+        summary_text = summary_prefix or None
     return summary_text, expert_markdown
 
 

@@ -95,6 +95,20 @@ Comparing the runtime input path.
         self.assertEqual(parsed["summary_text"], "25% Processing CLAUDE.md\n\nInspecting the existing implementation.")
         self.assertEqual(parsed["expert_markdown"], "")
 
+    def test_parse_uses_prefix_as_summary_when_only_expert_marker_exists(self):
+        parsed = parse_claude_progress_comment(
+            """25% Processing CLAUDE.md
+
+I found the runtime input path.
+
+<!-- EXPERT_DETAIL_START -->
+### Current analysis
+Comparing the runtime path now.
+<!-- EXPERT_DETAIL_END -->"""
+        )
+        self.assertEqual(parsed["summary_text"], "25% Processing CLAUDE.md\n\nI found the runtime input path.")
+        self.assertEqual(parsed["expert_markdown"], "### Current analysis\nComparing the runtime path now.")
+
     def test_create_issue_comment_lookup(self):
         comments = [
             make_comment(1, "someone", "regular user comment"),

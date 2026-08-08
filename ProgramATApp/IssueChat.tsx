@@ -1364,9 +1364,9 @@ export default function IssueChat({
                 accessible={true}
                 accessibilityRole="button"
                 accessibilityState={{ expanded: !!item.expertExpanded }}
-                accessibilityLabel={item.expertExpanded ? 'Hide expert details' : 'Show expert details'}>
+                accessibilityLabel={item.expertExpanded ? 'Collapse' : 'Expand'}>
                 <Text style={[styles.expertToggleText, { color: theme.primary }]}>
-                  {item.expertExpanded ? 'Hide expert details' : 'Show expert details'}
+                  {item.expertExpanded ? 'Collapse' : 'Expand'}
                 </Text>
               </TouchableOpacity>
             )}
