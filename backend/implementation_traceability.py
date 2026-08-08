@@ -248,7 +248,7 @@ def extract_implementation_summary(comment_body: str) -> Dict[str, Any]:
     text = comment_body or ''
     parsed = parse_claude_progress_comment(text)
     summary: Dict[str, Any] = {}
-    body = parsed.get('body') or text
+    body = parsed.get('expert_markdown') or parsed.get('body') or text
     section_match = re.search(
         r'###\s*Implementation summary\s*(.*?)(?:\n###\s|\Z)',
         body,

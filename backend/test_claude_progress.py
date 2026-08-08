@@ -63,6 +63,76 @@ class ClaudeProgressTests(unittest.TestCase):
         self.assertEqual(parsed["status"], "available")
         self.assertIn("PR #123", parsed["body"])
 
+    def test_parse_delimited_summary_and_expert_content(self):
+        parsed = parse_claude_progress_comment(
+            """<!-- USER_SUMMARY_START -->
+25% Processing CLAUDE.md
+
+I found the current runtime input flow.
+Next I will validate the update.
+<!-- USER_SUMMARY_END -->
+
+<!-- EXPERT_DETAIL_START -->
+### Progress
+
+- [x] Read issue and repository CLAUDE.md
+- [ ] Validate the generated tool
+
+### Current analysis
+
+Comparing the runtime input path.
+<!-- EXPERT_DETAIL_END -->"""
+        )
+        self.assertEqual(parsed["summary_text"], "25% Processing CLAUDE.md\n\nI found the current runtime input flow.\nNext I will validate the update.")
+        self.assertIn("### Progress", parsed["expert_markdown"])
+        self.assertEqual(parsed["status_line"]["percent"], 25)
+        self.assertEqual(parsed["steps"][1]["status"], "in_progress")
+
+    def test_parse_without_delimiters_falls_back_to_full_body_summary(self):
+        parsed = parse_claude_progress_comment(
+            "25% Processing CLAUDE.md\n\nInspecting the existing implementation."
+        )
+        self.assertEqual(parsed["summary_text"], "25% Processing CLAUDE.md\n\nInspecting the existing implementation.")
+        self.assertEqual(parsed["expert_markdown"], "")
+
+    def test_parse_uses_prefix_as_summary_when_only_expert_marker_exists(self):
+        parsed = parse_claude_progress_comment(
+            """25% Processing CLAUDE.md
+
+I found the runtime input path.
+
+<!-- EXPERT_DETAIL_START -->
+### Current analysis
+Comparing the runtime path now.
+<!-- EXPERT_DETAIL_END -->"""
+        )
+        self.assertEqual(parsed["summary_text"], "25% Processing CLAUDE.md\n\nI found the runtime input path.")
+        self.assertEqual(parsed["expert_markdown"], "### Current analysis\nComparing the runtime path now.")
+
+    def test_parse_splits_at_progress_heading_without_markers(self):
+        parsed = parse_claude_progress_comment(
+            """50% Implementing runtime input
+
+I found that the current streaming handler does not preserve the user criteria.
+I'm updating the state handoff now.
+Next I will validate both streaming and Take Photo.
+
+### Progress
+- [x] Inspected existing runtime input flow
+- [ ] Update streaming handler
+
+### Current analysis
+Tracing the state handoff.
+"""
+        )
+        self.assertEqual(
+            parsed["summary_text"],
+            "50% Implementing runtime input\n\nI found that the current streaming handler does not preserve the user criteria.\nI'm updating the state handoff now.\nNext I will validate both streaming and Take Photo."
+        )
+        self.assertTrue(parsed["expert_markdown"].startswith("### Progress"))
+        self.assertIn("### Current analysis", parsed["expert_markdown"])
+        self.assertEqual(parsed["steps"][1]["status"], "in_progress")
+
     def test_create_issue_comment_lookup(self):
         comments = [
             make_comment(1, "someone", "regular user comment"),

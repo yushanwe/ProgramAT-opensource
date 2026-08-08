@@ -26,6 +26,7 @@ import {
   Modal,
   NativeModules,
   Alert,
+  findNodeHandle,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { launchImageLibrary } from 'react-native-image-picker';
@@ -39,6 +40,7 @@ import {
   buildClaudeAccessibilitySections,
   buildClaudeAccessibilityLabel,
   getChangedClaudeAnnouncement,
+  parseClaudeMessage,
   sanitizeClaudeCommentBody,
 } from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
@@ -62,30 +64,31 @@ type ProgressTarget = {
   afterCommentId?: number | null;
   afterTimestamp?: string | null;
 };
-const CLAUDE_POLL_INTERVAL_MS = 5000;
+const CLAUDE_POLL_INTERVAL_MS = 6000;
 const CLAUDE_LOADING_AUDIO_INTERVAL_MS = 6000;
-export interface AutoScrollState {
-  itemCount: number;
-  lastItemId: string | null;
-}
-
-export function shouldAutoScrollForNewItems(previousState: AutoScrollState, nextState: AutoScrollState): boolean {
-  return nextState.itemCount > previousState.itemCount
-    || (nextState.lastItemId !== null && nextState.lastItemId !== previousState.lastItemId);
-}
-
-function buildProgressAnnouncement(status: string, label: string): string {
-  if (status === 'completed') return `Completed: ${label}`;
-  if (status === 'in_progress') return `In progress: ${label}`;
-  if (status === 'failed') return `Failed: ${label}`;
-  return `Pending: ${label}`;
-}
 
 function summarizeClaudeAnnouncement(progress: ClaudeProgressResponse): string {
   if (progress.status === 'waiting_for_comment') return 'Claude has not posted a progress comment yet.';
   if (progress.status === 'failed') return 'Claude posted a failed status update.';
   if (progress.status === 'completed') return 'Claude posted a completed status update.';
   return 'Claude updated progress.';
+}
+
+function buildClaudeVersionKey(progress: ClaudeProgressResponse): string | null {
+  if (progress.status === 'waiting_for_comment') {
+    return `waiting:${progress.issue_number || 'none'}:${progress.comment_id || 'none'}`;
+  }
+  const body = sanitizeClaudeCommentBody(progress.body);
+  if (!body) return null;
+  return `${progress.comment_id || 'none'}:${body}`;
+}
+
+function buildClaudeAnnouncement(progress: ClaudeProgressResponse, previousBody: string): string {
+  const changedSectionAnnouncement = getChangedClaudeAnnouncement(previousBody, progress.expert_markdown || progress.body);
+  if (changedSectionAnnouncement) return changedSectionAnnouncement;
+  if (progress.status_line?.text) return progress.status_line.text;
+  if (progress.summary_text) return progress.summary_text.split('\n')[0]?.trim() || summarizeClaudeAnnouncement(progress);
+  return summarizeClaudeAnnouncement(progress);
 }
 
 function hasClaudeCompletionLikeText(progress: ClaudeProgressResponse | null): boolean {
@@ -100,9 +103,18 @@ function hasClaudeCompletionLikeText(progress: ClaudeProgressResponse | null): b
     || combined.includes('done');
 }
 
-function formatClaudeBody(body: string | undefined): string {
-  const value = sanitizeClaudeCommentBody(body);
-  return value || 'Claude has not posted a progress comment yet.';
+function formatClaudeBody(progress: ClaudeProgressResponse): string {
+  if (progress.status === 'waiting_for_comment') {
+    return "Claude hasn't posted any comments yet.";
+  }
+  const parsed = parseClaudeMessage(progress.body || progress.summary_text);
+  const value = parsed.summaryMarkdown || sanitizeClaudeCommentBody(progress.summary_text || progress.body);
+  return value || "Claude hasn't posted any comments yet.";
+}
+
+function formatClaudeExpertMarkdown(progress: ClaudeProgressResponse): string {
+  const parsed = parseClaudeMessage(progress.body || progress.summary_text);
+  return parsed.expertMarkdown || sanitizeClaudeCommentBody(progress.expert_markdown);
 }
 
 function extractCreateToolName(summary: string | null): string | null {
@@ -184,21 +196,17 @@ export default function IssueChat({
   const scrollViewRef = useRef<ScrollView>(null);
   const composeInputRef = useRef<RNTextInput>(null);
   const lastAnnouncedIdRef = useRef<string | null>(null);
-  const lastAnnouncedProgressStepRef = useRef<string | null>(null);
+  const lastAnnouncedClaudeVersionRef = useRef<string | null>(null);
+  const lastAppendedClaudeVersionRef = useRef<string | null>(null);
   const progressPollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const claudeLoadingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const claudeLoadingLoopTokenRef = useRef(0);
-  const claudeProgressItemIdRef = useRef<string | null>(null);
   const previousClaudeBodyRef = useRef<string>('');
   const latestClaudePollRequestIdRef = useRef(0);
   const latestClaudeAppliedRequestIdRef = useRef(0);
   const latestClaudeAppliedUpdatedAtRef = useRef<number | null>(null);
-  const hasClaudeMessageRef = useRef(false);
-  const allowNextClaudeAutoFollowRef = useRef(false);
-  const lastAutoScrollStateRef = useRef<{ itemCount: number; lastItemId: string | null }>({
-    itemCount: 0,
-    lastItemId: null,
-  });
+  const pendingClaudeFocusItemIdRef = useRef<string | null>(null);
+  const claudeMessageRefs = useRef<Record<string, View | null>>({});
   const createToolName = extractCreateToolName(understandingSummary);
   const modeBannerText = isCreateMode
     ? createToolName
@@ -239,29 +247,21 @@ export default function IssueChat({
     return () => clearTimeout(timeout);
   }, [isCreateMode, selectedIssue?.title]);
 
-  // Auto-scroll to the newest message only when a new chat item is appended.
-  // In-place Claude progress updates intentionally preserve the user's position.
   useEffect(() => {
-    const lastItem = items[items.length - 1];
-    const nextState = {
-      itemCount: items.length,
-      lastItemId: lastItem?.id || null,
-    };
-    const previousState = lastAutoScrollStateRef.current;
-    const appendedMessage = shouldAutoScrollForNewItems(previousState, nextState);
-
-    const shouldAutoFollow = appendedMessage
-      && scrollViewRef.current
-      && (!hasClaudeMessageRef.current || allowNextClaudeAutoFollowRef.current);
-
-    if (shouldAutoFollow) {
+    const itemId = pendingClaudeFocusItemIdRef.current;
+    if (!itemId) return;
+    pendingClaudeFocusItemIdRef.current = null;
+    if (scrollViewRef.current) {
       setTimeout(() => {
         scrollViewRef.current?.scrollToEnd({ animated: true });
+        const target = claudeMessageRefs.current[itemId];
+        const nodeHandle = target ? findNodeHandle(target) : null;
+        if (nodeHandle) {
+          (AccessibilityInfo as any).setAccessibilityFocus?.(nodeHandle);
+        }
       }, 100);
-      allowNextClaudeAutoFollowRef.current = false;
     }
-    lastAutoScrollStateRef.current = nextState;
-  }, [items, progressText, isSending]);
+  }, [items]);
 
   // Loading sound while a request is in flight — video uploads can take
   // 15+ seconds to summarize, and the "Thinking…" bubble alone isn't audible.
@@ -332,14 +332,11 @@ export default function IssueChat({
 
   useEffect(() => {
     if (!claudeProgress) return;
-    const changedSectionAnnouncement = getChangedClaudeAnnouncement(previousClaudeBodyRef.current, claudeProgress.body);
-    const activeStep = claudeProgress.steps.find((step) => step.status === 'in_progress' || step.status === 'failed');
-    const announcement = changedSectionAnnouncement
-      || (activeStep ? buildProgressAnnouncement(activeStep.status, activeStep.label) : summarizeClaudeAnnouncement(claudeProgress));
-    const announcementKey = `${claudeProgress.comment_id || 'none'}:${claudeProgress.updated_at || claudeProgress.status}:${announcement}`;
-    if (lastAnnouncedProgressStepRef.current === announcementKey) return;
-    lastAnnouncedProgressStepRef.current = announcementKey;
-    previousClaudeBodyRef.current = claudeProgress.body || '';
+    const versionKey = buildClaudeVersionKey(claudeProgress);
+    if (!versionKey || lastAnnouncedClaudeVersionRef.current === versionKey) return;
+    lastAnnouncedClaudeVersionRef.current = versionKey;
+    const announcement = buildClaudeAnnouncement(claudeProgress, previousClaudeBodyRef.current);
+    previousClaudeBodyRef.current = claudeProgress.expert_markdown || claudeProgress.body || '';
     AccessibilityInfo.announceForAccessibility(announcement);
   }, [claudeProgress]);
 
@@ -425,7 +422,8 @@ export default function IssueChat({
 
     clearPoll();
     setClaudeProgress(null);
-    lastAnnouncedProgressStepRef.current = null;
+    lastAnnouncedClaudeVersionRef.current = null;
+    lastAppendedClaudeVersionRef.current = null;
     latestClaudePollRequestIdRef.current = 0;
     latestClaudeAppliedRequestIdRef.current = 0;
     latestClaudeAppliedUpdatedAtRef.current = null;
@@ -446,7 +444,7 @@ export default function IssueChat({
 
   useEffect(() => {
     if (!claudeProgress || !progressTarget) return;
-    upsertClaudeProgressItem(claudeProgress);
+    appendClaudeProgressItem(claudeProgress);
   }, [claudeProgress, progressTarget]);
 
   // Listen for WS 'progress' broadcasts fired by the backend while an HTTP
@@ -475,42 +473,42 @@ export default function IssueChat({
 
   const append = (item: IssueChatItem) => setItems((prev) => [...prev, item]);
 
-  const upsertClaudeProgressItem = (progress: ClaudeProgressResponse) => {
-    const body = formatClaudeBody(progress.body);
+  const appendClaudeProgressItem = (progress: ClaudeProgressResponse) => {
+    const summaryText = formatClaudeBody(progress);
+    const expertMarkdown = formatClaudeExpertMarkdown(progress);
+    const versionKey = buildClaudeVersionKey(progress);
+    if (!versionKey) return;
+    if (lastAppendedClaudeVersionRef.current === versionKey) return;
+    lastAppendedClaudeVersionRef.current = versionKey;
     setItems((prev) => {
-      const existingId = claudeProgressItemIdRef.current
-        || prev.find((item) => item.kind === 'assistant-claude-progress')?.id
-        || null;
-      if (!existingId) {
-        hasClaudeMessageRef.current = true;
-        allowNextClaudeAutoFollowRef.current = true;
-        const id = nextId('assistant-claude-progress');
-        claudeProgressItemIdRef.current = id;
-        return [...prev, {
-          kind: 'assistant-claude-progress',
-          id,
-          ts: new Date(),
-          status: progress.status,
-          body,
-          commentId: progress.comment_id,
-          updatedAt: progress.updated_at,
-          message: progress.message,
-        }];
-      }
-      return prev.map((item) => {
-        if (item.kind !== 'assistant-claude-progress' || item.id !== existingId) return item;
-        claudeProgressItemIdRef.current = existingId;
-        return {
-          ...item,
-          ts: new Date(),
-          status: progress.status,
-          body,
-          commentId: progress.comment_id,
-          updatedAt: progress.updated_at,
-          message: progress.message,
-        };
-      });
+      const duplicate = prev.some((item) =>
+        item.kind === 'assistant-claude-progress' && item.versionKey === versionKey
+      );
+      if (duplicate) return prev;
+      const id = nextId('assistant-claude-progress');
+      pendingClaudeFocusItemIdRef.current = id;
+      return [...prev, {
+        kind: 'assistant-claude-progress',
+        id,
+        ts: new Date(),
+        status: progress.status,
+        body: summaryText,
+        summaryText,
+        expertMarkdown,
+        expertExpanded: false,
+        commentId: progress.comment_id,
+        updatedAt: progress.updated_at,
+        message: progress.message,
+        versionKey,
+      }];
     });
+  };
+
+  const toggleClaudeExpertDetails = (itemId: string) => {
+    setItems((prev) => prev.map((item) => {
+      if (item.kind !== 'assistant-claude-progress' || item.id !== itemId) return item;
+      return { ...item, expertExpanded: !item.expertExpanded };
+    }));
   };
 
   const resolveLatestChoicePrompt = () => {
@@ -1077,30 +1075,27 @@ export default function IssueChat({
     setStagedVideoSource(null);
     setClaudeProgress(null);
     setProgressTarget(null);
-    claudeProgressItemIdRef.current = null;
     previousClaudeBodyRef.current = '';
+    lastAnnouncedClaudeVersionRef.current = null;
+    lastAppendedClaudeVersionRef.current = null;
     latestClaudePollRequestIdRef.current = 0;
     latestClaudeAppliedRequestIdRef.current = 0;
     latestClaudeAppliedUpdatedAtRef.current = null;
-    hasClaudeMessageRef.current = false;
-    allowNextClaudeAutoFollowRef.current = false;
-    lastAutoScrollStateRef.current = { itemCount: 0, lastItemId: null };
+    pendingClaudeFocusItemIdRef.current = null;
+    claudeMessageRefs.current = {};
     resetConversation();
     Keyboard.dismiss();
   };
 
   useEffect(() => {
-    hasClaudeMessageRef.current = false;
-    allowNextClaudeAutoFollowRef.current = false;
-    claudeProgressItemIdRef.current = null;
     previousClaudeBodyRef.current = '';
+    lastAnnouncedClaudeVersionRef.current = null;
+    lastAppendedClaudeVersionRef.current = null;
     latestClaudePollRequestIdRef.current = 0;
     latestClaudeAppliedRequestIdRef.current = 0;
     latestClaudeAppliedUpdatedAtRef.current = null;
-    lastAutoScrollStateRef.current = {
-      itemCount: items.length,
-      lastItemId: items[items.length - 1]?.id || null,
-    };
+    pendingClaudeFocusItemIdRef.current = null;
+    claudeMessageRefs.current = {};
   }, [isCreateMode, selectedIssue?.number]);
 
   // A staged video needs a caption — an empty/placeholder caption feeds
@@ -1296,12 +1291,17 @@ export default function IssueChat({
         );
       }
       case 'assistant-claude-progress': {
-        const accessibilityLabel = buildClaudeAccessibilityLabel(item.body, item.message);
-        const accessibilitySections = buildClaudeAccessibilitySections(item.body);
+        const summaryAccessibilityLabel = buildClaudeAccessibilityLabel(item.summaryText, item.message);
+        const summarySections = buildClaudeAccessibilitySections(item.summaryText);
+        const expertSections = buildClaudeAccessibilitySections(item.expertMarkdown);
+        const hasExpertDetails = expertSections.length > 0;
         return (
           <View
             key={item.id}
             testID={`claude-progress-${item.id}`}
+            ref={(node) => {
+              claudeMessageRefs.current[item.id] = node;
+            }}
             style={[styles.messageContainer, styles.assistantAlign, { backgroundColor: theme.card, borderColor: theme.border }]}
             accessible={false}>
             <Text
@@ -1311,19 +1311,19 @@ export default function IssueChat({
               accessibilityLabel="Claude">
               Claude
             </Text>
-            {accessibilitySections.map((section, sectionIndex) => (
+            {summarySections.map((section, sectionIndex) => (
               <View
-                key={`${item.id}_section_${sectionIndex}`}
+                key={`${item.id}_summary_section_${sectionIndex}`}
                 accessible={true}
                 accessibilityRole="text"
                 accessibilityLabel={section.label}>
                 {section.lines.map((line, lineIndex) => {
                   if (line.kind === 'blank') {
-                    return <View key={`${item.id}_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
+                    return <View key={`${item.id}_summary_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
                   }
                   return (
                     <Text
-                      key={`${item.id}_${sectionIndex}_${lineIndex}`}
+                      key={`${item.id}_summary_${sectionIndex}_${lineIndex}`}
                       style={[
                         line.kind === 'heading'
                           ? [styles.claudeHeadingText, { color: theme.text }]
@@ -1332,13 +1332,56 @@ export default function IssueChat({
                       selectable={true}
                       accessible={false}
                       accessibilityRole="text"
-                      accessibilityLabel={accessibilityLabel}>
+                      accessibilityLabel={summaryAccessibilityLabel}>
                       {line.text}
                     </Text>
                   );
                 })}
               </View>
             ))}
+            {hasExpertDetails && (
+              <TouchableOpacity
+                style={styles.expertToggleButton}
+                onPress={() => toggleClaudeExpertDetails(item.id)}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityState={{ expanded: !!item.expertExpanded }}
+                accessibilityLabel={item.expertExpanded ? 'Collapse expert details' : 'Expand expert details'}>
+                <Text style={[styles.expertToggleText, { color: theme.primary }]}>
+                  {item.expertExpanded ? 'Collapse' : 'Expand'}
+                </Text>
+              </TouchableOpacity>
+            )}
+            {hasExpertDetails && item.expertExpanded && (
+              <View style={styles.expertDetailsContainer} accessible={false}>
+                {expertSections.map((section, sectionIndex) => (
+                  <View
+                    key={`${item.id}_expert_section_${sectionIndex}`}
+                    accessible={true}
+                    accessibilityRole="text"
+                    accessibilityLabel={section.label}>
+                    {section.lines.map((line, lineIndex) => {
+                      if (line.kind === 'blank') {
+                        return <View key={`${item.id}_expert_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
+                      }
+                      return (
+                        <Text
+                          key={`${item.id}_expert_${sectionIndex}_${lineIndex}`}
+                          style={[
+                            line.kind === 'heading'
+                              ? [styles.claudeHeadingText, { color: theme.text }]
+                              : [styles.messageText, { color: theme.text }],
+                          ]}
+                          selectable={true}
+                          accessible={false}>
+                          {line.text}
+                        </Text>
+                      );
+                    })}
+                  </View>
+                ))}
+              </View>
+            )}
             <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
               {item.ts.toLocaleTimeString()}
             </Text>
@@ -1881,6 +1924,18 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
     marginBottom: 6,
+  },
+  expertToggleButton: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    paddingVertical: 4,
+  },
+  expertToggleText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  expertDetailsContainer: {
+    marginTop: 10,
   },
   claudeAccessibilityOnly: {
     position: 'absolute',
