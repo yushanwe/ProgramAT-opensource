@@ -85,13 +85,21 @@ jobs:
             instruction source of truth. The issue body, latest request comment,
             and root `CLAUDE.md` are the authoritative requirements.
             Maintain the workflow's single existing GitHub progress comment and
-            update it in place after meaningful work or decisions. Keep a compact
-            checklist plus concise sections such as Current analysis,
-            Implementation decisions, Recent work, and Next step. Overwrite those
-            evolving sections instead of appending unlimited history. Summarize
-            observable decisions, evidence, alternatives, uncertainty, recent
-            work, and next actions without exposing hidden chain-of-thought, raw
-            command logs, token details, or long internal traces.
+            update it in place after meaningful work or decisions. Use the same
+            two-level progress format in both Create and Update work:
+            1. A concise end-user block at the top with one `NN% Short status`
+               line followed by 2-3 short progress sentences.
+            2. A detailed expert block underneath with sections such as
+               `### Progress`, `### Current analysis`,
+               `### Implementation decisions`, `### Recent work`, and
+               `### Next step`.
+            At completion, use `100% Complete`, a short end-user-facing
+            completion summary, and `### Implementation summary` for the
+            detailed block. Overwrite evolving sections instead of appending
+            unlimited history. Summarize observable decisions, evidence,
+            alternatives, uncertainty, recent work, and next actions without
+            exposing hidden chain-of-thought, raw command logs, token details,
+            or long internal traces.
             Before implementing any temporal or multi-frame Streaming tool,
             inspect the relevant repository runtime and existing tool patterns
             referenced by `CLAUDE.md` rather than inventing scheduling from scratch.

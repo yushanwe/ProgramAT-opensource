@@ -4,6 +4,12 @@ from typing import Optional
 
 
 CHECKLIST_LINE_RE = re.compile(r'^\s*[-*]\s+\[(?P<checked>[ xX])\]\s+(?P<label>.+?)\s*$', re.MULTILINE)
+STATUS_LINE_RE = re.compile(r'^\s*(?P<percent>\d{1,3})%\s+(?P<label>[^\n]+?)\s*$')
+USER_SUMMARY_START = '<!-- USER_SUMMARY_START -->'
+USER_SUMMARY_END = '<!-- USER_SUMMARY_END -->'
+EXPERT_DETAIL_START = '<!-- EXPERT_DETAIL_START -->'
+EXPERT_DETAIL_END = '<!-- EXPERT_DETAIL_END -->'
+PROGRESS_HEADING_RE = re.compile(r'^\s{0,3}#{1,6}\s+Progress\s*$', re.IGNORECASE | re.MULTILINE)
 FAILURE_PATTERNS = (
     re.compile(r'\b(failed|failure|error|exception|traceback|unable to|could not|blocked)\b', re.IGNORECASE),
     re.compile(r'(^|\n)\s*status\s*:\s*failed\b', re.IGNORECASE),
@@ -25,6 +31,35 @@ CLAUDE_PROGRESS_MARKERS = (
     'pull request',
     'pr #',
 )
+
+
+def _extract_delimited_section(body: str, start_marker: str, end_marker: str) -> Optional[str]:
+    if not body or start_marker not in body:
+        return None
+    start = body.find(start_marker)
+    if start < 0:
+        return None
+    start += len(start_marker)
+    end = body.find(end_marker, start)
+    if end < 0:
+        end = len(body)
+    return body[start:end].strip()
+
+
+def _split_progress_content(body: str) -> tuple[Optional[str], Optional[str]]:
+    summary_text = _extract_delimited_section(body, USER_SUMMARY_START, USER_SUMMARY_END)
+    expert_markdown = _extract_delimited_section(body, EXPERT_DETAIL_START, EXPERT_DETAIL_END)
+    if summary_text is not None or expert_markdown is not None:
+        if summary_text is None and expert_markdown is not None:
+            summary_prefix = body.split(EXPERT_DETAIL_START, 1)[0].strip()
+            summary_text = summary_prefix or None
+        return summary_text, expert_markdown
+
+    progress_match = PROGRESS_HEADING_RE.search(body or '')
+    if progress_match:
+        summary_text = (body or '')[:progress_match.start()].strip() or None
+        expert_markdown = (body or '')[progress_match.start():].strip() or None
+    return summary_text, expert_markdown
 
 
 def normalize_progress_label(raw_label: str) -> str:
@@ -49,8 +84,12 @@ def normalize_progress_label(raw_label: str) -> str:
 def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = None,
                                   comment_id: Optional[int] = None,
                                   updated_at: Optional[str] = None) -> dict:
-    lines = body.splitlines()
+    summary_text, expert_markdown = _split_progress_content(body or '')
+    display_body = summary_text or body or ''
+    checklist_source = expert_markdown or body or ''
+    lines = checklist_source.splitlines()
     title = None
+    status_line = None
     steps = []
     first_pending_index = None
 
@@ -59,6 +98,17 @@ def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = No
             title_match = CLAUDE_PROGRESS_TITLE_RE.match(line)
             if title_match:
                 title = title_match.group(1).strip()
+    for line in display_body.splitlines():
+        if status_line is None:
+            status_match = STATUS_LINE_RE.match(line.strip())
+            if status_match:
+                percent = max(0, min(100, int(status_match.group('percent'))))
+                status_line = {
+                    'percent': percent,
+                    'label': status_match.group('label').strip(),
+                    'text': f"{percent}% {status_match.group('label').strip()}",
+                }
+    for line in lines:
         match = CHECKLIST_LINE_RE.match(line)
         if not match:
             continue
@@ -68,7 +118,7 @@ def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = No
         if not checked and first_pending_index is None:
             first_pending_index = len(steps) - 1
 
-    has_failure_text = any(pattern.search(body) for pattern in FAILURE_PATTERNS)
+    has_failure_text = any(pattern.search(checklist_source) or pattern.search(display_body) for pattern in FAILURE_PATTERNS)
     if has_failure_text:
         overall_status = 'failed'
     elif steps and all(step['completed'] for step in steps):
@@ -99,7 +149,10 @@ def parse_claude_progress_comment(body: str, *, issue_number: Optional[int] = No
         'issue_number': issue_number,
         'comment_id': comment_id,
         'body': body,
+        'summary_text': summary_text or display_body.strip(),
+        'expert_markdown': expert_markdown or '',
         'steps': normalized_steps,
+        'status_line': status_line,
         'updated_at': updated_at,
     }
 
@@ -110,7 +163,7 @@ def looks_like_claude_progress_comment(comment) -> bool:
     if user.lower() not in CLAUDE_PROGRESS_COMMENT_USERNAMES:
         return False
     lowered = body.lower()
-    return bool(CHECKLIST_LINE_RE.search(body)) or any(marker in lowered for marker in CLAUDE_PROGRESS_MARKERS)
+    return bool(CHECKLIST_LINE_RE.search(body)) or bool(STATUS_LINE_RE.search(body)) or any(marker in lowered for marker in CLAUDE_PROGRESS_MARKERS)
 
 
 def _parse_comment_timestamp(comment) -> Optional[datetime]:

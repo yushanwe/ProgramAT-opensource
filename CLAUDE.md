@@ -199,14 +199,48 @@ Before finishing, verify:
 
 ## GitHub Progress Comment
 
-## GitHub Progress Comment
-
 Maintain the same single GitHub progress comment and update it in place.
 
-During work, keep a detailed progress checklist at the top. Break the work into concrete, meaningful steps so the checklist reflects what Claude has inspected, verified, changed, and tested, rather than only a few high-level phases. Update it frequently as work progresses.
+Every in-progress comment must contain both a concise user-summary block and an expert-detail block inside the same GitHub comment, using these exact stable delimiters:
 
-Below the checklist, write 1–4 short first-person progress sentences such as “I found…”, “I’m fixing…”, “I’m checking…”, or “I’m trying… next.” Briefly explain what Claude has just learned, why it matters, what it is doing now, and what it plans to check next. Prefer frequent incremental updates over long explanations.
+```markdown
+<!-- USER_SUMMARY_START -->
+25% Processing CLAUDE.md
 
-Do not add headings like `Current analysis` or `Working on...`. Avoid raw command logs, token details, exhaustive implementation dumps, or raw chain-of-thought.
+I found how the current runtime handles input.
+I'm updating the streaming path to preserve that value.
+Next I will validate both modes.
+<!-- USER_SUMMARY_END -->
 
-When finished and only when finished, replace the evolving work sections with a concise final summary, such as `### Summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
+<!-- EXPERT_DETAIL_START -->
+### Progress
+- [x] Read the issue and repository CLAUDE.md
+- [ ] Update the runtime-input handling
+- [ ] Validate the generated tool
+
+### Current analysis
+...
+
+### Implementation decisions
+- Model:
+- Model strategy:
+- Execution mode:
+- Runtime input:
+- Referenced tools:
+- Rationale:
+
+### Recent work
+...
+
+### Next step
+...
+<!-- EXPERT_DETAIL_END -->
+```
+
+The user-summary block is the default end-user-facing version. Keep it short, readable, and non-technical: typically one `NN% Task label` line followed by 1–4 short first-person sentences such as “I found…”, “I’m fixing…”, “I’m checking…”, or “Next I will…”.
+
+The expert-detail block is for richer implementation detail. Reuse the established technical structure with sections such as `### Progress`, `### Current analysis`, `### Implementation decisions`, `### Recent work`, `### Next step`, and when complete `### Implementation summary`.
+
+Update the expert-detail block after meaningful work or decisions. Break the checklist into concrete, meaningful steps so it reflects what Claude has inspected, verified, changed, and tested. Preserve durable technical choices in `Implementation decisions`, updating them only when the design changes materially.
+
+Do not expose raw command logs, token details, exhaustive implementation dumps, or raw chain-of-thought. When finished, keep the concise summary at the top and replace the evolving expert work sections with a concise final technical summary such as `### Implementation summary`, including the model, strategy, execution mode, runtime input, referenced tools or helpers, validation or tests run, files changed, and any important limitation.
