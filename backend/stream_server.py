@@ -4278,13 +4278,18 @@ def get_local_tools_for_pr_merge() -> list:
                         description = description[:200] + "..."
             
             tool_name = py_file.stem
+            try:
+                modified_at = datetime.fromtimestamp(py_file.stat().st_mtime).isoformat()
+            except OSError:
+                modified_at = None
             tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': f'tools/{py_file.name}',
                 'description': description,
                 'code': code,
                 'language': 'python',
-                'source': 'local'
+                'source': 'local',
+                'modified_at': modified_at,
             })
             _log_runtime_input_tool_source(
                 tool_record,
@@ -4494,7 +4499,18 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
                 'jsx': 'javascript'
             }
             language = language_map.get(file_ext, file_ext)
-            
+
+            # Most recent commit touching this specific file, so multiple
+            # tool files in the same PR can be ordered by which was actually
+            # created/changed most recently, rather than git-tree order.
+            modified_at = None
+            try:
+                file_commits = repo.get_commits(path=file_info['path'], sha=pr.head.sha)
+                last_commit = file_commits[0]
+                modified_at = last_commit.commit.author.date.isoformat()
+            except Exception as e:
+                logger.debug(f"Could not determine last-commit date for {file_info['path']}: {e}")
+
             tool_record = _inject_runtime_input_metadata({
                 'name': tool_name,
                 'path': file_info['path'],
@@ -4509,6 +4525,7 @@ def fetch_pr_tools_from_github(pr, repo) -> list:
                 'gpt_query': pr_gpt_query,
                 'system_instruction': pr_system_instruction,
                 'query_interval': pr_query_interval,
+                'modified_at': modified_at,
             })
             _log_runtime_input_tool_source(
                 tool_record,
@@ -4595,6 +4612,10 @@ def merge_local_and_pr_tools(local_tools: list, pr_tools: list, pr_number: int) 
             logger.warning(f"   - {warning}")
         logger.warning(f"   💡 Consider updating PR #{pr_number} branch to latest commits")
     
+    # Most recently modified tool first, so when a PR touches multiple tool
+    # files the one it's actually for surfaces at the top of the list.
+    merged_tools.sort(key=lambda t: t.get('modified_at') or '', reverse=True)
+
     logger.info(f"✅ Merged {len(merged_tools)} tools for PR #{pr_number} (prioritizing PR versions)")
     return merged_tools
 
