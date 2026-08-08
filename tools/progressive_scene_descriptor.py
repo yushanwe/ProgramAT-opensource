@@ -30,6 +30,15 @@ TOOL_PROMPT = (
     "Start with a brief list of main objects, then provide more detail "
     "if the scene remains stable."
 )
+TOOL_RUNTIME_INPUT = {
+    "key": "search_target",
+    "label": "What are you looking for?",
+    "placeholder": "e.g., my keys, a red mug, the exit sign",
+    "prompt_instruction": (
+        "The user is specifically looking for: {value}. "
+        "Focus on this target in your description and mention if you see it."
+    ),
+}
 
 # Scene stability configuration
 SCENE_SIMILARITY_THRESHOLD = 0.98
@@ -91,19 +100,28 @@ def is_same_scene(
     return cosine_similarity(reference, current) >= threshold
 
 
-async def analyze_brief(image: np.ndarray) -> str:
+async def analyze_brief(image: np.ndarray, search_target: str | None = None) -> str:
     """Generate brief object list for the scene.
 
     Args:
         image: OpenCV image to analyze
+        search_target: Optional specific object the user is looking for
 
     Returns:
         Brief description text or fallback
     """
+    prompt = BRIEF_PROMPT
+    if search_target:
+        prompt = (
+            f"{BRIEF_PROMPT} "
+            f"The user is specifically looking for: {search_target}. "
+            f"Focus on this target in your description and mention if you see it."
+        )
+
     response = await asyncio.to_thread(
         call_model,
         DEFAULT_MODEL,
-        [{"role": "user", "content": BRIEF_PROMPT}],
+        [{"role": "user", "content": prompt}],
         [image],
         {"timeout": 60, "num_retries": 0},
     )
@@ -111,19 +129,28 @@ async def analyze_brief(image: np.ndarray) -> str:
     return text or FALLBACK_TEXT
 
 
-async def analyze_detailed(image: np.ndarray) -> str:
+async def analyze_detailed(image: np.ndarray, search_target: str | None = None) -> str:
     """Generate detailed scene description.
 
     Args:
         image: OpenCV image to analyze
+        search_target: Optional specific object the user is looking for
 
     Returns:
         Detailed description text or fallback
     """
+    prompt = DETAILED_PROMPT
+    if search_target:
+        prompt = (
+            f"{DETAILED_PROMPT} "
+            f"The user is specifically looking for: {search_target}. "
+            f"Focus on this target in your description and mention if you see it."
+        )
+
     response = await asyncio.to_thread(
         call_model,
         DEFAULT_MODEL,
-        [{"role": "user", "content": DETAILED_PROMPT}],
+        [{"role": "user", "content": prompt}],
         [image],
         {"timeout": 60, "num_retries": 0},
     )
@@ -133,15 +160,24 @@ async def analyze_detailed(image: np.ndarray) -> str:
 
 async def on_take_photo(runtime, image, input_data):
     """Use brief description for one-shot Take Photo requests."""
-    del runtime, input_data
+    del runtime
     if image is None:
         return FALLBACK_TEXT
-    return await analyze_brief(image)
+
+    search_target = None
+    if isinstance(input_data, dict):
+        search_target = input_data.get(TOOL_RUNTIME_INPUT["key"])
+
+    return await analyze_brief(image, search_target)
 
 
 async def on_stream_start(runtime, input_data):
     """Initialize state for progressive streaming."""
-    del input_data
+    search_target = None
+    if isinstance(input_data, dict):
+        search_target = input_data.get(TOOL_RUNTIME_INPUT["key"])
+
+    runtime.set_state("search_target", search_target)
     runtime.set_state("scene_anchor", None)
     runtime.set_state("scene_generation", 0)
     runtime.set_state("brief_emitted", False)
@@ -199,11 +235,14 @@ async def on_frame(runtime, frame):
     if runtime.get_state("in_flight"):
         return
 
+    # Get search target from runtime state
+    search_target = runtime.get_state("search_target")
+
     # Stage 1: Emit brief description for new scene
     if not brief_emitted:
         runtime.set_state("in_flight", True)
         try:
-            text = await analyze_brief(frame.image)
+            text = await analyze_brief(frame.image, search_target)
             if not runtime.is_cancelled() and runtime.get_state("scene_generation") == generation:
                 await runtime.emit(text, partial=False, final=False)
                 runtime.set_state("brief_emitted", True)
@@ -215,7 +254,7 @@ async def on_frame(runtime, frame):
     if not detailed_emitted and stable_count >= STABILITY_FRAME_COUNT:
         runtime.set_state("in_flight", True)
         try:
-            text = await analyze_detailed(frame.image)
+            text = await analyze_detailed(frame.image, search_target)
             if not runtime.is_cancelled() and runtime.get_state("scene_generation") == generation:
                 await runtime.emit(text, partial=False, final=True)
                 runtime.set_state("detailed_emitted", True)
