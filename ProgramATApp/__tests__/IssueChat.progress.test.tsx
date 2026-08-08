@@ -6,6 +6,7 @@ import { ThemeProvider } from '../ThemeContext';
 import {
   buildClaudeAccessibilitySections,
   getChangedClaudeAnnouncement,
+  parseClaudeMessage,
   parseClaudeRenderLines,
   sanitizeClaudeCommentBody,
 } from '../claudeCommentSanitizer';
@@ -218,6 +219,39 @@ describe('IssueChat Claude progress', () => {
     expect(mockFetchClaudeProgress).toHaveBeenCalledTimes(2);
   });
 
+  test('appends the initial Claude waiting message before the first real Claude update', async () => {
+    const renderer = await sendUpdateAndStartPolling([
+      {
+        status: 'waiting_for_comment',
+        issue_number: 55,
+        comment_id: null,
+        body: '',
+        steps: [],
+        updated_at: null,
+      },
+      {
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-08T10:00:10Z',
+        body: '25% Inspecting existing implementation\n\nLooking at the polling flow now.\n\n### Progress\n- [ ] Validate behavior',
+        status_line: { percent: 25, label: 'Inspecting existing implementation', text: '25% Inspecting existing implementation' },
+        steps: [],
+      },
+    ]);
+
+    expect(JSON.stringify(renderer.toJSON())).toContain("Claude hasn't posted any comments yet.");
+
+    await act(async () => {
+      jest.advanceTimersByTime(6000);
+      await Promise.resolve();
+    });
+
+    const claudeCards = findClaudeCards(renderer);
+    expect(claudeCards).toHaveLength(2);
+    expect(JSON.stringify(renderer.toJSON())).toContain('25% Inspecting existing implementation');
+  });
+
   test('identical polls do not append duplicate Claude messages', async () => {
     const response = {
       status: 'available',
@@ -316,9 +350,9 @@ describe('IssueChat Claude progress', () => {
     expect(JSON.stringify(renderer.toJSON())).not.toContain('Added the split summary and expert rendering path.');
 
     const toggleButtons = renderer.root.findAllByType(TouchableOpacity)
-      .filter((node) => node.props.accessibilityRole === 'button' && /expand|collapse/i.test(node.props.accessibilityLabel || ''));
+      .filter((node) => node.props.accessibilityRole === 'button' && /expert details/i.test(node.props.accessibilityLabel || ''));
     expect(toggleButtons).toHaveLength(2);
-    expect(toggleButtons[0].props.accessibilityLabel).toBe('Expand');
+    expect(toggleButtons[0].props.accessibilityLabel).toBe('Expand expert details');
     expect(toggleButtons[0].props.accessibilityState).toEqual({ expanded: false });
 
     await act(async () => {
@@ -326,8 +360,8 @@ describe('IssueChat Claude progress', () => {
     });
 
     const expandedButtons = renderer.root.findAllByType(TouchableOpacity)
-      .filter((node) => node.props.accessibilityRole === 'button' && /expand|collapse/i.test(node.props.accessibilityLabel || ''));
-    expect(expandedButtons[0].props.accessibilityLabel).toBe('Collapse');
+      .filter((node) => node.props.accessibilityRole === 'button' && /expert details/i.test(node.props.accessibilityLabel || ''));
+    expect(expandedButtons[0].props.accessibilityLabel).toBe('Collapse expert details');
     expect(JSON.stringify(renderer.toJSON())).toContain('Comparing the polling flow now.');
     expect(JSON.stringify(renderer.toJSON())).not.toContain('Added the split summary and expert rendering path.');
   });
@@ -456,6 +490,27 @@ describe('Claude progress sanitizing and accessibility', () => {
     const lines = parseClaudeRenderLines('25% Inspecting existing implementation\nNext paragraph');
     expect(lines[0].text).toBe('25% Inspecting existing implementation');
     expect(lines[1].kind).toBe('paragraph');
+  });
+
+  test('parses Claude messages at the Progress heading boundary', () => {
+    const parsed = parseClaudeMessage(`25% Processing CLAUDE.md
+
+I have identified the runtime path.
+I'm checking the streaming handler.
+Next I will validate both modes.
+
+### Progress
+- [x] Read requirements
+
+### Current analysis
+Comparing the old and new paths.`);
+    expect(parsed.summaryMarkdown).toBe(`25% Processing CLAUDE.md
+
+I have identified the runtime path.
+I'm checking the streaming handler.
+Next I will validate both modes.`);
+    expect(parsed.expertMarkdown).toContain('### Progress');
+    expect(parsed.expertMarkdown).toContain('### Current analysis');
   });
 
   test('groups the status line and prose together for VoiceOver sections', () => {

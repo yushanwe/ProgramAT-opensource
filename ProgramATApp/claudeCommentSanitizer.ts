@@ -11,6 +11,9 @@ const HEADING_RE = /^#{1,6}\s+(.+?)\s*$/;
 const STATUS_LINE_RE = /^\s*(\d{1,3})%\s+(.+?)\s*$/;
 const USER_SUMMARY_MARKER_RE = /<!--\s*USER_SUMMARY_(?:START|END)\s*-->/gi;
 const EXPERT_DETAIL_MARKER_RE = /<!--\s*EXPERT_DETAIL_(?:START|END)\s*-->/gi;
+const PROGRESS_HEADING_RE = /^#{1,6}\s+progress\s*$/im;
+const USER_SUMMARY_BLOCK_RE = /<!--\s*USER_SUMMARY_START\s*-->([\s\S]*?)<!--\s*USER_SUMMARY_END\s*-->/i;
+const EXPERT_DETAIL_BLOCK_RE = /<!--\s*EXPERT_DETAIL_START\s*-->([\s\S]*?)<!--\s*EXPERT_DETAIL_END\s*-->/i;
 
 function decodeHtmlEntities(text: string): string {
   return text
@@ -74,6 +77,31 @@ export function sanitizeClaudeCommentBody(body: string | undefined | null): stri
   return cleaned.trim();
 }
 
+export function parseClaudeMessage(body: string | undefined | null): ParsedClaudeMessage {
+  const raw = body || '';
+  const summaryBlock = raw.match(USER_SUMMARY_BLOCK_RE)?.[1];
+  const expertBlock = raw.match(EXPERT_DETAIL_BLOCK_RE)?.[1];
+  if (summaryBlock || expertBlock) {
+    return {
+      summaryMarkdown: sanitizeClaudeCommentBody(summaryBlock || ''),
+      expertMarkdown: sanitizeClaudeCommentBody(expertBlock || ''),
+    };
+  }
+
+  const sanitized = sanitizeClaudeCommentBody(raw);
+  if (!sanitized) return { summaryMarkdown: '', expertMarkdown: '' };
+
+  const match = sanitized.match(PROGRESS_HEADING_RE);
+  if (!match || typeof match.index !== 'number') {
+    return { summaryMarkdown: sanitized, expertMarkdown: '' };
+  }
+
+  return {
+    summaryMarkdown: sanitized.slice(0, match.index).trim(),
+    expertMarkdown: sanitized.slice(match.index).trim(),
+  };
+}
+
 function stripInlineMarkdownPunctuation(text: string): string {
   return text
     .replace(/`([^`]+)`/g, '$1')
@@ -99,6 +127,11 @@ export interface ClaudeAccessibilitySection {
   heading: string | null;
   label: string;
   lines: ClaudeRenderLine[];
+}
+
+export interface ParsedClaudeMessage {
+  summaryMarkdown: string;
+  expertMarkdown: string;
 }
 
 const SECTION_HEADINGS = new Set([

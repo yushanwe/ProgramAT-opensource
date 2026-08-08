@@ -40,6 +40,7 @@ import {
   buildClaudeAccessibilitySections,
   buildClaudeAccessibilityLabel,
   getChangedClaudeAnnouncement,
+  parseClaudeMessage,
   sanitizeClaudeCommentBody,
 } from './claudeCommentSanitizer';
 import TextToSpeechService from './TextToSpeechService';
@@ -74,6 +75,9 @@ function summarizeClaudeAnnouncement(progress: ClaudeProgressResponse): string {
 }
 
 function buildClaudeVersionKey(progress: ClaudeProgressResponse): string | null {
+  if (progress.status === 'waiting_for_comment') {
+    return `waiting:${progress.issue_number || 'none'}:${progress.comment_id || 'none'}`;
+  }
   const body = sanitizeClaudeCommentBody(progress.body);
   if (!body) return null;
   return `${progress.comment_id || 'none'}:${body}`;
@@ -100,12 +104,17 @@ function hasClaudeCompletionLikeText(progress: ClaudeProgressResponse | null): b
 }
 
 function formatClaudeBody(progress: ClaudeProgressResponse): string {
-  const value = sanitizeClaudeCommentBody(progress.summary_text || progress.body);
-  return value || 'Claude has not posted a progress comment yet.';
+  if (progress.status === 'waiting_for_comment') {
+    return "Claude hasn't posted any comments yet.";
+  }
+  const parsed = parseClaudeMessage(progress.body || progress.summary_text);
+  const value = parsed.summaryMarkdown || sanitizeClaudeCommentBody(progress.summary_text || progress.body);
+  return value || "Claude hasn't posted any comments yet.";
 }
 
 function formatClaudeExpertMarkdown(progress: ClaudeProgressResponse): string {
-  return sanitizeClaudeCommentBody(progress.expert_markdown);
+  const parsed = parseClaudeMessage(progress.body || progress.summary_text);
+  return parsed.expertMarkdown || sanitizeClaudeCommentBody(progress.expert_markdown);
 }
 
 function extractCreateToolName(summary: string | null): string | null {
@@ -1364,7 +1373,7 @@ export default function IssueChat({
                 accessible={true}
                 accessibilityRole="button"
                 accessibilityState={{ expanded: !!item.expertExpanded }}
-                accessibilityLabel={item.expertExpanded ? 'Collapse' : 'Expand'}>
+                accessibilityLabel={item.expertExpanded ? 'Collapse expert details' : 'Expand expert details'}>
                 <Text style={[styles.expertToggleText, { color: theme.primary }]}>
                   {item.expertExpanded ? 'Collapse' : 'Expand'}
                 </Text>
