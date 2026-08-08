@@ -9,6 +9,8 @@ const CHECKLIST_LINE_RE = /^\s*[-*]\s*\[(x| |)\]\s+(.+?)\s*$/i;
 const CHECKLIST_LINE_COMPACT_RE = /^\s*[-*]\s*\[\]\s+(.+?)\s*$/i;
 const HEADING_RE = /^#{1,6}\s+(.+?)\s*$/;
 const STATUS_LINE_RE = /^\s*(\d{1,3})%\s+(.+?)\s*$/;
+const USER_SUMMARY_MARKER_RE = /<!--\s*USER_SUMMARY_(?:START|END)\s*-->/gi;
+const EXPERT_DETAIL_MARKER_RE = /<!--\s*EXPERT_DETAIL_(?:START|END)\s*-->/gi;
 
 function decodeHtmlEntities(text: string): string {
   return text
@@ -28,6 +30,9 @@ export function sanitizeClaudeCommentBody(body: string | undefined | null): stri
   if (!body) return '';
 
   let cleaned = body;
+
+  cleaned = cleaned.replace(USER_SUMMARY_MARKER_RE, '');
+  cleaned = cleaned.replace(EXPERT_DETAIL_MARKER_RE, '');
 
   const removedMediaUrls = new Set<string>();
 

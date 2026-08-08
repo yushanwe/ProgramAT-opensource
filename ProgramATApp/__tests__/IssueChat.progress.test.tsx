@@ -247,7 +247,9 @@ describe('IssueChat Claude progress', () => {
         issue_number: 55,
         comment_id: 601,
         updated_at: '2026-08-07T10:00:00Z',
-        body: '25% Inspecting existing implementation\n\nLooking at the polling flow now.',
+        body: '<!-- USER_SUMMARY_START -->\n25% Inspecting existing implementation\n\nLooking at the polling flow now.\n<!-- USER_SUMMARY_END -->\n\n<!-- EXPERT_DETAIL_START -->\n### Current analysis\nComparing the polling flow now.\n<!-- EXPERT_DETAIL_END -->',
+        summary_text: '25% Inspecting existing implementation\n\nLooking at the polling flow now.',
+        expert_markdown: '### Current analysis\nComparing the polling flow now.',
         status_line: { percent: 25, label: 'Inspecting existing implementation', text: '25% Inspecting existing implementation' },
         steps: [],
       },
@@ -256,7 +258,9 @@ describe('IssueChat Claude progress', () => {
         issue_number: 55,
         comment_id: 601,
         updated_at: '2026-08-07T10:00:10Z',
-        body: '50% Implementing changes\n\nThe append-only update path is in place.',
+        body: '<!-- USER_SUMMARY_START -->\n50% Implementing changes\n\nThe append-only update path is in place.\n<!-- USER_SUMMARY_END -->\n\n<!-- EXPERT_DETAIL_START -->\n### Recent work\nAdded the split summary and expert rendering path.\n<!-- EXPERT_DETAIL_END -->',
+        summary_text: '50% Implementing changes\n\nThe append-only update path is in place.',
+        expert_markdown: '### Recent work\nAdded the split summary and expert rendering path.',
         status_line: { percent: 50, label: 'Implementing changes', text: '50% Implementing changes' },
         steps: [],
       },
@@ -271,6 +275,57 @@ describe('IssueChat Claude progress', () => {
     expect(claudeCards).toHaveLength(2);
     expect(JSON.stringify(renderer.toJSON())).toContain('25% Inspecting existing implementation');
     expect(JSON.stringify(renderer.toJSON())).toContain('50% Implementing changes');
+    expect(JSON.stringify(renderer.toJSON())).toContain('Looking at the polling flow now.');
+    expect(JSON.stringify(renderer.toJSON())).toContain('The append-only update path is in place.');
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Comparing the polling flow now.');
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Added the split summary and expert rendering path.');
+  });
+
+  test('expert details are collapsed by default and expand per Claude message', async () => {
+    const renderer = await sendUpdateAndStartPolling([
+      {
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:00Z',
+        body: '<!-- USER_SUMMARY_START -->\n25% Inspecting existing implementation\n\nLooking at the polling flow now.\n<!-- USER_SUMMARY_END -->\n\n<!-- EXPERT_DETAIL_START -->\n### Current analysis\nComparing the polling flow now.\n<!-- EXPERT_DETAIL_END -->',
+        summary_text: '25% Inspecting existing implementation\n\nLooking at the polling flow now.',
+        expert_markdown: '### Current analysis\nComparing the polling flow now.',
+        status_line: { percent: 25, label: 'Inspecting existing implementation', text: '25% Inspecting existing implementation' },
+        steps: [],
+      },
+      {
+        status: 'available',
+        issue_number: 55,
+        comment_id: 601,
+        updated_at: '2026-08-07T10:00:10Z',
+        body: '<!-- USER_SUMMARY_START -->\n50% Implementing changes\n\nThe append-only update path is in place.\n<!-- USER_SUMMARY_END -->\n\n<!-- EXPERT_DETAIL_START -->\n### Recent work\nAdded the split summary and expert rendering path.\n<!-- EXPERT_DETAIL_END -->',
+        summary_text: '50% Implementing changes\n\nThe append-only update path is in place.',
+        expert_markdown: '### Recent work\nAdded the split summary and expert rendering path.',
+        status_line: { percent: 50, label: 'Implementing changes', text: '50% Implementing changes' },
+        steps: [],
+      },
+    ]);
+
+    await act(async () => {
+      jest.advanceTimersByTime(6000);
+      await Promise.resolve();
+    });
+
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Comparing the polling flow now.');
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Added the split summary and expert rendering path.');
+
+    const toggleButtons = renderer.root.findAllByType(TouchableOpacity)
+      .filter((node) => node.props.accessibilityRole === 'button' && /expert details/i.test(node.props.accessibilityLabel || ''));
+    expect(toggleButtons).toHaveLength(2);
+    expect(toggleButtons[0].props.accessibilityState).toEqual({ expanded: false });
+
+    await act(async () => {
+      toggleButtons[0].props.onPress();
+    });
+
+    expect(JSON.stringify(renderer.toJSON())).toContain('Comparing the polling flow now.');
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Added the split summary and expert rendering path.');
   });
 
   test('each new Claude message gets one scroll and focus transition, unchanged polls do not', async () => {
@@ -383,7 +438,7 @@ describe('IssueChat Claude progress', () => {
 
 describe('Claude progress sanitizing and accessibility', () => {
   test('preserves status lines and removes unsupported media', () => {
-    const input = '25% Inspecting implementation\n<img src="https://example.com/spinner.gif" />\nWorking now.';
+    const input = '<!-- USER_SUMMARY_START -->\n25% Inspecting implementation\n<!-- USER_SUMMARY_END -->\n<img src="https://example.com/spinner.gif" />\nWorking now.';
     expect(sanitizeClaudeCommentBody(input)).toBe('25% Inspecting implementation\n\nWorking now.');
   });
 

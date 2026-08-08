@@ -49,13 +49,19 @@ class ImplementationTraceabilityTests(unittest.TestCase):
 
     def test_extract_implementation_summary(self):
         summary = implementation_traceability.extract_implementation_summary(
-            """### Implementation summary
+            """<!-- USER_SUMMARY_START -->
+100% Complete
+<!-- USER_SUMMARY_END -->
+
+<!-- EXPERT_DETAIL_START -->
+### Implementation summary
 
 - Model: `gemini/gemini-3.1-flash-lite`
 - Strategy: single-frame VLM
 - Execution mode: streaming
 - Runtime input: search_criteria
 - Validation: passed
+<!-- EXPERT_DETAIL_END -->
 """
         )
         self.assertEqual(summary['model'], 'gemini/gemini-3.1-flash-lite')

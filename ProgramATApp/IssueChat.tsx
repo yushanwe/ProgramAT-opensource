@@ -80,9 +80,10 @@ function buildClaudeVersionKey(progress: ClaudeProgressResponse): string | null 
 }
 
 function buildClaudeAnnouncement(progress: ClaudeProgressResponse, previousBody: string): string {
-  const changedSectionAnnouncement = getChangedClaudeAnnouncement(previousBody, progress.body);
+  const changedSectionAnnouncement = getChangedClaudeAnnouncement(previousBody, progress.expert_markdown || progress.body);
   if (changedSectionAnnouncement) return changedSectionAnnouncement;
   if (progress.status_line?.text) return progress.status_line.text;
+  if (progress.summary_text) return progress.summary_text.split('\n')[0]?.trim() || summarizeClaudeAnnouncement(progress);
   return summarizeClaudeAnnouncement(progress);
 }
 
@@ -98,9 +99,13 @@ function hasClaudeCompletionLikeText(progress: ClaudeProgressResponse | null): b
     || combined.includes('done');
 }
 
-function formatClaudeBody(body: string | undefined): string {
-  const value = sanitizeClaudeCommentBody(body);
+function formatClaudeBody(progress: ClaudeProgressResponse): string {
+  const value = sanitizeClaudeCommentBody(progress.summary_text || progress.body);
   return value || 'Claude has not posted a progress comment yet.';
+}
+
+function formatClaudeExpertMarkdown(progress: ClaudeProgressResponse): string {
+  return sanitizeClaudeCommentBody(progress.expert_markdown);
 }
 
 function extractCreateToolName(summary: string | null): string | null {
@@ -329,7 +334,7 @@ export default function IssueChat({
     if (!versionKey || lastAnnouncedClaudeVersionRef.current === versionKey) return;
     lastAnnouncedClaudeVersionRef.current = versionKey;
     const announcement = buildClaudeAnnouncement(claudeProgress, previousClaudeBodyRef.current);
-    previousClaudeBodyRef.current = claudeProgress.body || '';
+    previousClaudeBodyRef.current = claudeProgress.expert_markdown || claudeProgress.body || '';
     AccessibilityInfo.announceForAccessibility(announcement);
   }, [claudeProgress]);
 
@@ -467,7 +472,8 @@ export default function IssueChat({
   const append = (item: IssueChatItem) => setItems((prev) => [...prev, item]);
 
   const appendClaudeProgressItem = (progress: ClaudeProgressResponse) => {
-    const body = formatClaudeBody(progress.body);
+    const summaryText = formatClaudeBody(progress);
+    const expertMarkdown = formatClaudeExpertMarkdown(progress);
     const versionKey = buildClaudeVersionKey(progress);
     if (!versionKey) return;
     if (lastAppendedClaudeVersionRef.current === versionKey) return;
@@ -484,13 +490,23 @@ export default function IssueChat({
         id,
         ts: new Date(),
         status: progress.status,
-        body,
+        body: summaryText,
+        summaryText,
+        expertMarkdown,
+        expertExpanded: false,
         commentId: progress.comment_id,
         updatedAt: progress.updated_at,
         message: progress.message,
         versionKey,
       }];
     });
+  };
+
+  const toggleClaudeExpertDetails = (itemId: string) => {
+    setItems((prev) => prev.map((item) => {
+      if (item.kind !== 'assistant-claude-progress' || item.id !== itemId) return item;
+      return { ...item, expertExpanded: !item.expertExpanded };
+    }));
   };
 
   const resolveLatestChoicePrompt = () => {
@@ -1293,8 +1309,10 @@ export default function IssueChat({
         );
       }
       case 'assistant-claude-progress': {
-        const accessibilityLabel = buildClaudeAccessibilityLabel(item.body, item.message);
-        const accessibilitySections = buildClaudeAccessibilitySections(item.body);
+        const summaryAccessibilityLabel = buildClaudeAccessibilityLabel(item.summaryText, item.message);
+        const summarySections = buildClaudeAccessibilitySections(item.summaryText);
+        const expertSections = buildClaudeAccessibilitySections(item.expertMarkdown);
+        const hasExpertDetails = expertSections.length > 0;
         return (
           <View
             key={item.id}
@@ -1311,19 +1329,19 @@ export default function IssueChat({
               accessibilityLabel="Claude">
               Claude
             </Text>
-            {accessibilitySections.map((section, sectionIndex) => (
+            {summarySections.map((section, sectionIndex) => (
               <View
-                key={`${item.id}_section_${sectionIndex}`}
+                key={`${item.id}_summary_section_${sectionIndex}`}
                 accessible={true}
                 accessibilityRole="text"
                 accessibilityLabel={section.label}>
                 {section.lines.map((line, lineIndex) => {
                   if (line.kind === 'blank') {
-                    return <View key={`${item.id}_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
+                    return <View key={`${item.id}_summary_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
                   }
                   return (
                     <Text
-                      key={`${item.id}_${sectionIndex}_${lineIndex}`}
+                      key={`${item.id}_summary_${sectionIndex}_${lineIndex}`}
                       style={[
                         line.kind === 'heading'
                           ? [styles.claudeHeadingText, { color: theme.text }]
@@ -1332,13 +1350,56 @@ export default function IssueChat({
                       selectable={true}
                       accessible={false}
                       accessibilityRole="text"
-                      accessibilityLabel={accessibilityLabel}>
+                      accessibilityLabel={summaryAccessibilityLabel}>
                       {line.text}
                     </Text>
                   );
                 })}
               </View>
             ))}
+            {hasExpertDetails && (
+              <TouchableOpacity
+                style={styles.expertToggleButton}
+                onPress={() => toggleClaudeExpertDetails(item.id)}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityState={{ expanded: !!item.expertExpanded }}
+                accessibilityLabel={item.expertExpanded ? 'Hide expert details' : 'Show expert details'}>
+                <Text style={[styles.expertToggleText, { color: theme.primary }]}>
+                  {item.expertExpanded ? 'Hide expert details' : 'Show expert details'}
+                </Text>
+              </TouchableOpacity>
+            )}
+            {hasExpertDetails && item.expertExpanded && (
+              <View style={styles.expertDetailsContainer} accessible={false}>
+                {expertSections.map((section, sectionIndex) => (
+                  <View
+                    key={`${item.id}_expert_section_${sectionIndex}`}
+                    accessible={true}
+                    accessibilityRole="text"
+                    accessibilityLabel={section.label}>
+                    {section.lines.map((line, lineIndex) => {
+                      if (line.kind === 'blank') {
+                        return <View key={`${item.id}_expert_blank_${sectionIndex}_${lineIndex}`} style={styles.claudeLineSpacer} />;
+                      }
+                      return (
+                        <Text
+                          key={`${item.id}_expert_${sectionIndex}_${lineIndex}`}
+                          style={[
+                            line.kind === 'heading'
+                              ? [styles.claudeHeadingText, { color: theme.text }]
+                              : [styles.messageText, { color: theme.text }],
+                          ]}
+                          selectable={true}
+                          accessible={false}>
+                          {line.text}
+                        </Text>
+                      );
+                    })}
+                  </View>
+                ))}
+              </View>
+            )}
             <Text style={[styles.timestamp, { color: theme.textTertiary }]} accessible={false}>
               {item.ts.toLocaleTimeString()}
             </Text>
@@ -1883,6 +1944,18 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
     marginBottom: 6,
+  },
+  expertToggleButton: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    paddingVertical: 4,
+  },
+  expertToggleText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  expertDetailsContainer: {
+    marginTop: 10,
   },
   claudeAccessibilityOnly: {
     position: 'absolute',
