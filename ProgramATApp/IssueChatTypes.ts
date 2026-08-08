@@ -16,7 +16,7 @@ export type RetryDescriptor =
 export type IssueChatItem =
   | { kind: 'user-text'; id: string; ts: Date; text: string }
   | { kind: 'user-video'; id: string; ts: Date; videoUri: string; caption: string }
-  | { kind: 'user-choice'; id: string; ts: Date; choice: 'keep_brainstorming' | 'start_building' | 'ask_agent'; label: string }
+  | { kind: 'user-choice'; id: string; ts: Date; choice: 'keep_brainstorming' | 'start_building'; label: string }
   | { kind: 'assistant-question'; id: string; ts: Date; question: string; token: string }
   | { kind: 'assistant-choice-prompt'; id: string; ts: Date; text: string; token: string; resolved: boolean }
   | { kind: 'assistant-clarification-answer'; id: string; ts: Date; question: string; answer: string; token: string }

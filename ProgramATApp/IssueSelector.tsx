@@ -5,7 +5,7 @@
  * @format
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   StyleSheet,
   Text,
@@ -74,6 +74,14 @@ export default function IssueSelector({
   const [loading, setLoading] = useState(false);
   const [expectingNewPRs, setExpectingNewPRs] = useState(false); // Track when we're expecting fresh PRs
   const [error, setError] = useState<string>('');
+
+  // Most recently created PR (i.e. tool) first, so a just-created tool is
+  // always at the top of the list rather than wherever GitHub's
+  // last-updated ordering happens to place it.
+  const sortedPrs = useMemo(
+    () => [...prs].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()),
+    [prs],
+  );
 
   useEffect(() => {
     if (visible) {
@@ -334,7 +342,7 @@ export default function IssueSelector({
               </Text>
             </TouchableOpacity>
           </View>
-        ) : prs.length === 0 ? (
+        ) : sortedPrs.length === 0 ? (
           <View 
             style={styles.emptyContainer}
             accessible={false}>
@@ -364,8 +372,8 @@ export default function IssueSelector({
           <ScrollView 
             style={styles.issueList}
             accessible={false}
-            accessibilityLabel={`List of ${prs.length} open pull requests`}>
-            {prs.map((pr) => {
+            accessibilityLabel={`List of ${sortedPrs.length} open pull requests`}>
+            {sortedPrs.map((pr) => {
               const isSelected = selectedIssue?.number === pr.number;
               return (
               <TouchableOpacity
