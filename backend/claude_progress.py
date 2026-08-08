@@ -9,6 +9,7 @@ USER_SUMMARY_START = '<!-- USER_SUMMARY_START -->'
 USER_SUMMARY_END = '<!-- USER_SUMMARY_END -->'
 EXPERT_DETAIL_START = '<!-- EXPERT_DETAIL_START -->'
 EXPERT_DETAIL_END = '<!-- EXPERT_DETAIL_END -->'
+PROGRESS_HEADING_RE = re.compile(r'^\s{0,3}#{1,6}\s+Progress\s*$', re.IGNORECASE | re.MULTILINE)
 FAILURE_PATTERNS = (
     re.compile(r'\b(failed|failure|error|exception|traceback|unable to|could not|blocked)\b', re.IGNORECASE),
     re.compile(r'(^|\n)\s*status\s*:\s*failed\b', re.IGNORECASE),
@@ -48,9 +49,16 @@ def _extract_delimited_section(body: str, start_marker: str, end_marker: str) ->
 def _split_progress_content(body: str) -> tuple[Optional[str], Optional[str]]:
     summary_text = _extract_delimited_section(body, USER_SUMMARY_START, USER_SUMMARY_END)
     expert_markdown = _extract_delimited_section(body, EXPERT_DETAIL_START, EXPERT_DETAIL_END)
-    if summary_text is None and expert_markdown is not None:
-        summary_prefix = body.split(EXPERT_DETAIL_START, 1)[0].strip()
-        summary_text = summary_prefix or None
+    if summary_text is not None or expert_markdown is not None:
+        if summary_text is None and expert_markdown is not None:
+            summary_prefix = body.split(EXPERT_DETAIL_START, 1)[0].strip()
+            summary_text = summary_prefix or None
+        return summary_text, expert_markdown
+
+    progress_match = PROGRESS_HEADING_RE.search(body or '')
+    if progress_match:
+        summary_text = (body or '')[:progress_match.start()].strip() or None
+        expert_markdown = (body or '')[progress_match.start():].strip() or None
     return summary_text, expert_markdown
 
 
