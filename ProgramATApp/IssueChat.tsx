@@ -53,7 +53,7 @@ interface IssueChatProps {
   showBackButton?: boolean;
 }
 
-type Awaiting = 'answer' | 'choice' | 'clarification' | null;
+type Awaiting = 'answer' | 'choice' | null;
 type ProgressTarget = {
   mode: 'create' | 'update';
   issueNumber?: number | null;
@@ -318,13 +318,6 @@ export default function IssueChat({
   // should be able to answer immediately without hunting for the input.
   useEffect(() => {
     if (awaiting === 'answer') {
-      const timeout = setTimeout(() => composeInputRef.current?.focus(), 150);
-      return () => clearTimeout(timeout);
-    } else if (awaiting === 'clarification') {
-      // No new chat bubble carries this mode switch, so announce it
-      // explicitly — otherwise a screen-reader user won't know the compose
-      // bar's purpose just changed.
-      AccessibilityInfo.announceForAccessibility('Ask the agent a question. Type your question and press send.');
       const timeout = setTimeout(() => composeInputRef.current?.focus(), 150);
       return () => clearTimeout(timeout);
     }
@@ -733,7 +726,7 @@ export default function IssueChat({
         kind: 'assistant-choice-prompt',
         id: nextId('assistant-choice-prompt'),
         ts: new Date(),
-        text: 'Thanks for that context! You can keep brainstorming or start building.',
+        text: 'Thanks for that context! You can keep brainstorming, start building, or just type a question.',
         token: result.token,
         resolved: false,
       });
@@ -797,7 +790,7 @@ export default function IssueChat({
         kind: 'assistant-choice-prompt',
         id: nextId('assistant-choice-prompt'),
         ts: new Date(),
-        text: 'Thanks for that context! You can keep brainstorming or start building.',
+        text: 'Thanks for that context! You can keep brainstorming, start building, or just type a question.',
         token: result.token,
         resolved: false,
       });
@@ -941,22 +934,13 @@ export default function IssueChat({
     }
   };
 
-  const handleTalkToAgent = () => {
-    if (!activeToken) return;
-    resolveLatestChoicePrompt();
-    append({
-      kind: 'user-choice',
-      id: nextId('user-choice'),
-      ts: new Date(),
-      choice: 'ask_agent',
-      label: '💬 Talk to Agent',
-    });
-    setAwaiting('clarification');
-  };
-
+  // Any message sent while a choice prompt is showing (i.e. not a direct
+  // answer to a pending structured question) is treated as a free-form
+  // question to the agent — no explicit "Talk to Agent" action needed.
   const sendAgentQuestion = async (question: string, token: string) => {
     const trimmed = question.trim();
     if (!trimmed) return;
+    resolveLatestChoicePrompt();
     append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
     setComposeText('');
     Keyboard.dismiss();
@@ -1057,17 +1041,20 @@ export default function IssueChat({
     const text = composeText.trim();
     if (!text && !stagedVideoUri) return;
 
-    if (awaiting === 'clarification' && activeToken) {
-      sendAgentQuestion(text, activeToken);
-      return;
-    }
-
     if (awaiting === 'answer' && activeToken) {
       if (isCreateMode) {
         sendIdeationAnswer(text, activeToken);
       } else {
         sendUpdateIdeationAnswer(text, activeToken);
       }
+      return;
+    }
+
+    // Any message that isn't a direct answer to a pending structured
+    // question, sent while a brainstorming choice prompt is showing, is
+    // treated as a free-form question to the agent.
+    if (awaiting === 'choice' && activeToken) {
+      sendAgentQuestion(text, activeToken);
       return;
     }
 
@@ -1120,12 +1107,11 @@ export default function IssueChat({
   // parse_transcript_with_ai garbage to build the issue title from.
   const sendDisabled =
     isSending ||
-    awaiting === 'choice' ||
     (stagedVideoUri ? !composeText.trim() : !composeText.trim());
 
   const placeholder =
-    awaiting === 'clarification'
-      ? 'Ask the agent a question…'
+    awaiting === 'choice'
+      ? 'Ask a question, or tap an option above…'
       : awaiting === 'answer'
       ? 'Type your answer…'
       : stagedVideoUri
@@ -1140,6 +1126,8 @@ export default function IssueChat({
     ? 'Submit with video'
     : awaiting === 'answer'
     ? 'Send answer'
+    : awaiting === 'choice'
+    ? 'Send question'
     : 'Send text';
 
   const renderItem = (item: IssueChatItem) => {
@@ -1278,21 +1266,6 @@ export default function IssueChat({
                     <ActivityIndicator size="small" color="#fff" />
                   ) : (
                     <Text style={styles.brainstormButtonText}>🚀 Start Building</Text>
-                  )}
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.brainstormButton, { backgroundColor: theme.info }]}
-                  onPress={handleTalkToAgent}
-                  disabled={isSending}
-                  accessible={true}
-                  accessibilityLabel="Talk to agent"
-                  accessibilityHint="Ask a free-form question about your tool and get an answer, then return to this menu"
-                  accessibilityRole="button"
-                  accessibilityState={{ disabled: isSending }}>
-                  {isSending ? (
-                    <ActivityIndicator size="small" color="#fff" />
-                  ) : (
-                    <Text style={styles.brainstormButtonText}>💬 Talk to Agent</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1662,7 +1635,7 @@ export default function IssueChat({
             onChangeText={setComposeText}
             autoCorrect={true}
             autoCapitalize="sentences"
-            editable={awaiting !== 'choice' && !isSending}
+            editable={!isSending}
             accessible={true}
             accessibilityLabel="Message input"
             accessibilityHint="Type your message here. Use context menu to copy or paste"
@@ -1670,27 +1643,25 @@ export default function IssueChat({
             selectTextOnFocus={false}
           />
 
-          {awaiting !== 'choice' && (
-            <TouchableOpacity
-              style={[
-                styles.sendButton,
-                { backgroundColor: theme.primary },
-                sendDisabled && styles.sendButtonDisabled,
-              ]}
-              onPress={handleSend}
-              disabled={sendDisabled}
-              accessible={true}
-              accessibilityLabel={sendAccessibilityLabel}
-              accessibilityHint="Sends the message to the server"
-              accessibilityRole="button"
-              accessibilityState={{ disabled: sendDisabled }}>
-              {isSending ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <Text style={styles.sendButtonText}>Send</Text>
-              )}
-            </TouchableOpacity>
-          )}
+          <TouchableOpacity
+            style={[
+              styles.sendButton,
+              { backgroundColor: theme.primary },
+              sendDisabled && styles.sendButtonDisabled,
+            ]}
+            onPress={handleSend}
+            disabled={sendDisabled}
+            accessible={true}
+            accessibilityLabel={sendAccessibilityLabel}
+            accessibilityHint="Sends the message to the server"
+            accessibilityRole="button"
+            accessibilityState={{ disabled: sendDisabled }}>
+            {isSending ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <Text style={styles.sendButtonText}>Send</Text>
+            )}
+          </TouchableOpacity>
         </View>
       </View>
 
