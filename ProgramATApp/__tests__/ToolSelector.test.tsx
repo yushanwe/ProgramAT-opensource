@@ -88,22 +88,6 @@ describe('ToolSelector', () => {
         <ToolSelector
           onToolSelect={onToolSelect}
           selectedTool={null}
-          issueTools={oldTools}
-          selectedIssue={{ number: 2, title: 'Issue 2' }}
-        />,
-      );
-    });
-
-    expect(tree!.root.findAll(node => node.props?.children === 'old_tool')).toHaveLength(0);
-    expect(
-      tree!.root.findAllByProps({ children: 'Loading tools...' }).length,
-    ).toBeGreaterThan(0);
-
-    await ReactTestRenderer.act(() => {
-      tree!.update(
-        <ToolSelector
-          onToolSelect={onToolSelect}
-          selectedTool={null}
           issueTools={newTools}
           selectedIssue={{ number: 2, title: 'Issue 2' }}
         />,
@@ -117,6 +101,40 @@ describe('ToolSelector', () => {
     expect(
       tree!.root.findAllByProps({ children: 'Loading tools...' }),
     ).toHaveLength(0);
+
+    await ReactTestRenderer.act(() => {
+      tree!.unmount();
+    });
+  });
+
+  test('does not restart loading when response updates selected issue metadata', async () => {
+    let tree: ReactTestRenderer.ReactTestRenderer;
+    const newTools = [{ name: 'new_tool', path: 'tools/new_tool.py' }];
+
+    await ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(
+        <ToolSelector
+          onToolSelect={jest.fn()}
+          selectedTool={null}
+          issueTools={[]}
+          selectedIssue={{ number: 10, title: 'Linked issue' }}
+        />,
+      );
+    });
+
+    await ReactTestRenderer.act(() => {
+      tree!.update(
+        <ToolSelector
+          onToolSelect={jest.fn()}
+          selectedTool={null}
+          issueTools={newTools}
+          selectedIssue={{ number: 11, title: 'Implementing PR' }}
+        />,
+      );
+    });
+
+    expect(tree!.root.findAll(node => node.props?.children === 'new_tool').length).toBeGreaterThan(0);
+    expect(tree!.root.findAllByProps({ children: 'Loading tools...' })).toHaveLength(0);
 
     await ReactTestRenderer.act(() => {
       tree!.unmount();

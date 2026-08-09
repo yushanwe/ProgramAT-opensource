@@ -129,7 +129,13 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
   useEffect(() => {
     console.log('[ToolSelector] useEffect triggered - calling loadTools(), productionMode:', productionMode, 'selectedIssue:', selectedIssueNumber);
     loadTools();
-  }, [loadTools, productionMode, selectedIssueNumber]);
+    // A PR-tools response can update selectedIssue metadata in the same render
+    // that delivers the tools. Reloading for that metadata update would consume
+    // the successful response and leave the selector waiting forever. New PR
+    // selections clear the parent list and remount this screen through the
+    // normal navigation flow, so loading here is scoped to mount/mode changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [productionMode]);
 
   // Update tools when issueTools changes (both development and production modes).
   // Uses a ref guard (not state) so the effect only fires when issueTools changes,
