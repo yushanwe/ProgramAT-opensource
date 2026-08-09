@@ -44,6 +44,8 @@ interface ToolSelectorProps {
   selectedIssue?: {number: number; title: string} | null;
 }
 
+const TOOL_LOAD_TIMEOUT_MS = 60000;
+
 export default function ToolSelector({ onToolSelect, selectedTool, issueTools = [], productionMode = false, selectedIssue = null }: ToolSelectorProps) {
   const { theme } = useTheme();
   const [tools, setTools] = useState<Tool[]>([]);
@@ -136,7 +138,7 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
           expectingNewToolsRef.current = false;
           setLoading(false);
         }
-      }, 60000); // 60 second safety timeout
+      }, TOOL_LOAD_TIMEOUT_MS);
       
       return;
     }
@@ -162,7 +164,7 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
         expectingNewToolsRef.current = false;
         setLoading(false);
       }
-    }, 60000);
+    }, TOOL_LOAD_TIMEOUT_MS);
   }, [productionMode, selectedIssue]);
 
   const handleToolPress = (tool: Tool) => {
