@@ -78,8 +78,9 @@ describe('ToolSelector', () => {
       );
     });
 
+    expect(tree!.root.findAll(node => node.props?.children === 'old_tool')).toHaveLength(0);
     expect(
-      tree!.root.findAll(node => node.props?.children === 'old_tool').length,
+      tree!.root.findAllByProps({ children: 'Loading tools...' }).length,
     ).toBeGreaterThan(0);
 
     await ReactTestRenderer.act(() => {
@@ -116,6 +117,40 @@ describe('ToolSelector', () => {
     expect(
       tree!.root.findAllByProps({ children: 'Loading tools...' }),
     ).toHaveLength(0);
+
+    await ReactTestRenderer.act(() => {
+      tree!.unmount();
+    });
+  });
+
+  test('finishes loading when the fresh response contains no tools', async () => {
+    let tree: ReactTestRenderer.ReactTestRenderer;
+    const staleTools = [{ name: 'stale_tool', path: 'tools/stale_tool.py' }];
+
+    await ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(
+        <ToolSelector
+          onToolSelect={jest.fn()}
+          selectedTool={null}
+          issueTools={staleTools}
+          selectedIssue={{ number: 1, title: 'Issue 1' }}
+        />,
+      );
+    });
+
+    await ReactTestRenderer.act(() => {
+      tree!.update(
+        <ToolSelector
+          onToolSelect={jest.fn()}
+          selectedTool={null}
+          issueTools={[]}
+          selectedIssue={{ number: 1, title: 'Issue 1' }}
+        />,
+      );
+    });
+
+    expect(tree!.root.findAllByProps({ children: 'Loading tools...' })).toHaveLength(0);
+    expect(tree!.root.findAll(node => node.props?.children === 'stale_tool')).toHaveLength(0);
 
     await ReactTestRenderer.act(() => {
       tree!.unmount();
