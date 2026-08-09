@@ -32,6 +32,10 @@ jobs:
       (github.event_name == 'issue_comment' &&
        contains(github.event.comment.body, '@claude'))
     runs-on: ubuntu-latest
+    outputs:
+      branch_name: ${{ steps.claude.outputs.branch_name }}
+      pr_number: ${{ steps.verify-tool-pr.outputs.pr_number }}
+      tool_path: ${{ steps.verify-tool-pr.outputs.tool_path }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -273,20 +277,108 @@ jobs:
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "tool_path=$first_tool_file" >> "$GITHUB_OUTPUT"
 
+      # - name: Persist implementation context on Claude branch
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #     REPO: ${{ github.repository }}
+      #     ISSUE_NUMBER: ${{ github.event.issue.number }}
+      #     CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
+      #     VERIFIED_PR_NUMBER: ${{ steps.verify-tool-pr.outputs.pr_number }}
+      #     VERIFIED_TOOL_PATH: ${{ steps.verify-tool-pr.outputs.tool_path }}
+      #     WORKFLOW_RUN_ID: ${{ github.run_id }}
+      #     SERVER_URL: ${{ github.server_url }}
+      #   run: |
+      #     set -euxo pipefail
+
+      #     branch_name="${CLAUDE_BRANCH:-}"
+      #     if [ -z "$branch_name" ]; then
+      #       branch_prefix="claude/issue-${ISSUE_NUMBER}-"
+      #       branch_name="$(
+      #         git ls-remote --heads origin "refs/heads/${branch_prefix}*" \
+      #           | awk '{sub("refs/heads/","",$2); print $2}' \
+      #           | tail -n 1
+      #       )"
+      #     fi
+
+      #     if [ -z "$branch_name" ]; then
+      #       echo "::error::Could not determine Claude branch for issue #$ISSUE_NUMBER."
+      #       exit 1
+      #     fi
+
+      #     git fetch --no-tags origin "$branch_name"
+      #     git checkout -B "$branch_name" "origin/$branch_name"
+
+      #     commit_sha="$(git rev-parse HEAD)"
+      #     pr_number="${VERIFIED_PR_NUMBER:-}"
+      #     tool_path="${VERIFIED_TOOL_PATH:-}"
+
+      #     mkdir -p .programat /tmp/programat-context
+
+      #     comments_json="/tmp/programat-context/comments.json"
+      #     pr_files_json="/tmp/programat-context/pr_files.json"
+      #     raw_log_file="/tmp/programat-context/raw_action_log.txt"
+      #     jobs_json="/tmp/programat-context/jobs.json"
+
+      #     gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments?per_page=100" > "$comments_json"
+      #     gh api "repos/${REPO}/pulls/${pr_number}/files?per_page=100" > "$pr_files_json"
+      #     gh api "repos/${REPO}/actions/runs/${WORKFLOW_RUN_ID}/jobs?per_page=100" > "$jobs_json"
+
+      #     workflow_job_id="$(jq -r '.jobs[] | select(.name == "claude-vat") | .id' "$jobs_json" | head -n 1)"
+      #     workflow_job_url=""
+      #     if [ -n "${workflow_job_id:-}" ] && [ "$workflow_job_id" != "null" ]; then
+      #       workflow_job_url="${SERVER_URL}/${REPO}/actions/runs/${WORKFLOW_RUN_ID}/job/${workflow_job_id}"
+      #       gh api "repos/${REPO}/actions/jobs/${workflow_job_id}/logs" > "$raw_log_file"
+      #     else
+      #       : > "$raw_log_file"
+      #     fi
+
+      #     python3 backend/write_implementation_context.py \
+      #       --metadata-path .programat/implementation_context.json \
+      #       --action-log-path .programat/claude_action_log.txt \
+      #       --repository "$REPO" \
+      #       --issue-number "$ISSUE_NUMBER" \
+      #       --pr-number "$pr_number" \
+      #       --branch "$branch_name" \
+      #       --commit-sha "$commit_sha" \
+      #       --tool-path "$tool_path" \
+      #       --comments-json "$comments_json" \
+      #       --pr-files-json "$pr_files_json" \
+      #       --raw-log-file "$raw_log_file" \
+      #       --workflow-run-id "$WORKFLOW_RUN_ID" \
+      #       --workflow-job-url "$workflow_job_url"
+
+      #     if ! git diff --quiet -- .programat/implementation_context.json .programat/claude_action_log.txt; then
+      #       git add .programat/implementation_context.json .programat/claude_action_log.txt
+      #       git commit -m "Persist implementation context for issue #${ISSUE_NUMBER}"
+      #       git push origin "HEAD:${branch_name}"
+      #     fi
+  persist-context:
+    needs: claude-vat
+    if: ${{ needs.claude-vat.result == 'success' }}
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      CLAUDE_BRANCH: ${{ needs.claude-vat.outputs.branch_name }}
+      VERIFIED_PR_NUMBER: ${{ needs.claude-vat.outputs.pr_number }}
+      VERIFIED_TOOL_PATH: ${{ needs.claude-vat.outputs.tool_path }}
+      WORKFLOW_RUN_ID: ${{ github.run_id }}
+      SERVER_URL: ${{ github.server_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Persist implementation context on Claude branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          CLAUDE_BRANCH: ${{ steps.claude.outputs.branch_name }}
-          VERIFIED_PR_NUMBER: ${{ steps.verify-tool-pr.outputs.pr_number }}
-          VERIFIED_TOOL_PATH: ${{ steps.verify-tool-pr.outputs.tool_path }}
-          WORKFLOW_RUN_ID: ${{ github.run_id }}
-          SERVER_URL: ${{ github.server_url }}
         run: |
           set -euxo pipefail
 
           branch_name="${CLAUDE_BRANCH:-}"
+
           if [ -z "$branch_name" ]; then
             branch_prefix="claude/issue-${ISSUE_NUMBER}-"
             branch_name="$(
@@ -300,6 +392,8 @@ jobs:
             echo "::error::Could not determine Claude branch for issue #$ISSUE_NUMBER."
             exit 1
           fi
+
+          echo "Claude branch: $branch_name"
 
           git fetch --no-tags origin "$branch_name"
           git checkout -B "$branch_name" "origin/$branch_name"
@@ -315,16 +409,38 @@ jobs:
           raw_log_file="/tmp/programat-context/raw_action_log.txt"
           jobs_json="/tmp/programat-context/jobs.json"
 
-          gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments?per_page=100" > "$comments_json"
-          gh api "repos/${REPO}/pulls/${pr_number}/files?per_page=100" > "$pr_files_json"
-          gh api "repos/${REPO}/actions/runs/${WORKFLOW_RUN_ID}/jobs?per_page=100" > "$jobs_json"
+          gh api \
+            "repos/${REPO}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+            > "$comments_json"
 
-          workflow_job_id="$(jq -r '.jobs[] | select(.name == "claude-vat") | .id' "$jobs_json" | head -n 1)"
+          gh api \
+            "repos/${REPO}/pulls/${pr_number}/files?per_page=100" \
+            > "$pr_files_json"
+
+          gh api \
+            "repos/${REPO}/actions/runs/${WORKFLOW_RUN_ID}/jobs?per_page=100" \
+            > "$jobs_json"
+
+          workflow_job_id="$(
+            jq -r \
+              '.jobs[] | select(.name == "claude-vat") | .id' \
+              "$jobs_json" \
+              | head -n 1
+          )"
+
           workflow_job_url=""
+
           if [ -n "${workflow_job_id:-}" ] && [ "$workflow_job_id" != "null" ]; then
             workflow_job_url="${SERVER_URL}/${REPO}/actions/runs/${WORKFLOW_RUN_ID}/job/${workflow_job_id}"
-            gh api "repos/${REPO}/actions/jobs/${workflow_job_id}/logs" > "$raw_log_file"
+
+            echo "Claude job ID: $workflow_job_id"
+            echo "Claude job URL: $workflow_job_url"
+
+            gh api \
+              "repos/${REPO}/actions/jobs/${workflow_job_id}/logs" \
+              > "$raw_log_file"
           else
+            echo "::warning::Could not find claude-vat job."
             : > "$raw_log_file"
           fi
 
@@ -343,8 +459,18 @@ jobs:
             --workflow-run-id "$WORKFLOW_RUN_ID" \
             --workflow-job-url "$workflow_job_url"
 
-          if ! git diff --quiet -- .programat/implementation_context.json .programat/claude_action_log.txt; then
-            git add .programat/implementation_context.json .programat/claude_action_log.txt
-            git commit -m "Persist implementation context for issue #${ISSUE_NUMBER}"
+          if ! git diff --quiet -- \
+            .programat/implementation_context.json \
+            .programat/claude_action_log.txt
+          then
+            git add \
+              .programat/implementation_context.json \
+              .programat/claude_action_log.txt
+
+            git commit \
+              -m "Persist implementation context for issue #${ISSUE_NUMBER}"
+
             git push origin "HEAD:${branch_name}"
+          else
+            echo "No implementation context changes to commit."
           fi
