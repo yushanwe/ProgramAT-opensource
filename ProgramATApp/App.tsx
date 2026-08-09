@@ -344,6 +344,10 @@ function AppContent() {
   };
 
   const handleIssueSelect = (pr: {number: number; title: string}) => {
+    // The request for this PR has already been sent by IssueSelector. Remove
+    // the previous PR's tools immediately so they cannot remain actionable
+    // while the new response is in flight.
+    setPRTools([]);
     setSelectedPR(pr);
     // Persist the selected PR
     AsyncStorage.setItem('selectedPR', JSON.stringify(pr)).catch(error => {
@@ -390,6 +394,7 @@ function AppContent() {
         copilotSummaries={copilotSummaries}
         copilotLogs={copilotLogs}
         onClearCopilotData={clearCopilotData}
+        onToolsLoadStart={() => setPRTools([])}
       />
     </View>
   );

@@ -48,9 +48,13 @@ const TOOL_LOAD_TIMEOUT_MS = 60000;
 
 export default function ToolSelector({ onToolSelect, selectedTool, issueTools = [], productionMode = false, selectedIssue = null }: ToolSelectorProps) {
   const { theme } = useTheme();
+  const selectedIssueNumber = selectedIssue?.number;
   const [tools, setTools] = useState<Tool[]>([]);
   const [loading, setLoading] = useState(true);
   const expectingNewToolsRef = useRef(false); // ref avoids spurious effect triggers on state change
+  const latestIssueToolsRef = useRef(issueTools);
+  latestIssueToolsRef.current = issueTools;
+  const toolsAtRequestStartRef = useRef<Tool[] | null>(null);
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   console.log('[ToolSelector] Rendered - productionMode:', productionMode, 'issueTools:', issueTools.length);
 
@@ -63,16 +67,78 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     return () => clearTimeout(timeout);
   }, []);
 
+  const loadTools = useCallback(async () => {
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+
+    // Remember the exact array present when the request began. The parent may
+    // still hold tools from the previous screen/PR, and those must not be
+    // mistaken for the response to this request.
+    toolsAtRequestStartRef.current = latestIssueToolsRef.current;
+    setTools([]);
+    setLoading(true);
+    expectingNewToolsRef.current = true;
+
+    // Production mode: request tools from main branch only
+    if (productionMode) {
+      console.log('[ToolSelector] Production mode - requesting tools from main branch');
+      const success = WebSocketService.requestProductionTools();
+
+      if (!success) {
+        console.error('[ToolSelector] Failed to request production tools - WebSocket not connected');
+        setLoading(false);
+        expectingNewToolsRef.current = false;
+        return;
+      }
+
+      // Safety timeout in case tools never arrive
+      loadTimeoutRef.current = setTimeout(() => {
+        if (expectingNewToolsRef.current) {
+          console.warn('[ToolSelector] Timeout - no tools received');
+          expectingNewToolsRef.current = false;
+          setLoading(false);
+        }
+        loadTimeoutRef.current = null;
+      }, TOOL_LOAD_TIMEOUT_MS);
+
+      return;
+    }
+
+    // Development mode: the PR request is sent by IssueSelector.
+    console.log('[ToolSelector] Development mode - checking if PR is selected');
+
+    if (!selectedIssueNumber) {
+      console.log('[ToolSelector] No PR selected in development mode');
+      setLoading(false);
+      expectingNewToolsRef.current = false;
+      return;
+    }
+
+    loadTimeoutRef.current = setTimeout(() => {
+      if (expectingNewToolsRef.current) {
+        console.warn('[ToolSelector] Timeout - no tools received for selected PR');
+        expectingNewToolsRef.current = false;
+        setLoading(false);
+      }
+      loadTimeoutRef.current = null;
+    }, TOOL_LOAD_TIMEOUT_MS);
+  }, [productionMode, selectedIssueNumber]);
+
   useEffect(() => {
-    console.log('[ToolSelector] useEffect triggered - calling loadTools(), productionMode:', productionMode, 'selectedIssue:', selectedIssue?.number);
+    console.log('[ToolSelector] useEffect triggered - calling loadTools(), productionMode:', productionMode, 'selectedIssue:', selectedIssueNumber);
     loadTools();
-  }, [loadTools, productionMode, selectedIssue]);
+  }, [loadTools, productionMode, selectedIssueNumber]);
 
   // Update tools when issueTools changes (both development and production modes).
   // Uses a ref guard (not state) so the effect only fires when issueTools changes,
   // never when loading starts (which would fire with stale old-PR tools).
   useEffect(() => {
-    if (!issueTools.length || !expectingNewToolsRef.current) return;
+    if (
+      !expectingNewToolsRef.current ||
+      issueTools === toolsAtRequestStartRef.current
+    ) return;
 
     if (loadTimeoutRef.current) {
       clearTimeout(loadTimeoutRef.current);
@@ -124,68 +190,6 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
       BeepService.stopLoadingSound();
     };
   }, [loading]);
-
-  const loadTools = useCallback(async () => {
-    if (loadTimeoutRef.current) {
-      clearTimeout(loadTimeoutRef.current);
-      loadTimeoutRef.current = null;
-    }
-
-    setLoading(true);
-    expectingNewToolsRef.current = true;
-    
-    // Clear existing tools so we know when fresh ones actually arrive
-    setTools([]);
-    
-    // Production mode: request tools from main branch only
-    if (productionMode) {
-      console.log('[ToolSelector] Production mode - requesting tools from main branch');
-      const success = WebSocketService.requestProductionTools();
-      
-      if (!success) {
-        console.error('[ToolSelector] Failed to request production tools - WebSocket not connected');
-        setLoading(false);
-        expectingNewToolsRef.current = false;
-        return;
-      }
-      
-      // Safety timeout in case tools never arrive
-      loadTimeoutRef.current = setTimeout(() => {
-        if (expectingNewToolsRef.current) {
-          console.warn('[ToolSelector] Timeout - no tools received');
-          expectingNewToolsRef.current = false;
-          setLoading(false);
-        }
-        loadTimeoutRef.current = null;
-      }, TOOL_LOAD_TIMEOUT_MS);
-      
-      return;
-    }
-    
-    // Development mode: Check if a PR is selected
-    console.log('[ToolSelector] Development mode - checking if PR is selected');
-    
-    // If no PR is selected, stop loading immediately
-    if (!selectedIssue) {
-      console.log('[ToolSelector] No PR selected in development mode');
-      setLoading(false);
-      expectingNewToolsRef.current = false;
-      return;
-    }
-    
-    // PR is selected - request tools and wait for them to arrive
-    console.log('[ToolSelector] PR selected - requesting tools via WebSocket');
-    
-    // Safety timeout in case tools never arrive
-    loadTimeoutRef.current = setTimeout(() => {
-      if (expectingNewToolsRef.current) {
-        console.warn('[ToolSelector] Timeout - no tools received for selected PR');
-        expectingNewToolsRef.current = false;
-        setLoading(false);
-      }
-      loadTimeoutRef.current = null;
-    }, TOOL_LOAD_TIMEOUT_MS);
-  }, [productionMode, selectedIssue]);
 
   const handleToolPress = (tool: Tool) => {
     onToolSelect(tool);
