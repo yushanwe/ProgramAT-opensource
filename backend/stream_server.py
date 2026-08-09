@@ -5878,6 +5878,7 @@ async def generate_ideation_question(parsed_data: dict, video_summary: str, brai
 
 async def answer_brainstorm_question(
     parsed_data: dict, video_summary: str, brainstorm_context: list, user_question: str,
+    update_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Ask the system LLM to directly respond to a free-form message the user
@@ -5893,6 +5894,9 @@ async def answer_brainstorm_question(
         video_summary: Optional video summary
         brainstorm_context: Optional list of {"question": str, "answer": str} dicts for previous brainstorming rounds
         user_question: The free-form question or correction the user just sent
+        update_context: For update-mode sessions, the richer context fetched fresh from
+            GitHub (issue/PR body, implementation_summary, implementation_metadata, etc.)
+            — same data generate_ranked_question_queue uses in update mode.
 
     Returns a plain answer/confirmation string, or a sensible fallback on any error.
     """
@@ -5900,6 +5904,7 @@ async def answer_brainstorm_question(
     description = parsed_data.get('description', '')
     solution = parsed_data.get('solution', '')
     example_usage = parsed_data.get('example_usage', '')
+    additional = parsed_data.get('additional', '')
 
     video_section = ''
     if video_summary:
@@ -5916,15 +5921,35 @@ async def answer_brainstorm_question(
         if brainstorm_pairs:
             brainstorm_section = "\n\nPrevious brainstorming rounds:\n" + "\n\n".join(brainstorm_pairs)
 
+    implementation_section = ''
+    if update_context:
+        implementation_summary_json = json.dumps(update_context.get('implementation_summary') or {}, ensure_ascii=False)[:2500]
+        metadata_json = json.dumps(update_context.get('implementation_metadata') or {}, ensure_ascii=False)[:5000]
+        implementation_section = (
+            "\n\nCurrent implementation context, fetched fresh from the PR (authoritative — "
+            "prefer the actual tool source below over the parsed summary fields when they "
+            "conflict, since the source is ground truth for things like which model is used):\n"
+            f"Current tool: {update_context.get('tool_name', '')}\n"
+            f"Current tool source:\n{(update_context.get('tool_source') or '')[:6000]}\n\n"
+            f"Issue / PR context: {(update_context.get('issue_body') or '')[:2000]}\n{(update_context.get('pr_body') or '')[:2000]}\n"
+            f"Implementation summary fields (model, strategy, execution mode, runtime input, validation): {implementation_summary_json}\n"
+            f"Implementation metadata JSON: {metadata_json}"
+        )
+
     prompt = (
         "You are helping a blind or low-vision user design a camera-based assistive tool. "
-        "Below is everything known about the tool they want so far. The user has sent a "
-        "free-form message, which may be a question OR a correction/change to something "
-        "already decided (e.g. \"no, use a VLM instead of YOLO\"). "
+        "Below is everything known about the tool they want so far — including, for an "
+        "update to an existing tool, its current implementation details and source code "
+        "excerpt if available. The user has sent a free-form message, which may be a "
+        "question OR a correction/change to something already decided "
+        "(e.g. \"no, use a VLM instead of YOLO\"). "
         "If it is a question, answer it directly and concisely using only the information "
-        "below; if the answer isn't covered by what's known, say so rather than inventing "
-        "details, and if you must make a reasonable assumption to give a useful answer, "
-        "state the assumption you're making rather than asking them to choose. "
+        "below — including the current implementation context and tool source if that's "
+        "where the answer lives, e.g. which model or approach it actually uses; the actual "
+        "tool source is ground truth and takes priority over the parsed summary fields if "
+        "they ever disagree; if the answer isn't covered by what's known, say so rather than "
+        "inventing details, and if you must make a reasonable assumption to give a useful "
+        "answer, state the assumption you're making rather than asking them to choose. "
         "If it is a correction or change, briefly confirm the change back to them in plain "
         "language (e.g. \"Got it — I'll use a VLM instead of YOLO.\") so it's clear the new "
         "instruction replaces the earlier one, not adds to it. "
@@ -5934,7 +5959,9 @@ async def answer_brainstorm_question(
         f"Tool title: {title}\n"
         f"Description: {description}\n"
         f"Proposed solution: {solution}\n"
-        f"Example usage: {example_usage}"
+        f"Example usage: {example_usage}\n"
+        f"Constraints and extra context (may include current tool source): {additional}"
+        f"{implementation_section}"
         f"{video_section}"
         f"{brainstorm_section}"
         f"\n\nUser's question:\n{user_question}"
@@ -6179,13 +6206,28 @@ async def generate_ranked_question_queue(
     return deduped_fallback[:max_queue_size]
 
 
-def _build_update_issue_parsed_data(selected_issue_title: str, update_request: str, video_summary: str = '') -> Dict[str, str]:
+def _build_update_issue_parsed_data(
+    selected_issue_title: str,
+    update_request: str,
+    video_summary: str = '',
+    update_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
     additional_parts = [
         "This is an update to an existing tool.",
         update_request.strip(),
     ]
     if video_summary:
         additional_parts.append(f"Video summary: {video_summary}")
+    if update_context:
+        tool_name = update_context.get('tool_name') or ''
+        tool_source = (update_context.get('tool_source') or '')[:6000]
+        claude_summary = (update_context.get('claude_summary') or '')[:3000]
+        if tool_name:
+            additional_parts.append(f"Current tool: {tool_name}")
+        if tool_source:
+            additional_parts.append(f"Current tool source excerpt:\n{tool_source}")
+        if claude_summary:
+            additional_parts.append(f"Claude implementation summary: {claude_summary}")
     return {
         'title': selected_issue_title or 'Existing tool update',
         'description': update_request.strip(),
@@ -7300,10 +7342,13 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
     brainstorm_history = entry.get('brainstorm_history', [])
     parsed_data = entry['parsed_data']
     video_summary = entry['video_summary']
+    update_context = entry.get('update_context')
     await _broadcast_ws({'type': 'progress', 'message': 'Answering your question…'})
 
     try:
-        answer = await answer_brainstorm_question(parsed_data, video_summary, brainstorm_history, user_question)
+        answer = await answer_brainstorm_question(
+            parsed_data, video_summary, brainstorm_history, user_question, update_context,
+        )
     except Exception:
         logger.warning("answer_brainstorm_question failed in /brainstorm-ask-agent", exc_info=True)
         answer = "Sorry, I wasn't able to answer that just now."
@@ -7487,7 +7532,7 @@ async def handle_update_submit(request: web.Request) -> web.Response:
                     'pr_diff': '',
                 }
 
-            parsed_data = _build_update_issue_parsed_data(update_context.get('issue_title', ''), text.strip(), video_summary)
+            parsed_data = _build_update_issue_parsed_data(update_context.get('issue_title', ''), text.strip(), video_summary, update_context)
             await _broadcast_ws({'type': 'progress', 'message': 'Generating the next question…'})
             try:
                 results = await asyncio.gather(

@@ -69,7 +69,7 @@ DEFAULT_TAKE_PHOTO_POLICY = {
 }
 
 # Infrastructure calls are deliberately separate from generated visual tool policies.
-SYSTEM_MODEL = "groq/llama-3.1-8b-instant"
+SYSTEM_MODEL = "gemini/gemini-3.1-flash-lite"
 
 # Transcript parsing uses Gemini instead of the Groq system model; ideation
 # questions and summaries still use SYSTEM_MODEL.

@@ -960,6 +960,7 @@ export default function IssueChat({
           token,
         });
         setActiveToken(token);
+        setAwaiting('choice');
         append({
           kind: 'assistant-choice-prompt',
           id: nextId('assistant-choice-prompt'),

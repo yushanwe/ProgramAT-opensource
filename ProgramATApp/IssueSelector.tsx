@@ -176,18 +176,32 @@ export default function IssueSelector({
     onClose();
   };
 
+  // GitHub issues and PRs share one number sequence, so a PR opened to
+  // implement an issue always has a higher number than the issue itself
+  // (e.g. issue #171, PR #172 with body "Fixes #171"). The backend's
+  // update flow looks up context by issue number, so this must resolve to
+  // the linked issue — never the PR's own number — or update requests are
+  // sent for a nonexistent issue and it looks like no implementation exists.
+  const resolveIssueNumber = (pr: PR): number => {
+    const mentioned = pr.mentioned_issues && pr.mentioned_issues.length > 0
+      ? parseInt(pr.mentioned_issues[0], 10)
+      : NaN;
+    return Number.isFinite(mentioned) ? mentioned : pr.number;
+  };
+
   const handlePRPress = (pr: PR) => {
     console.log('[IssueSelector] PR selected:', pr.number, pr.title);
 
     const openTools = () => {
-      WebSocketService.sendIssueSelection('update', pr.number, pr.title);
+      const issueNumber = resolveIssueNumber(pr);
+      WebSocketService.sendIssueSelection('update', issueNumber, pr.title);
       if (reviewMode) {
         WebSocketService.requestPRToolsFromReview(pr.number);
       } else {
         WebSocketService.requestPRTools(pr.number);
       }
       const prAsIssue: Issue = {
-        number: pr.number,
+        number: issueNumber,
         title: pr.title,
         labels: [],
         created_at: pr.created_at,
@@ -240,18 +254,19 @@ export default function IssueSelector({
           text: 'Update Issue',
           onPress: () => {
             console.log('[IssueSelector] Opening update mode for PR:', pr.number);
-            
-            WebSocketService.sendIssueSelection('update', pr.number, pr.title);
+
+            const issueNumber = resolveIssueNumber(pr);
+            WebSocketService.sendIssueSelection('update', issueNumber, pr.title);
             WebSocketService.requestPRTools(pr.number); // non-review mode only
-            
+
             const prAsIssue: Issue = {
-              number: pr.number,
+              number: issueNumber,
               title: pr.title,
               labels: [],
               created_at: pr.created_at,
               updated_at: pr.updated_at
             };
-            
+
             onIssueSelect(prAsIssue);
             onClose();
           }

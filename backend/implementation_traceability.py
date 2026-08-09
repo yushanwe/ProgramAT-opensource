@@ -510,6 +510,12 @@ def resolve_update_brainstorm_context(
                 resolved_pr = candidate
                 break
 
+    logger.info(
+        "[update_context DEBUG] issue=#%s resolved_pr=%s",
+        issue_number,
+        f"#{resolved_pr.number} ({resolved_pr.head.ref})" if resolved_pr is not None else "NONE FOUND",
+    )
+
     pr_metadata: Dict[str, Any] = {}
     saved_metadata: Dict[str, Any] = {}
     saved_action_log = ''
@@ -528,23 +534,43 @@ def resolve_update_brainstorm_context(
         try:
             metadata_file = repo.get_contents(IMPLEMENTATION_CONTEXT_PATH, ref=resolved_pr.head.sha)
             saved_metadata = json.loads(metadata_file.decoded_content.decode('utf-8', errors='replace'))
-        except Exception:
+            logger.info(
+                "[update_context DEBUG] fetched %s at sha=%s: tool_path=%s keys=%s",
+                IMPLEMENTATION_CONTEXT_PATH, resolved_pr.head.sha,
+                saved_metadata.get('tool_path'), list(saved_metadata.keys()),
+            )
+        except Exception as e:
             saved_metadata = {}
+            logger.warning(
+                "[update_context DEBUG] FAILED to fetch %s at sha=%s: %s",
+                IMPLEMENTATION_CONTEXT_PATH, resolved_pr.head.sha, e,
+            )
 
         action_log_path = str(saved_metadata.get('action_log_path') or DEFAULT_ACTION_LOG_PATH).strip() or DEFAULT_ACTION_LOG_PATH
         try:
             action_log_file = repo.get_contents(action_log_path, ref=resolved_pr.head.sha)
             saved_action_log = sanitize_action_logs(action_log_file.decoded_content.decode('utf-8', errors='replace'))
-        except Exception:
+        except Exception as e:
             saved_action_log = ''
+            logger.warning("[update_context DEBUG] FAILED to fetch action log %s: %s", action_log_path, e)
 
         tool_path = saved_metadata.get('tool_path')
         if isinstance(tool_path, str) and tool_path:
             try:
                 tool_file = repo.get_contents(tool_path, ref=resolved_pr.head.sha)
                 saved_tool_source = tool_file.decoded_content.decode('utf-8', errors='replace')
-            except Exception:
+                logger.info(
+                    "[update_context DEBUG] fetched tool_source from %s: %d chars",
+                    tool_path, len(saved_tool_source),
+                )
+            except Exception as e:
                 saved_tool_source = ''
+                logger.warning("[update_context DEBUG] FAILED to fetch tool_source %s: %s", tool_path, e)
+        else:
+            logger.warning(
+                "[update_context DEBUG] no tool_path in saved_metadata — cannot fetch tool_source. saved_metadata=%s",
+                saved_metadata,
+            )
 
         try:
             pr_comments = [
