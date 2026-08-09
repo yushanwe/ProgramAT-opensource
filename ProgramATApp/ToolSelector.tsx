@@ -133,8 +133,8 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
       setTimeout(() => {
         if (expectingNewToolsRef.current) {
           console.warn('[ToolSelector] Timeout - no tools received');
+          expectingNewToolsRef.current = false;
           setLoading(false);
-          // Leave the ref true so late-arriving tools are still processed and shown
         }
       }, 60000); // 60 second safety timeout
       
@@ -159,8 +159,8 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     setTimeout(() => {
       if (expectingNewToolsRef.current) {
         console.warn('[ToolSelector] Timeout - no tools received for selected PR');
+        expectingNewToolsRef.current = false;
         setLoading(false);
-        // Leave the ref true so late-arriving tools are still processed and shown
       }
     }, 60000);
   }, [productionMode, selectedIssue]);
