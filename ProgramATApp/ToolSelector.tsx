@@ -3,7 +3,7 @@
  * Displays available tools from the tools folder and allows selection
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   StyleSheet,
   Text,
@@ -44,12 +44,14 @@ interface ToolSelectorProps {
   selectedIssue?: {number: number; title: string} | null;
 }
 
+const TOOL_LOAD_TIMEOUT_MS = 60000;
+
 export default function ToolSelector({ onToolSelect, selectedTool, issueTools = [], productionMode = false, selectedIssue = null }: ToolSelectorProps) {
   const { theme } = useTheme();
   const [tools, setTools] = useState<Tool[]>([]);
   const [loading, setLoading] = useState(true);
-  const [expectingNewTools, setExpectingNewTools] = useState(false);
-  const [loadingStartTime, setLoadingStartTime] = useState<number>(0); // Track when loading started
+  const expectingNewToolsRef = useRef(false); // ref avoids spurious effect triggers on state change
+  const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   console.log('[ToolSelector] Rendered - productionMode:', productionMode, 'issueTools:', issueTools.length);
 
   // Announce the screen title when entering the tool selector.
@@ -64,33 +66,39 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
   useEffect(() => {
     console.log('[ToolSelector] useEffect triggered - calling loadTools(), productionMode:', productionMode, 'selectedIssue:', selectedIssue?.number);
     loadTools();
-  }, [productionMode, selectedIssue]);
+  }, [loadTools, productionMode, selectedIssue]);
 
-  // Update tools when issueTools changes (both development and production modes)
+  // Update tools when issueTools changes (both development and production modes).
+  // Uses a ref guard (not state) so the effect only fires when issueTools changes,
+  // never when loading starts (which would fire with stale old-PR tools).
   useEffect(() => {
-    if (issueTools.length > 0) {
-      console.log('[ToolSelector] Received tools:', issueTools.length);
-      console.log('[ToolSelector] Tool names:', issueTools.map(t => t.name));
-      issueTools.forEach(tool => {
-        console.log(
-          `[Runtime Input] tool=${tool.path || tool.name} enabled=${tool.runtime_input ? 'true' : 'false'}`,
-        );
-      });
-      
-      // Update the tools
-      setTools(issueTools);
-      
-      // If we were expecting new tools (i.e., we cleared tools and requested fresh ones)
-      // OR if we had no tools before, then stop loading
-      if (expectingNewTools || tools.length === 0) {
-        console.log('[ToolSelector] Fresh tools arrived, stopping loading');
-        setLoading(false);
-        setExpectingNewTools(false);
-      } else {
-        console.log('[ToolSelector] Tools updated but not expecting new ones');
-      }
+    if (!issueTools.length || !expectingNewToolsRef.current) return;
+
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
     }
-  }, [issueTools, expectingNewTools, tools.length]);
+
+    console.log('[ToolSelector] Received tools:', issueTools.length);
+    console.log('[ToolSelector] Tool names:', issueTools.map(t => t.name));
+    issueTools.forEach(tool => {
+      console.log(
+        `[Runtime Input] tool=${tool.path || tool.name} enabled=${tool.runtime_input ? 'true' : 'false'}`,
+      );
+    });
+
+    expectingNewToolsRef.current = false;
+    setTools(issueTools);
+    setLoading(false);
+    console.log('[ToolSelector] Fresh sorted tools arrived, loading complete');
+  }, [issueTools]);
+
+  useEffect(() => () => {
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+  }, []);
 
   // Loading sound effect for tool fetching
   useEffect(() => {
@@ -117,10 +125,14 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     };
   }, [loading]);
 
-  const loadTools = async () => {
+  const loadTools = useCallback(async () => {
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+
     setLoading(true);
-    setExpectingNewTools(true);
-    setLoadingStartTime(Date.now());
+    expectingNewToolsRef.current = true;
     
     // Clear existing tools so we know when fresh ones actually arrive
     setTools([]);
@@ -133,18 +145,19 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
       if (!success) {
         console.error('[ToolSelector] Failed to request production tools - WebSocket not connected');
         setLoading(false);
-        setExpectingNewTools(false);
+        expectingNewToolsRef.current = false;
         return;
       }
       
       // Safety timeout in case tools never arrive
-      setTimeout(() => {
-        if (tools.length === 0) {
+      loadTimeoutRef.current = setTimeout(() => {
+        if (expectingNewToolsRef.current) {
           console.warn('[ToolSelector] Timeout - no tools received');
+          expectingNewToolsRef.current = false;
           setLoading(false);
-          setExpectingNewTools(false);
         }
-      }, 10000); // 10 second safety timeout
+        loadTimeoutRef.current = null;
+      }, TOOL_LOAD_TIMEOUT_MS);
       
       return;
     }
@@ -156,7 +169,7 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     if (!selectedIssue) {
       console.log('[ToolSelector] No PR selected in development mode');
       setLoading(false);
-      setExpectingNewTools(false);
+      expectingNewToolsRef.current = false;
       return;
     }
     
@@ -164,14 +177,15 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     console.log('[ToolSelector] PR selected - requesting tools via WebSocket');
     
     // Safety timeout in case tools never arrive
-    setTimeout(() => {
-      if (tools.length === 0) {
+    loadTimeoutRef.current = setTimeout(() => {
+      if (expectingNewToolsRef.current) {
         console.warn('[ToolSelector] Timeout - no tools received for selected PR');
+        expectingNewToolsRef.current = false;
         setLoading(false);
-        setExpectingNewTools(false);
       }
-    }, 10000);
-  };
+      loadTimeoutRef.current = null;
+    }, TOOL_LOAD_TIMEOUT_MS);
+  }, [productionMode, selectedIssue]);
 
   const handleToolPress = (tool: Tool) => {
     onToolSelect(tool);
@@ -194,7 +208,7 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
         </Text>
         {productionMode && (
           <View style={[styles.productionBadge, { backgroundColor: theme.success }]} accessible={false}>
-            <Text style={[styles.productionBadgeText, { color: '#fff' }]} accessible={false}>🚀 Production Mode</Text>
+            <Text style={styles.productionBadgeText} accessible={false}>🚀 Production Mode</Text>
           </View>
         )}
       </View>
@@ -203,27 +217,9 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
         <View style={styles.loadingContainer}>
           <Text style={[styles.loadingText, { color: theme.textSecondary }]}>Loading tools...</Text>
         </View>
-      ) : tools.length === 0 ? (
-        <View style={styles.emptyContainer}>
-          {!productionMode && !selectedIssue ? (
-            <>
-              <Text style={[styles.emptyText, { color: theme.textTertiary }]}>No Branch Selected</Text>
-              <Text style={[styles.emptySubtext, { color: theme.textTertiary }]}>
-                Go to the PRs tab to select a pull request
-              </Text>
-            </>
-          ) : (
-            <>
-              <Text style={[styles.emptyText, { color: theme.textTertiary }]}>No tools found</Text>
-              <Text style={[styles.emptySubtext, { color: theme.textTertiary }]}>
-                Request a tool to be created in your issue description
-              </Text>
-            </>
-          )}
-        </View>
-      ) : (
+      ) : tools.length > 0 ? (
         <ScrollView style={styles.toolList}>
-          {tools.map((tool, index) => {
+          {tools.map((tool) => {
             // Build comprehensive accessibility label including all metadata
             const accessibilityParts = [tool.name];
             if (tool.description) accessibilityParts.push(tool.description);
@@ -234,7 +230,7 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
             
             return (
               <TouchableOpacity
-                key={index}
+                key={`${tool.path}:${tool.name}`}
                 style={[
                   styles.toolCard,
                   { 
@@ -283,6 +279,24 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
             );
           })}
         </ScrollView>
+      ) : (
+        <View style={styles.emptyContainer}>
+          {!productionMode && !selectedIssue ? (
+            <>
+              <Text style={[styles.emptyText, { color: theme.textTertiary }]}>No Branch Selected</Text>
+              <Text style={[styles.emptySubtext, { color: theme.textTertiary }]}>
+                Go to the PRs tab to select a pull request
+              </Text>
+            </>
+          ) : (
+            <>
+              <Text style={[styles.emptyText, { color: theme.textTertiary }]}>No tools found</Text>
+              <Text style={[styles.emptySubtext, { color: theme.textTertiary }]}>
+                Request a tool to be created in your issue description
+              </Text>
+            </>
+          )}
+        </View>
       )}
 
       <View style={[styles.footer, { backgroundColor: theme.background, borderTopColor: theme.border }]}>
@@ -390,6 +404,7 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
   },
   productionBadgeText: {
+    color: '#fff',
     fontSize: 12,
     fontWeight: '600',
   },
