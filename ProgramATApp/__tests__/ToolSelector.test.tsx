@@ -113,6 +113,9 @@ describe('ToolSelector', () => {
     expect(
       tree!.root.findAll(node => node.props?.children === 'new_tool').length,
     ).toBeGreaterThan(0);
+    expect(
+      tree!.root.findAllByProps({ children: 'Loading tools...' }),
+    ).toHaveLength(0);
 
     await ReactTestRenderer.act(() => {
       tree!.unmount();

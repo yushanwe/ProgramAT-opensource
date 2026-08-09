@@ -79,17 +79,10 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
       );
     });
 
-    // Set tools immediately — the render condition shows the list as soon as
-    // tools.length > 0, so the list becomes visible before loading clears.
     expectingNewToolsRef.current = false;
     setTools(issueTools);
-
-    // Keep beeps going for 300ms after the list appears so the native render
-    // has time to commit to screen before beeps stop. rAF alone (~16ms) is
-    // not enough on the React Native bridge.
-    const stopTimer = setTimeout(() => setLoading(false), 300);
-    console.log('[ToolSelector] Fresh sorted tools arrived, list rendering, beeps stop in 300ms');
-    return () => clearTimeout(stopTimer);
+    setLoading(false);
+    console.log('[ToolSelector] Fresh sorted tools arrived, loading complete');
   }, [issueTools]);
 
   // Loading sound effect for tool fetching
@@ -198,10 +191,11 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
         )}
       </View>
 
-      {tools.length > 0 ? (
-        // Show list as soon as tools.length > 0, even while loading=true.
-        // This ensures the list is committed to screen before loading clears,
-        // so beeps stop only after the list is visible.
+      {loading ? (
+        <View style={styles.loadingContainer}>
+          <Text style={[styles.loadingText, { color: theme.textSecondary }]}>Loading tools...</Text>
+        </View>
+      ) : tools.length > 0 ? (
         <ScrollView style={styles.toolList}>
           {tools.map((tool) => {
             // Build comprehensive accessibility label including all metadata
@@ -263,10 +257,6 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
             );
           })}
         </ScrollView>
-      ) : loading ? (
-        <View style={styles.loadingContainer}>
-          <Text style={[styles.loadingText, { color: theme.textSecondary }]}>Loading tools...</Text>
-        </View>
       ) : (
         <View style={styles.emptyContainer}>
           {!productionMode && !selectedIssue ? (
