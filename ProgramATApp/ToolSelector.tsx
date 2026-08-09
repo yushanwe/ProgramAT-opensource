@@ -44,7 +44,7 @@ interface ToolSelectorProps {
   selectedIssue?: {number: number; title: string} | null;
 }
 
-const TOOL_LOAD_TIMEOUT_MS = 60000;
+const TOOL_LOAD_TIMEOUT_MS = 10000;
 
 export default function ToolSelector({ onToolSelect, selectedTool, issueTools = [], productionMode = false, selectedIssue = null }: ToolSelectorProps) {
   const { theme } = useTheme();
