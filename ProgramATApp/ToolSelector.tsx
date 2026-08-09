@@ -51,6 +51,7 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
   const [tools, setTools] = useState<Tool[]>([]);
   const [loading, setLoading] = useState(true);
   const expectingNewToolsRef = useRef(false); // ref avoids spurious effect triggers on state change
+  const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   console.log('[ToolSelector] Rendered - productionMode:', productionMode, 'issueTools:', issueTools.length);
 
   // Announce the screen title when entering the tool selector.
@@ -73,6 +74,11 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
   useEffect(() => {
     if (!issueTools.length || !expectingNewToolsRef.current) return;
 
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+
     console.log('[ToolSelector] Received tools:', issueTools.length);
     console.log('[ToolSelector] Tool names:', issueTools.map(t => t.name));
     issueTools.forEach(tool => {
@@ -86,6 +92,13 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     setLoading(false);
     console.log('[ToolSelector] Fresh sorted tools arrived, loading complete');
   }, [issueTools]);
+
+  useEffect(() => () => {
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+  }, []);
 
   // Loading sound effect for tool fetching
   useEffect(() => {
@@ -113,6 +126,11 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
   }, [loading]);
 
   const loadTools = useCallback(async () => {
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+
     setLoading(true);
     expectingNewToolsRef.current = true;
     
@@ -132,12 +150,13 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
       }
       
       // Safety timeout in case tools never arrive
-      setTimeout(() => {
+      loadTimeoutRef.current = setTimeout(() => {
         if (expectingNewToolsRef.current) {
           console.warn('[ToolSelector] Timeout - no tools received');
           expectingNewToolsRef.current = false;
           setLoading(false);
         }
+        loadTimeoutRef.current = null;
       }, TOOL_LOAD_TIMEOUT_MS);
       
       return;
@@ -158,12 +177,13 @@ export default function ToolSelector({ onToolSelect, selectedTool, issueTools = 
     console.log('[ToolSelector] PR selected - requesting tools via WebSocket');
     
     // Safety timeout in case tools never arrive
-    setTimeout(() => {
+    loadTimeoutRef.current = setTimeout(() => {
       if (expectingNewToolsRef.current) {
         console.warn('[ToolSelector] Timeout - no tools received for selected PR');
         expectingNewToolsRef.current = false;
         setLoading(false);
       }
+      loadTimeoutRef.current = null;
     }, TOOL_LOAD_TIMEOUT_MS);
   }, [productionMode, selectedIssue]);
 
