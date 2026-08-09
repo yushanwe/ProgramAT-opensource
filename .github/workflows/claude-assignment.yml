@@ -459,18 +459,18 @@ jobs:
             --workflow-run-id "$WORKFLOW_RUN_ID" \
             --workflow-job-url "$workflow_job_url"
 
-          if ! git diff --quiet -- \
+          git add \
+            .programat/implementation_context.json \
+            .programat/claude_action_log.txt
+
+          if git diff --cached --quiet -- \
             .programat/implementation_context.json \
             .programat/claude_action_log.txt
           then
-            git add \
-              .programat/implementation_context.json \
-              .programat/claude_action_log.txt
-
+            echo "No implementation context changes to commit."
+          else
             git commit \
               -m "Persist implementation context for issue #${ISSUE_NUMBER}"
 
             git push origin "HEAD:${branch_name}"
-          else
-            echo "No implementation context changes to commit."
           fi
