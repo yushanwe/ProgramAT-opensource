@@ -38,6 +38,7 @@ interface TabNavigatorProps {
   copilotLogs?: any[];
   onClearCopilotData?: () => void;
   onToolRunnerVisibilityChange?: (visible: boolean) => void;
+  onToolsLoadStart?: () => void;
 }
 
 type TabName = 'prs' | 'tools' | 'settings' | 'chat';
@@ -58,6 +59,7 @@ export default function TabNavigator({
   copilotLogs = [],
   onClearCopilotData,
   onToolRunnerVisibilityChange,
+  onToolsLoadStart,
 }: TabNavigatorProps) {
   const { theme } = useTheme();
   const [appMode, setAppMode] = useState<AppMode>(Config.APP_MODE);
@@ -67,6 +69,9 @@ export default function TabNavigator({
   const insets = useSafeAreaInsets();
 
   const handleModeChange = (newMode: AppMode) => {
+    if (newMode === 'production') {
+      onToolsLoadStart?.();
+    }
     setAppMode(newMode);
     Config.APP_MODE = newMode;
 
