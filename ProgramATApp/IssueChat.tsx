@@ -660,6 +660,7 @@ export default function IssueChat({
       setActiveToken(result.token);
 
       if (result.status === 'agent_answer') {
+        if (wasAwaitingChoice) resolveLatestChoicePrompt();
         append({
           kind: 'assistant-clarification-answer',
           id: nextId('assistant-clarification-answer'),
@@ -669,6 +670,14 @@ export default function IssueChat({
           token: result.token,
         });
         setAwaiting('choice');
+        append({
+          kind: 'assistant-choice-prompt',
+          id: nextId('assistant-choice-prompt'),
+          ts: new Date(),
+          text: 'You can keep brainstorming, start building, or send another message.',
+          token: result.token,
+          resolved: false,
+        });
         return;
       }
 
