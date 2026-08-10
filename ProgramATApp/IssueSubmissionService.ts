@@ -2,12 +2,11 @@
  * IssueSubmissionService
  * HTTP layer for the chat-style issue creation/update flow. Every call in
  * this module hits the existing /submit-creation, /submit-update,
- * /brainstorm-next-question, and /brainstorm-ask-agent REST endpoints — no
- * backend changes.
+ * /brainstorm-next-question, and /brainstorm-ask-agent REST endpoints.
  */
 
 import WebSocketService from './WebSocketService';
-import { AskAgentResponse, ClaudeProgressResponse, CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
+import { BrainstormTurnResponse, ClaudeProgressResponse, CreationResponse, NextQuestionResponse, UpdateResponse } from './IssueChatTypes';
 
 const REQUEST_TIMEOUT_MS = 120_000; // text-only requests: brainstorm question, no video
 const VIDEO_REQUEST_TIMEOUT_MS = 300_000; // video upload + summarization + two Gemini calls; uploads over a tunnel (e.g. ngrok) can be slow
@@ -165,7 +164,7 @@ export async function nextBrainstormQuestion(token: string): Promise<NextQuestio
   }
 }
 
-export async function askBrainstormAgent(token: string, question: string): Promise<AskAgentResponse> {
+export async function submitBrainstormTurn(token: string, text: string): Promise<BrainstormTurnResponse> {
   const baseUrl = getHttpBaseUrl();
   if (!baseUrl) {
     return { status: 'error', error: 'Server URL not configured' };
@@ -174,17 +173,20 @@ export async function askBrainstormAgent(token: string, question: string): Promi
   try {
     const response = await postWithTimeout(
       `${baseUrl}/brainstorm-ask-agent`,
-      JSON.stringify({ token, question }),
+      JSON.stringify({ token, text }),
       { 'Content-Type': 'application/json' },
     );
     const result = await response.json();
     console.log('[IssueSubmissionService] brainstorm-ask-agent response:', JSON.stringify(result));
-    return result as AskAgentResponse;
+    return result as BrainstormTurnResponse;
   } catch (e) {
     console.log('[IssueSubmissionService] brainstorm-ask-agent threw:', String(e));
     return { status: 'error', error: 'Network error. Please try again.' };
   }
 }
+
+// Compatibility alias for callers outside IssueChat that still use the old name.
+export const askBrainstormAgent = submitBrainstormTurn;
 
 export interface FetchClaudeProgressArgs {
   mode: 'create' | 'update';

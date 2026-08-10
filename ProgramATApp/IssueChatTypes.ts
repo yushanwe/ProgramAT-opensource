@@ -7,11 +7,9 @@ export type RetryDescriptor =
   | { op: 'create-text'; text: string }
   | { op: 'create-video'; text: string; videoUri: string }
   | { op: 'update'; text: string; videoUri: string | null; issueNumber: number }
-  | { op: 'update-answer'; text: string; token: string; issueNumber: number }
-  | { op: 'ideation-answer'; text: string; token: string }
+  | { op: 'brainstorm-turn'; text: string; token: string }
   | { op: 'next-question'; token: string }
-  | { op: 'start-building'; token: string; mode?: 'create' | 'update'; issueNumber?: number }
-  | { op: 'ask-agent'; token: string; question: string };
+  | { op: 'start-building'; token: string; mode?: 'create' | 'update'; issueNumber?: number };
 
 export type IssueChatItem =
   | { kind: 'user-text'; id: string; ts: Date; text: string }
@@ -82,6 +80,10 @@ export interface ClaudeProgressResponse {
   error?: string;
 }
 
-export type AskAgentResponse =
-  | { status: 'clarification'; token: string; answer: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
+export type BrainstormTurnResponse =
+  | { status: 'clarification'; token: string; answer: string; question: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
+  | { status: 'agent_answer'; token: string; answer: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
+  | { status: 'brainstorm_choice'; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string };
+
+export type AskAgentResponse = BrainstormTurnResponse;

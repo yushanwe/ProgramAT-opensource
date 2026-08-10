@@ -35,7 +35,7 @@ import WebSocketService from './WebSocketService';
 import VideoRecorderModal from './VideoRecorderModal';
 import { isBrainstormingEnabled, isBasicModeEnabled } from './Settings';
 import { ClaudeProgressResponse, IssueChatItem, RetryDescriptor } from './IssueChatTypes';
-import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion, askBrainstormAgent } from './IssueSubmissionService';
+import { fetchClaudeProgress, submitCreation, submitUpdate, nextBrainstormQuestion, submitBrainstormTurn } from './IssueSubmissionService';
 import {
   buildClaudeAccessibilitySections,
   buildClaudeAccessibilityLabel,
@@ -622,57 +622,98 @@ export default function IssueChat({
     }
   };
 
-  const sendIdeationAnswer = async (answer: string, token: string) => {
-    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: answer });
-    setComposeText('');
-    Keyboard.dismiss();
-    setIsSending(true);
-    inFlightRef.current = true;
-    try {
-      const result = await submitCreation({ text: answer, ideationAnswer: answer, token });
-      if (result.status === 'error' && result.error === 'Ideation session expired or not found') {
-        resetConversation();
-        append({
-          kind: 'assistant-error',
-          id: nextId('assistant-error'),
-          ts: new Date(),
-          text: 'That brainstorming session expired. Send your description again to start over.',
-        });
-        return;
-      }
-      handleCreationResponse(result, { op: 'ideation-answer', text: answer, token });
-    } finally {
-      inFlightRef.current = false;
-      setProgressText(null);
-      setIsSending(false);
+  const sendBrainstormTurn = async (text: string, token: string, appendUser = true) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const wasAwaitingChoice = awaiting === 'choice';
+    if (appendUser) {
+      append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
     }
-  };
-
-  const sendUpdateIdeationAnswer = async (answer: string, token: string) => {
-    if (!selectedIssue) return;
-    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: answer });
     setComposeText('');
     Keyboard.dismiss();
     setIsSending(true);
     inFlightRef.current = true;
     try {
-      const result = await submitUpdate({
-        text: answer,
-        issueNumber: selectedIssue.number,
-        ideationAnswer: answer,
-        token,
-      });
-      if (result.status === 'error' && result.error === 'Ideation session expired or not found') {
-        resetConversation();
+      const result = await submitBrainstormTurn(token, trimmed);
+      if (result.status === 'error') {
+        if (result.error === 'Ideation session expired or not found' || result.error === 'Brainstorm session expired or not found') {
+          resetConversation();
+          append({
+            kind: 'assistant-error',
+            id: nextId('assistant-error'),
+            ts: new Date(),
+            text: `That brainstorming session expired. Send your ${isCreateMode ? 'description' : 'update'} again to start over.`,
+          });
+          return;
+        }
         append({
           kind: 'assistant-error',
           id: nextId('assistant-error'),
           ts: new Date(),
-          text: 'That brainstorming session expired. Send your update again to start over.',
+          text: result.error || 'Failed to process that brainstorming response',
+          retry: { op: 'brainstorm-turn', token, text: trimmed },
         });
         return;
       }
-      handleUpdateResponse(result, { op: 'update-answer', text: answer, token, issueNumber: selectedIssue.number });
+
+      brainstormHistoryRef.current = result.brainstorm_history || [];
+      setActiveToken(result.token);
+
+      if (result.status === 'agent_answer') {
+        if (wasAwaitingChoice) resolveLatestChoicePrompt();
+        append({
+          kind: 'assistant-clarification-answer',
+          id: nextId('assistant-clarification-answer'),
+          ts: new Date(),
+          question: trimmed,
+          answer: result.answer,
+          token: result.token,
+        });
+        setAwaiting('choice');
+        append({
+          kind: 'assistant-choice-prompt',
+          id: nextId('assistant-choice-prompt'),
+          ts: new Date(),
+          text: 'You can keep brainstorming, start building, or send another message.',
+          token: result.token,
+          resolved: false,
+        });
+        return;
+      }
+
+      if (result.status === 'clarification') {
+        if (wasAwaitingChoice) resolveLatestChoicePrompt();
+        append({
+          kind: 'assistant-clarification-answer',
+          id: nextId('assistant-clarification-answer'),
+          ts: new Date(),
+          question: trimmed,
+          answer: result.answer,
+          token: result.token,
+        });
+        append({
+          kind: 'assistant-question',
+          id: nextId('assistant-question'),
+          ts: new Date(),
+          question: result.question,
+          token: result.token,
+        });
+        setAwaiting('answer');
+        return;
+      }
+
+      setAwaiting('choice');
+      if (wasAwaitingChoice) resolveLatestChoicePrompt();
+      if (result.summary) setUnderstandingSummary(result.summary);
+      if (result.integration_note) setLastIntegrated(result.integration_note);
+      append({
+        kind: 'assistant-choice-prompt',
+        id: nextId('assistant-choice-prompt'),
+        ts: new Date(),
+        text: 'Thanks for that context! You can keep brainstorming or start building.',
+        token: result.token,
+        resolved: false,
+      });
     } finally {
       inFlightRef.current = false;
       setProgressText(null);
@@ -862,7 +903,6 @@ export default function IssueChat({
       if (isCreateMode) {
         const result = await submitCreation({
           text: lastAnswer,
-          ideationAnswer: lastAnswer,
           token: activeToken,
           choice: 'start_building',
         });
@@ -892,7 +932,6 @@ export default function IssueChat({
         const result = await submitUpdate({
           text: lastAnswer,
           issueNumber: selectedIssue.number,
-          ideationAnswer: lastAnswer,
           token: activeToken,
           choice: 'start_building',
         });
@@ -924,59 +963,6 @@ export default function IssueChat({
             retry: { op: 'start-building', token: activeToken, mode: 'update', issueNumber: selectedIssue.number },
           });
         }
-      }
-    } finally {
-      inFlightRef.current = false;
-      setProgressText(null);
-      setIsSending(false);
-    }
-  };
-
-  // Any message sent while a choice prompt is showing (i.e. not a direct
-  // answer to a pending structured question) is treated as a free-form
-  // question to the agent — no explicit "Talk to Agent" action needed.
-  const sendAgentQuestion = async (question: string, token: string) => {
-    const trimmed = question.trim();
-    if (!trimmed) return;
-    resolveLatestChoicePrompt();
-    append({ kind: 'user-text', id: nextId('user-text'), ts: new Date(), text: trimmed });
-    setComposeText('');
-    Keyboard.dismiss();
-    setAwaiting(null);
-    setIsSending(true);
-    inFlightRef.current = true;
-    try {
-      const result = await askBrainstormAgent(token, trimmed);
-      if (result.status === 'clarification') {
-        brainstormHistoryRef.current = result.brainstorm_history || [];
-        if (result.summary) setUnderstandingSummary(result.summary);
-        if (result.integration_note) setLastIntegrated(result.integration_note);
-        append({
-          kind: 'assistant-clarification-answer',
-          id: nextId('assistant-clarification-answer'),
-          ts: new Date(),
-          question: trimmed,
-          answer: result.answer,
-          token,
-        });
-        setActiveToken(token);
-        setAwaiting('choice');
-        append({
-          kind: 'assistant-choice-prompt',
-          id: nextId('assistant-choice-prompt'),
-          ts: new Date(),
-          text: 'Anything else? You can keep brainstorming, start building, or ask another question.',
-          token,
-          resolved: false,
-        });
-      } else {
-        append({
-          kind: 'assistant-error',
-          id: nextId('assistant-error'),
-          ts: new Date(),
-          text: result.error || 'Failed to get an answer',
-          retry: { op: 'ask-agent', token, question: trimmed },
-        });
       }
     } finally {
       inFlightRef.current = false;
@@ -1018,20 +1004,14 @@ export default function IssueChat({
       case 'update':
         sendUpdate(retry.text, retry.videoUri);
         return;
-      case 'update-answer':
-        sendUpdateIdeationAnswer(retry.text, retry.token);
-        return;
-      case 'ideation-answer':
-        sendIdeationAnswer(retry.text, retry.token);
+      case 'brainstorm-turn':
+        sendBrainstormTurn(retry.text, retry.token, false);
         return;
       case 'next-question':
         handleKeepBrainstorming();
         return;
       case 'start-building':
         handleStartBuilding();
-        return;
-      case 'ask-agent':
-        sendAgentQuestion(retry.question, retry.token);
         return;
     }
   };
@@ -1041,19 +1021,14 @@ export default function IssueChat({
     if (!text && !stagedVideoUri) return;
 
     if (awaiting === 'answer' && activeToken) {
-      if (isCreateMode) {
-        sendIdeationAnswer(text, activeToken);
-      } else {
-        sendUpdateIdeationAnswer(text, activeToken);
-      }
+      sendBrainstormTurn(text, activeToken);
       return;
     }
 
-    // Any message that isn't a direct answer to a pending structured
-    // question, sent while a brainstorming choice prompt is showing, is
-    // treated as a free-form question to the agent.
+    // The server accepts clarification questions here and rejects ordinary
+    // answers with guidance to use one of the explicit choice buttons.
     if (awaiting === 'choice' && activeToken) {
-      sendAgentQuestion(text, activeToken);
+      sendBrainstormTurn(text, activeToken);
       return;
     }
 
@@ -1107,7 +1082,7 @@ export default function IssueChat({
 
   const placeholder =
     awaiting === 'choice'
-      ? 'Ask a question, or tap an option above…'
+      ? 'Ask a question, add a requirement, or tap an option above…'
       : awaiting === 'answer'
       ? 'Type your answer…'
       : stagedVideoUri
@@ -1123,7 +1098,7 @@ export default function IssueChat({
     : awaiting === 'answer'
     ? 'Send answer'
     : awaiting === 'choice'
-    ? 'Send question'
+    ? 'Send message'
     : 'Send text';
 
   const renderItem = (item: IssueChatItem) => {
