@@ -17,10 +17,18 @@ TOOL_NAME = "empty_seat_detection"
 EXECUTION_MODE = "take_photo"
 TOOL_PROMPT = (
     "Identify genuinely empty chairs, benches, couches, or other usable seats in "
-    "this image. Distinguish occupied seats from empty ones. Give a concise count "
-    "and body-relative directions such as left, right, or straight ahead. Do not "
-    "use colors or other visual-only landmarks as the sole navigation cue. If seat "
-    "availability is uncertain or no seating is visible, say so plainly."
+    "this image. Distinguish occupied seats from empty ones. Provide a detailed "
+    "description that includes: the total count of available seats, the type of "
+    "each seat (chair, bench, couch, etc.), the condition and accessibility of "
+    "each seat, body-relative directions such as left, right, or straight ahead, "
+    "and approximate distances when observable. Describe the overall seating area "
+    "layout to help the user understand the arrangement. Use multiple navigation "
+    "cues such as approximate distance, body-relative position, and structural "
+    "landmarks, but do not use colors or other visual-only landmarks as the sole "
+    "navigation cue. If seat availability is uncertain or no seating is visible, "
+    "say so plainly. Return a detailed user-facing response suitable for spoken "
+    "output. Use natural sentences organized in a single paragraph with no "
+    "unnecessary line breaks."
 )
 
 SCENE_SIMILARITY_THRESHOLD = 0.985
