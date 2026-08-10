@@ -168,6 +168,7 @@ Keep these restrictions in one place and follow them strictly:
 
 - Do not modify backend transport, WebSocket handling, frontend code, `ToolRunner`, `stream_server.py`, shared runtime code, or validator behavior just to support one tool. Those changes easily break unrelated tool execution or delivery.
 - Do not access API keys or environment variables directly. The validator rejects environment access, and shared helpers already own credential resolution.
+- Do not reference raw credential variables or explicit API-key fields such as `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `api_key`, or `explicit_api_key`. Those patterns are validator failures even when wrapped indirectly.
 - Do not call provider SDKs directly or construct arbitrary network requests. Use the approved shared model helpers instead, or local processing that passes validation.
 - Do not use subprocesses, multiprocessing, raw filesystem reads or writes, unsafe dynamic imports, or unsupported networking imports. These patterns are validator failures and can break sandbox assumptions.
 - Do not import implementation code from another tool module. Shared behavior belongs in approved shared helpers, not cross-tool coupling.
@@ -188,7 +189,7 @@ Keep these restrictions in one place and follow them strictly:
 Before finishing, verify:
 
 - Only necessary files changed, and the default case stayed limited to the target tool file.
-- The generated-tool validator still passes.
+- The generated-tool validator still passes. Run the repository check in `backend/validate_generated_tools.py` against the changed tool(s) before considering the implementation complete or creating/updating the PR, and fix any validator errors introduced.
 - Any relevant focused tests or existing validation scripts for the changed tool still pass.
 - Single-frame versus multi-frame behavior was chosen deliberately.
 - The selected model profile and strategy match the user request.
