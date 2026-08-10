@@ -659,6 +659,19 @@ export default function IssueChat({
       brainstormHistoryRef.current = result.brainstorm_history || [];
       setActiveToken(result.token);
 
+      if (result.status === 'agent_answer') {
+        append({
+          kind: 'assistant-clarification-answer',
+          id: nextId('assistant-clarification-answer'),
+          ts: new Date(),
+          question: trimmed,
+          answer: result.answer,
+          token: result.token,
+        });
+        setAwaiting('choice');
+        return;
+      }
+
       if (result.status === 'clarification') {
         if (wasAwaitingChoice) resolveLatestChoicePrompt();
         append({
@@ -681,6 +694,7 @@ export default function IssueChat({
       }
 
       setAwaiting('choice');
+      if (wasAwaitingChoice) resolveLatestChoicePrompt();
       if (result.summary) setUnderstandingSummary(result.summary);
       if (result.integration_note) setLastIntegrated(result.integration_note);
       append({
@@ -1059,7 +1073,7 @@ export default function IssueChat({
 
   const placeholder =
     awaiting === 'choice'
-      ? 'Ask a question, or tap an option above…'
+      ? 'Ask a question, add a requirement, or tap an option above…'
       : awaiting === 'answer'
       ? 'Type your answer…'
       : stagedVideoUri
@@ -1075,7 +1089,7 @@ export default function IssueChat({
     : awaiting === 'answer'
     ? 'Send answer'
     : awaiting === 'choice'
-    ? 'Send question'
+    ? 'Send message'
     : 'Send text';
 
   const renderItem = (item: IssueChatItem) => {

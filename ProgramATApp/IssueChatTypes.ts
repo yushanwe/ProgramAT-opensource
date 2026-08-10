@@ -82,6 +82,7 @@ export interface ClaudeProgressResponse {
 
 export type BrainstormTurnResponse =
   | { status: 'clarification'; token: string; answer: string; question: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
+  | { status: 'agent_answer'; token: string; answer: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'brainstorm_choice'; token: string; brainstorm_history: Array<{question: string; answer: string}>; summary?: string; integration_note?: string }
   | { status: 'error'; error: string };
 

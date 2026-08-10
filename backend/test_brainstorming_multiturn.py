@@ -214,22 +214,66 @@ class BrainstormTurnHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual("user_answer", pending["token"]["brainstorm_transcript"][-1]["kind"])
 
-    async def test_repeated_answer_in_choice_phase_is_rejected_without_duplicate(self):
+    async def test_requirement_outside_question_commits_and_exact_retry_is_idempotent(self):
         session = {
             "parsed_data": {"title": "Reader"},
             "video_summary": "",
             "brainstorm_history": [{"question": "Frequency?", "answer": "On changes"}],
             "clarification_history": [],
+            "brainstorm_transcript": [
+                {"kind": "assistant_question", "text": "Frequency?"},
+                {"kind": "user_answer", "text": "On changes"},
+            ],
             "last_question": "Frequency?",
             "last_summary": "Speak on changes",
             "phase": "awaiting_choice",
         }
-        handler, pending, summary_calls = self.make_handler(session, ["substantive_answer"])
+        handler, pending, summary_calls = self.make_handler(
+            session,
+            ["substantive_answer", "substantive_answer"],
+        )
 
-        response = await handler(FakeRequest({"token": "token", "text": "On changes"}))
+        payload = {"token": "token", "text": "Also use a VLM instead of OCR."}
+        first = await handler(FakeRequest(payload))
+        second = await handler(FakeRequest(payload))
 
-        self.assertEqual(409, response["status"])
-        self.assertEqual(1, len(pending["token"]["brainstorm_history"]))
+        self.assertEqual("brainstorm_choice", first["payload"]["status"])
+        self.assertEqual("brainstorm_choice", second["payload"]["status"])
+        self.assertEqual(2, len(pending["token"]["brainstorm_history"]))
+        self.assertEqual(
+            "User-provided requirement or correction",
+            pending["token"]["brainstorm_history"][-1]["question"],
+        )
+        self.assertEqual("user_requirement", pending["token"]["brainstorm_transcript"][-1]["kind"])
+        self.assertEqual(1, len(summary_calls))
+        self.assertEqual("user_statement", summary_calls[0][1]["latest_qa_role"])
+
+    async def test_normal_agent_question_in_choice_phase_has_no_follow_up(self):
+        session = {
+            "parsed_data": {"title": "Reader"},
+            "video_summary": "",
+            "brainstorm_history": [{"question": "Frequency?", "answer": "On changes"}],
+            "clarification_history": [],
+            "brainstorm_transcript": [
+                {"kind": "assistant_question", "text": "Frequency?"},
+                {"kind": "user_answer", "text": "On changes"},
+            ],
+            "last_question": "Frequency?",
+            "last_summary": "Speak on changes",
+            "phase": "awaiting_choice",
+        }
+        handler, pending, summary_calls = self.make_handler(session, ["clarification_question"])
+
+        response = await handler(FakeRequest({
+            "token": "token",
+            "text": "What model would work well for that?",
+        }))
+
+        self.assertEqual("agent_answer", response["payload"]["status"])
+        self.assertEqual("awaiting_choice", pending["token"]["phase"])
+        self.assertEqual("Frequency?", pending["token"]["last_question"])
+        self.assertEqual([], pending["token"]["clarification_history"])
+        self.assertEqual(2, len(pending["token"]["brainstorm_transcript"]))
         self.assertEqual([], summary_calls)
 
 

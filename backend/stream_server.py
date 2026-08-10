@@ -6479,6 +6479,8 @@ async def generate_understanding_summary(
         la = latest_qa.get('answer', '').strip()
         if latest_qa_role == 'user_question':
             latest_section = f"\n\nMost recent exchange (just now):\nThey asked: {lq}\nYou answered: {la}"
+        elif latest_qa_role == 'user_statement':
+            latest_section = f"\n\nMost recent requirement or correction (just now):\nThey said: {la}"
         else:
             latest_section = f"\n\nMost recent exchange (just now):\nYou asked: {lq}\nThey answered: {la}"
         prompt = (
@@ -7557,16 +7559,30 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
     )
 
     if turn_kind == 'substantive_answer':
-        if phase != 'awaiting_answer':
+        if phase not in {'awaiting_answer', 'awaiting_choice'}:
             return web.json_response({
                 'status': 'error',
-                'error': 'Choose Keep Brainstorming or Start Building before providing another answer.',
+                'error': 'This brainstorming session is not ready for another response.',
             }, status=409)
 
-        new_qa = {'question': active_question, 'answer': user_text}
+        if phase == 'awaiting_choice':
+            cached = entry.get('last_commit_response')
+            if entry.get('last_committed_text') == user_text and isinstance(cached, dict):
+                return web.json_response(cached)
+            new_qa = {
+                'question': 'User-provided requirement or correction',
+                'answer': user_text,
+            }
+            transcript_kind = 'user_requirement'
+            latest_role = 'user_statement'
+        else:
+            new_qa = {'question': active_question, 'answer': user_text}
+            transcript_kind = 'user_answer'
+            latest_role = 'assistant_question'
+
         brainstorm_history = brainstorm_history + [new_qa]
         entry['brainstorm_history'] = brainstorm_history
-        _append_brainstorm_transcript(entry, 'user_answer', user_text)
+        _append_brainstorm_transcript(entry, transcript_kind, user_text)
         entry['phase'] = 'awaiting_choice'
         await _broadcast_ws({'type': 'progress', 'message': 'Summarizing what I understood…'})
         try:
@@ -7575,6 +7591,7 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
                 video_summary,
                 brainstorm_history,
                 latest_qa=new_qa,
+                latest_qa_role=latest_role,
                 clarification_context=clarification_history,
             )
         except Exception:
@@ -7584,14 +7601,17 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
             summary = entry.get('last_summary', '')
         entry['last_summary'] = summary
         entry['clarification_history'] = []
-        logger.info("Committed brainstorm answer (token=%s, history size=%d)", token, len(brainstorm_history))
-        return web.json_response({
+        logger.info("Committed brainstorm requirement (token=%s, history size=%d)", token, len(brainstorm_history))
+        response_payload = {
             'status': 'brainstorm_choice',
             'token': token,
             'brainstorm_history': brainstorm_history,
             'summary': summary,
             'integration_note': integration_note,
-        })
+        }
+        entry['last_committed_text'] = user_text
+        entry['last_commit_response'] = response_payload
+        return web.json_response(response_payload)
 
     await _broadcast_ws({'type': 'progress', 'message': 'Answering your question…'})
 
@@ -7608,6 +7628,19 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
     except Exception:
         logger.warning("answer_brainstorm_question failed in /brainstorm-ask-agent", exc_info=True)
         answer = "Sorry, I wasn't able to answer that just now."
+
+    # A question asked while the choice controls are showing is ordinary
+    # conversation, not a clarification of an active brainstorming question.
+    # Answer it directly and leave the session at the choice phase.
+    if phase == 'awaiting_choice':
+        return web.json_response({
+            'status': 'agent_answer',
+            'token': token,
+            'answer': answer,
+            'brainstorm_history': brainstorm_history,
+            'summary': entry.get('last_summary', ''),
+            'integration_note': '',
+        })
 
     try:
         follow_up = await generate_brainstorm_clarification_followup(

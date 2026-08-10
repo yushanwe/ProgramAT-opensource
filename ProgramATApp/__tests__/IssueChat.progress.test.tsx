@@ -511,6 +511,32 @@ describe('IssueChat Claude progress', () => {
         }],
         summary: 'The tool reads nearby signs and announces changed results immediately.',
         integration_note: 'Announce changed results immediately.',
+      })
+      .mockResolvedValueOnce({
+        status: 'agent_answer',
+        token: 'brainstorm-token',
+        answer: 'A lightweight vision model would be a reasonable fit.',
+        brainstorm_history: [{
+          question: 'How quickly should it announce a changed result?',
+          answer: 'Immediately.',
+        }],
+        summary: 'The tool reads nearby signs and announces changed results immediately.',
+      })
+      .mockResolvedValueOnce({
+        status: 'brainstorm_choice',
+        token: 'brainstorm-token',
+        brainstorm_history: [
+          {
+            question: 'How quickly should it announce a changed result?',
+            answer: 'Immediately.',
+          },
+          {
+            question: 'User-provided requirement or correction',
+            answer: 'Actually, use a VLM.',
+          },
+        ],
+        summary: 'The tool reads nearby signs with a VLM and announces changed results immediately.',
+        integration_note: 'Corrected: use a VLM.',
       });
 
     const renderer = await renderWithTheme(<IssueChat selectedIssue={null} />);
@@ -581,6 +607,43 @@ describe('IssueChat Claude progress', () => {
     expect(renderer.root.findAllByProps({ children: '🧠 Keep Brainstorming' }).length).toBeGreaterThan(0);
     expect(renderer.root.findAllByProps({ children: '🚀 Start Building' }).length).toBeGreaterThan(0);
 
+    const questionCountBeforeNormalAgentTurn = renderer.root.findAll((node) =>
+      typeof node.props?.accessibilityLabel === 'string'
+      && node.props.accessibilityLabel.startsWith('Assistant said:'),
+    ).length;
+    await act(async () => {
+      renderer.root.findByType(TextInput).props.onChangeText('What model would work well for that?');
+    });
+    await act(async () => {
+      renderer.root.findAllByType(TouchableOpacity)
+        .find((node) => node.props.accessibilityLabel === 'Send message')!
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(renderer.root.findAllByProps({ children: 'A lightweight vision model would be a reasonable fit.' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAll((node) =>
+      typeof node.props?.accessibilityLabel === 'string'
+      && node.props.accessibilityLabel.startsWith('Assistant said:'),
+    )).toHaveLength(questionCountBeforeNormalAgentTurn);
+    expect(renderer.root.findAllByProps({ children: '🧠 Keep Brainstorming' }).length).toBeGreaterThan(0);
+
+    await act(async () => {
+      renderer.root.findByType(TextInput).props.onChangeText('Actually, use a VLM.');
+    });
+    await act(async () => {
+      renderer.root.findAllByType(TouchableOpacity)
+        .find((node) => node.props.accessibilityLabel === 'Send message')!
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(mockSubmitBrainstormTurn).toHaveBeenNthCalledWith(5, 'brainstorm-token', 'Actually, use a VLM.');
+    expect(renderer.root.findAllByProps({ children: 'The tool reads nearby signs with a VLM and announces changed results immediately.' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByType(TouchableOpacity).filter(
+      (node) => node.props.accessibilityLabel === 'Start building',
+    )).toHaveLength(1);
+
     await act(async () => {
       renderer.root.findAllByType(TouchableOpacity)
         .find((node) => node.props.accessibilityLabel === 'Start building')!
@@ -589,7 +652,7 @@ describe('IssueChat Claude progress', () => {
     });
 
     expect(mockSubmitCreation).toHaveBeenNthCalledWith(2, {
-      text: 'Immediately.',
+      text: 'Actually, use a VLM.',
       token: 'brainstorm-token',
       choice: 'start_building',
     });

@@ -185,6 +185,7 @@ def format_brainstorm_transcript(
         "user_clarification": "User clarification question",
         "assistant_clarification": "Assistant clarification answer",
         "user_answer": "A",
+        "user_requirement": "User requirement or correction",
     }
     lines: List[str] = []
     for event in session_transcript or []:
