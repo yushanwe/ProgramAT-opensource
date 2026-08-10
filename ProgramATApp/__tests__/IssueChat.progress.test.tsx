@@ -1,6 +1,6 @@
 import React from 'react';
 import ReactTestRenderer, { act } from 'react-test-renderer';
-import { AccessibilityInfo, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { AccessibilityInfo, ScrollView, TextInput, TouchableOpacity, View } from 'react-native';
 import IssueChat from '../IssueChat';
 import { ThemeProvider } from '../ThemeContext';
 import {
@@ -66,18 +66,18 @@ jest.mock('../RayBanRecorderModal', () => 'RayBanRecorderModal');
 const mockSubmitUpdate = jest.fn();
 const mockSubmitCreation = jest.fn();
 const mockNextBrainstormQuestion = jest.fn();
-const mockAskBrainstormAgent = jest.fn();
+const mockSubmitBrainstormTurn = jest.fn();
 const mockFetchClaudeProgress = jest.fn();
 
 jest.mock('../IssueSubmissionService', () => ({
   submitUpdate: (...args: any[]) => mockSubmitUpdate(...args),
   submitCreation: (...args: any[]) => mockSubmitCreation(...args),
   nextBrainstormQuestion: (...args: any[]) => mockNextBrainstormQuestion(...args),
-  askBrainstormAgent: (...args: any[]) => mockAskBrainstormAgent(...args),
+  submitBrainstormTurn: (...args: any[]) => mockSubmitBrainstormTurn(...args),
   fetchClaudeProgress: (...args: any[]) => mockFetchClaudeProgress(...args),
 }));
 
-const announceSpy = jest.spyOn(AccessibilityInfo, 'announceForAccessibility').mockImplementation(jest.fn());
+jest.spyOn(AccessibilityInfo, 'announceForAccessibility').mockImplementation(jest.fn());
 const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
 
 describe('IssueChat Claude progress', () => {
@@ -115,7 +115,7 @@ describe('IssueChat Claude progress', () => {
     mockSubmitUpdate.mockReset();
     mockSubmitCreation.mockReset();
     mockNextBrainstormQuestion.mockReset();
-    mockAskBrainstormAgent.mockReset();
+    mockSubmitBrainstormTurn.mockReset();
     mockFetchClaudeProgress.mockReset();
     (AccessibilityInfo as any).setAccessibilityFocus = jest.fn();
   });
@@ -471,6 +471,128 @@ describe('IssueChat Claude progress', () => {
       await Promise.resolve();
     });
     expect(mockPlayLoadingSound).toHaveBeenCalledTimes(2);
+  });
+
+  test('keeps clarification turns open and updates understanding only after an answer', async () => {
+    mockSubmitCreation
+      .mockResolvedValueOnce({
+        status: 'ideation',
+        token: 'brainstorm-token',
+        question: 'How often should the tool speak?',
+        summary: 'The tool reads nearby signs.',
+      })
+      .mockResolvedValueOnce({
+        status: 'created',
+        issue_number: 88,
+        issue_url: 'https://github.test/issues/88',
+        video_summary: '',
+      });
+    mockSubmitBrainstormTurn
+      .mockResolvedValueOnce({
+        status: 'clarification',
+        token: 'brainstorm-token',
+        answer: 'Streaming checks frames continuously.',
+        question: 'Should it speak only when the result changes?',
+        brainstorm_history: [],
+      })
+      .mockResolvedValueOnce({
+        status: 'clarification',
+        token: 'brainstorm-token',
+        answer: 'Speaking only on changes avoids repetitive announcements.',
+        question: 'How quickly should it announce a changed result?',
+        brainstorm_history: [],
+      })
+      .mockResolvedValueOnce({
+        status: 'brainstorm_choice',
+        token: 'brainstorm-token',
+        brainstorm_history: [{
+          question: 'How quickly should it announce a changed result?',
+          answer: 'Immediately.',
+        }],
+        summary: 'The tool reads nearby signs and announces changed results immediately.',
+        integration_note: 'Announce changed results immediately.',
+      });
+
+    const renderer = await renderWithTheme(<IssueChat selectedIssue={null} />);
+
+    await act(async () => {
+      renderer.root.findByType(TextInput).props.onChangeText('Build a sign reader');
+    });
+    await act(async () => {
+      renderer.root.findAllByType(TouchableOpacity)
+        .find((node) => node.props.accessibilityLabel === 'Send text')!
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      renderer.root.findByType(TextInput).props.onChangeText('what does streaming mean');
+    });
+    await act(async () => {
+      renderer.root.findAllByType(TouchableOpacity)
+        .find((node) => node.props.accessibilityLabel === 'Send answer')!
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(mockSubmitBrainstormTurn).toHaveBeenNthCalledWith(
+      1,
+      'brainstorm-token',
+      'what does streaming mean',
+    );
+    expect(renderer.root.findAllByProps({ children: 'Streaming checks frames continuously.' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ children: 'Should it speak only when the result changes?' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ accessibilityLabel: 'Assistant answered: Streaming checks frames continuously.' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ accessibilityLabel: 'Assistant said: Should it speak only when the result changes?' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ children: 'The tool reads nearby signs.' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ children: 'The tool reads nearby signs and announces changed results immediately.' })).toHaveLength(0);
+
+    await act(async () => {
+      renderer.root.findByType(TextInput).props.onChangeText('why is that better');
+    });
+    await act(async () => {
+      renderer.root.findAllByType(TouchableOpacity)
+        .find((node) => node.props.accessibilityLabel === 'Send answer')!
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(mockSubmitBrainstormTurn).toHaveBeenNthCalledWith(
+      2,
+      'brainstorm-token',
+      'why is that better',
+    );
+    expect(renderer.root.findAllByProps({ children: 'Speaking only on changes avoids repetitive announcements.' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ children: 'How quickly should it announce a changed result?' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ children: 'The tool reads nearby signs.' }).length).toBeGreaterThan(0);
+
+    await act(async () => {
+      renderer.root.findByType(TextInput).props.onChangeText('Immediately.');
+    });
+    await act(async () => {
+      renderer.root.findAllByType(TouchableOpacity)
+        .find((node) => node.props.accessibilityLabel === 'Send answer')!
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(mockSubmitBrainstormTurn).toHaveBeenNthCalledWith(3, 'brainstorm-token', 'Immediately.');
+    expect(renderer.root.findAllByProps({ children: 'The tool reads nearby signs and announces changed results immediately.' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ children: '🧠 Keep Brainstorming' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ children: '🚀 Start Building' }).length).toBeGreaterThan(0);
+
+    await act(async () => {
+      renderer.root.findAllByType(TouchableOpacity)
+        .find((node) => node.props.accessibilityLabel === 'Start building')!
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(mockSubmitCreation).toHaveBeenNthCalledWith(2, {
+      text: 'Immediately.',
+      token: 'brainstorm-token',
+      choice: 'start_building',
+    });
   });
 });
 

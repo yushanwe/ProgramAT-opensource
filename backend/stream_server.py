@@ -113,6 +113,7 @@ from nvidia_hosted_client import (
 from brainstorming import (
     build_clarified_update_request,
     build_update_brainstorm_context,
+    format_brainstorm_transcript,
     generate_brainstorming_question,
 )
 import re
@@ -306,8 +307,28 @@ USER_LOGS_DIR.mkdir(exist_ok=True, parents=True)
 
 # Get server identity for logging
 import socket
-SERVER_HOSTNAME = socket.gethostname()
-SERVER_IP = socket.gethostbyname(SERVER_HOSTNAME) if SERVER_HOSTNAME else 'unknown'
+
+
+def _resolve_server_identity() -> tuple[str, str]:
+    """Return best-effort identity without making DNS a startup dependency."""
+    try:
+        hostname = socket.gethostname() or 'unknown'
+    except OSError:
+        return 'unknown', 'unknown'
+
+    if hostname == 'unknown':
+        return hostname, 'unknown'
+
+    try:
+        return hostname, socket.gethostbyname(hostname)
+    except OSError:
+        # Local hostnames are not guaranteed to exist in DNS or /etc/hosts.
+        # This address is used only in diagnostic logs, so startup should
+        # continue when it cannot be resolved.
+        return hostname, 'unknown'
+
+
+SERVER_HOSTNAME, SERVER_IP = _resolve_server_identity()
 
 
 class SessionLogger:
@@ -5879,6 +5900,8 @@ async def generate_ideation_question(parsed_data: dict, video_summary: str, brai
 async def answer_brainstorm_question(
     parsed_data: dict, video_summary: str, brainstorm_context: list, user_question: str,
     update_context: Optional[Dict[str, Any]] = None,
+    clarification_context: Optional[List[Dict[str, str]]] = None,
+    active_question: str = '',
 ) -> str:
     """
     Ask the system LLM to directly respond to a free-form message the user
@@ -5920,6 +5943,26 @@ async def answer_brainstorm_question(
                 brainstorm_pairs.append(f"Q: {q}\nA: {a}")
         if brainstorm_pairs:
             brainstorm_section = "\n\nPrevious brainstorming rounds:\n" + "\n\n".join(brainstorm_pairs)
+
+    clarification_section = ''
+    if clarification_context:
+        clarification_turns = []
+        for turn in clarification_context:
+            user_text = str(turn.get('user_question', '')).strip()
+            agent_answer = str(turn.get('agent_answer', '')).strip()
+            follow_up = str(turn.get('follow_up_question', '')).strip()
+            if user_text and agent_answer:
+                clarification_turns.append(
+                    f"User clarification: {user_text}\n"
+                    f"Assistant answer: {agent_answer}\n"
+                    f"Follow-up question: {follow_up}"
+                )
+        if clarification_turns:
+            clarification_section = (
+                "\n\nUncommitted clarification dialogue from the current round. "
+                "Use it for conversational context, but do not treat it as a confirmed requirement:\n"
+                + "\n\n".join(clarification_turns)
+            )
 
     implementation_section = ''
     if update_context:
@@ -5964,6 +6007,8 @@ async def answer_brainstorm_question(
         f"{implementation_section}"
         f"{video_section}"
         f"{brainstorm_section}"
+        f"{clarification_section}"
+        f"\n\nThe assistant's currently active brainstorming question:\n{active_question}"
         f"\n\nUser's question:\n{user_question}"
     )
 
@@ -5979,6 +6024,112 @@ async def answer_brainstorm_question(
         logger.warning("answer_brainstorm_question failed", exc_info=True)
 
     return "Sorry, I wasn't able to answer that just now. Feel free to try rephrasing, or continue brainstorming."
+
+
+async def classify_brainstorm_turn(
+    active_question: str,
+    user_text: str,
+    brainstorm_history: Optional[List[Dict[str, str]]] = None,
+    clarification_history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Classify a response without mutating brainstorming session state."""
+    prompt = (
+        "Classify the user's response to an active brainstorming question. "
+        "Return JSON only as {\"kind\": \"clarification_question\"} or "
+        "{\"kind\": \"substantive_answer\"}. A clarification_question asks the "
+        "assistant for information, explanation, options, or clarification before the user "
+        "commits an answer. A substantive_answer provides, chooses, corrects, or confirms "
+        "requirements, including short answers such as yes, no, either option, or use streaming. "
+        "Speech transcripts may omit question marks, so classify by meaning rather than punctuation. "
+        "If genuinely uncertain, choose clarification_question.\n\n"
+        f"Active question: {active_question}\n"
+        f"Committed rounds: {json.dumps(brainstorm_history or [], ensure_ascii=False)[:4000]}\n"
+        f"Current clarification dialogue: {json.dumps(clarification_history or [], ensure_ascii=False)[:4000]}\n"
+        f"User response: {user_text}"
+    )
+    try:
+        response = await asyncio.to_thread(
+            system_llm_call,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        parsed = _parse_llm_json_object(extract_text(response).strip())
+        kind = str(parsed.get('kind', '')).strip().lower()
+        if kind in {'clarification_question', 'substantive_answer'}:
+            return kind
+        logger.warning("classify_brainstorm_turn returned an unknown kind: %s", kind)
+        return 'clarification_question'
+    except Exception:
+        logger.warning("classify_brainstorm_turn failed; using conservative fallback", exc_info=True)
+
+    normalized = re.sub(r'\s+', ' ', user_text.strip().lower())
+    question_starters = (
+        'who ', 'what ', 'when ', 'where ', 'why ', 'how ', 'which ',
+        'can ', 'could ', 'would ', 'should ', 'is ', 'are ', 'am ',
+        'do ', 'does ', 'did ', 'will ', 'may ', 'might ',
+        'explain ', 'tell me ', 'help me understand ',
+    )
+    if '?' in normalized or normalized.startswith(question_starters):
+        return 'clarification_question'
+    return 'substantive_answer'
+
+
+def _append_brainstorm_transcript(entry: Dict[str, Any], kind: str, text: str) -> None:
+    value = str(text or '').strip()
+    if not value:
+        return
+    transcript = list(entry.get('brainstorm_transcript') or [])
+    transcript.append({'kind': kind, 'text': value})
+    entry['brainstorm_transcript'] = transcript
+
+
+async def generate_brainstorm_clarification_followup(
+    parsed_data: dict,
+    video_summary: str,
+    brainstorm_history: List[Dict[str, str]],
+    clarification_history: List[Dict[str, str]],
+    previous_question: str,
+    user_question: str,
+    agent_answer: str,
+    update_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Generate the next active question after answering a clarification."""
+    context = {
+        'parsed_data': parsed_data,
+        'video_summary': video_summary,
+        'committed_history': brainstorm_history,
+        'clarification_history': clarification_history,
+        'previous_question': previous_question,
+        'user_question': user_question,
+        'agent_answer': agent_answer,
+    }
+    if update_context:
+        context['current_implementation'] = {
+            'tool_name': update_context.get('tool_name', ''),
+            'tool_source': (update_context.get('tool_source') or '')[:5000],
+            'implementation_summary': update_context.get('implementation_summary') or {},
+        }
+    prompt = (
+        "You are continuing a brainstorming conversation about a camera-based assistive tool "
+        "for a blind or low-vision user. The user asked a clarification question and the assistant "
+        "answered it. Ask exactly one concise, related question that helps the user provide a concrete "
+        "requirement or decision next. Do not summarize or repeat the answer. Return only the question. "
+        "If there is no more specific useful question, return exactly: How would you like to proceed?\n\n"
+        f"Context: {json.dumps(context, ensure_ascii=False)[:12000]}"
+    )
+    try:
+        response = await asyncio.to_thread(
+            system_llm_call,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        question = extract_text(response).strip()
+        if question:
+            question = question.splitlines()[0].strip().strip('"')
+            if not question.endswith('?'):
+                question += '?'
+            return question
+    except Exception:
+        logger.warning("generate_brainstorm_clarification_followup failed", exc_info=True)
+    return "How would you like to proceed?"
 
 
 async def generate_ranked_question_queue(
@@ -6257,6 +6408,7 @@ async def generate_understanding_summary(
     brainstorm_context: list = None,
     latest_qa: dict = None,
     latest_qa_role: str = 'assistant_question',
+    clarification_context: Optional[List[Dict[str, str]]] = None,
 ) -> tuple:
     """
     Ask the system LLM for a brief, conversational restatement of what the
@@ -6302,6 +6454,26 @@ async def generate_understanding_summary(
         if brainstorm_pairs:
             brainstorm_section = "\n\nAdditional details the user gave in follow-up rounds:\n" + "\n\n".join(brainstorm_pairs)
 
+    clarification_section = ''
+    if clarification_context:
+        turns = []
+        for turn in clarification_context:
+            user_question = str(turn.get('user_question', '')).strip()
+            agent_answer = str(turn.get('agent_answer', '')).strip()
+            follow_up = str(turn.get('follow_up_question', '')).strip()
+            if user_question or agent_answer or follow_up:
+                turns.append(
+                    f"User clarification: {user_question}\n"
+                    f"Assistant explanation or options: {agent_answer}\n"
+                    f"Assistant follow-up: {follow_up}"
+                )
+        if turns:
+            clarification_section = (
+                "\n\nClarification dialogue leading to the latest answer. Use this only to "
+                "resolve references such as 'the last option'; assistant wording is context, "
+                "not a user requirement by itself:\n" + "\n\n".join(turns)
+            )
+
     if latest_qa:
         lq = latest_qa.get('question', '').strip()
         la = latest_qa.get('answer', '').strip()
@@ -6335,6 +6507,7 @@ async def generate_understanding_summary(
             f"Constraints and extra context: {additional}"
             f"{video_section}"
             f"{brainstorm_section}"
+            f"{clarification_section}"
             f"{latest_section}"
         )
     else:
@@ -6360,6 +6533,7 @@ async def generate_understanding_summary(
             f"Constraints and extra context: {additional}"
             f"{video_section}"
             f"{brainstorm_section}"
+            f"{clarification_section}"
         )
 
     try:
@@ -7020,24 +7194,33 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
         if choice != 'start_building':
             return web.json_response({'status': 'error', 'error': 'No text provided'}, status=400)
 
-    # --- Shape B: ideation answer received — store in brainstorm history and offer choice ---
-    if token and ideation_answer:
+    # --- Shape B: accept legacy answers or build from an already committed answer ---
+    if token and (ideation_answer or choice == 'start_building'):
         entry = pending_ideation_http.get(token)  # Don't pop yet; keep it for next round
         if entry is None:
             return web.json_response(
                 {'status': 'error', 'error': 'Ideation session expired or not found'},
                 status=400,
             )
+        if choice == 'start_building' and entry.get('phase', 'awaiting_choice') != 'awaiting_choice':
+            return web.json_response(
+                {'status': 'error', 'error': 'Answer the current brainstorming question first.'},
+                status=409,
+            )
         
         # Store the Q&A pair in brainstorm history
         last_question = entry.get('last_question', '')
         brainstorm_history = entry.get('brainstorm_history', [])
-        if last_question and ideation_answer.strip():
+        # New clients commit the answer through /brainstorm-ask-agent before
+        # showing the choice UI. Never append it again when Start Building is
+        # selected. The non-choice branch remains for older clients.
+        if choice != 'start_building' and last_question and ideation_answer.strip():
             brainstorm_history.append({
                 'question': last_question,
                 'answer': ideation_answer.strip()
             })
             entry['brainstorm_history'] = brainstorm_history
+            _append_brainstorm_transcript(entry, 'user_answer', ideation_answer)
             logger.info("Stored brainstorming Q&A pair (total: %d)", len(brainstorm_history))
         
         # If user is starting to build, remove token and proceed to issue creation
@@ -7048,7 +7231,9 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
             video_summary = entry['video_summary']
             
             # Add brainstorm context to parsed data
-            brainstorm_summary = '\n\n'.join([
+            brainstorm_summary = format_brainstorm_transcript(
+                entry.get('brainstorm_transcript')
+            ) or '\n\n'.join([
                 f"Q: {qa.get('question')}\nA: {qa.get('answer')}"
                 for qa in brainstorm_history
             ])
@@ -7071,6 +7256,8 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
             if not summary:
                 summary = entry.get('last_summary', '')
             entry['last_summary'] = summary
+            entry['clarification_history'] = []
+            entry['phase'] = 'awaiting_choice'
             return web.json_response({
                 'status': 'brainstorm_choice',
                 'token': token,
@@ -7149,9 +7336,14 @@ async def handle_creation_submit(request: web.Request) -> web.Response:
                 'parsed_data': parsed_data,
                 'video_summary': video_summary,
                 'brainstorm_history': [],  # Will accumulate Q&A pairs
+                'clarification_history': [],
+                'brainstorm_transcript': [
+                    {'kind': 'assistant_question', 'text': question},
+                ],
                 'question_queue': question_queue[1:],  # Remaining ranked questions
                 'last_question': question,  # Track the question we just asked
                 'last_summary': summary,  # Track the understanding summary we just showed
+                'phase': 'awaiting_answer',
                 'created_at': datetime.now(),
             }
             logger.info("Sending ideation question via HTTP (token=%s, queue_remaining=%d)", new_token, len(question_queue[1:]))
@@ -7246,6 +7438,12 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
             status=400,
         )
 
+    if entry.get('phase', 'awaiting_choice') != 'awaiting_choice':
+        return web.json_response(
+            {'status': 'error', 'error': 'Answer the current brainstorming question first.'},
+            status=409,
+        )
+
     # Brainstorm history already contains all previous Q&A pairs
     brainstorm_history = entry.get('brainstorm_history', [])
 
@@ -7295,6 +7493,9 @@ async def handle_brainstorm_next_question(request: web.Request) -> web.Response:
     # Store the new question and summary for next round
     entry['last_question'] = next_question
     entry['last_summary'] = summary
+    entry['clarification_history'] = []
+    entry['phase'] = 'awaiting_answer'
+    _append_brainstorm_transcript(entry, 'assistant_question', next_question)
 
     logger.info("Sending next brainstorming question (token=%s, history size=%d, queue_remaining=%d)", token, len(brainstorm_history), len(entry['question_queue']))
     return web.json_response({
@@ -7312,12 +7513,13 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
     POST /brainstorm-ask-agent
     Accepts JSON with:
       - 'token': the ideation session token
-      - 'question': a free-form clarifying question from the user
+      - 'text': the user's response to the active question
+      - 'question': legacy alias for 'text'
 
-    One question in, one answer out — not a sub-chat. Answers the question
-    using everything already known about the tool, appends the exchange to
-    the same brainstorm_history the structured questions use, and returns an
-    updated understanding summary (see handle_creation_submit's docstring).
+    Classifies each user turn semantically. Clarification questions are
+    answered without changing committed requirements or the understanding
+    summary, then followed by another related brainstorming question. A
+    substantive answer is committed and advances to the existing choice UI.
     """
     try:
         data = await request.json()
@@ -7325,12 +7527,12 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
         return web.json_response({'status': 'error', 'error': 'Invalid JSON'}, status=400)
 
     token = data.get('token', '')
-    user_question = data.get('question', '').strip()
+    user_text = str(data.get('text') or data.get('question') or '').strip()
 
     if not token:
         return web.json_response({'status': 'error', 'error': 'Missing token'}, status=400)
-    if not user_question:
-        return web.json_response({'status': 'error', 'error': 'Missing question'}, status=400)
+    if not user_text:
+        return web.json_response({'status': 'error', 'error': 'Missing text'}, status=400)
 
     entry = pending_ideation_http.get(token)
     if entry is None:
@@ -7340,44 +7542,117 @@ async def handle_brainstorm_ask_agent(request: web.Request) -> web.Response:
         )
 
     brainstorm_history = entry.get('brainstorm_history', [])
+    clarification_history = entry.get('clarification_history', [])
     parsed_data = entry['parsed_data']
     video_summary = entry['video_summary']
     update_context = entry.get('update_context')
+    active_question = entry.get('last_question', '')
+    phase = entry.get('phase', 'awaiting_answer')
+
+    turn_kind = await classify_brainstorm_turn(
+        active_question,
+        user_text,
+        brainstorm_history,
+        clarification_history,
+    )
+
+    if turn_kind == 'substantive_answer':
+        if phase != 'awaiting_answer':
+            return web.json_response({
+                'status': 'error',
+                'error': 'Choose Keep Brainstorming or Start Building before providing another answer.',
+            }, status=409)
+
+        new_qa = {'question': active_question, 'answer': user_text}
+        brainstorm_history = brainstorm_history + [new_qa]
+        entry['brainstorm_history'] = brainstorm_history
+        _append_brainstorm_transcript(entry, 'user_answer', user_text)
+        entry['phase'] = 'awaiting_choice'
+        await _broadcast_ws({'type': 'progress', 'message': 'Summarizing what I understood…'})
+        try:
+            summary, integration_note = await generate_understanding_summary(
+                parsed_data,
+                video_summary,
+                brainstorm_history,
+                latest_qa=new_qa,
+                clarification_context=clarification_history,
+            )
+        except Exception:
+            logger.warning("generate_understanding_summary failed in /brainstorm-ask-agent", exc_info=True)
+            summary, integration_note = '', ''
+        if not summary:
+            summary = entry.get('last_summary', '')
+        entry['last_summary'] = summary
+        entry['clarification_history'] = []
+        logger.info("Committed brainstorm answer (token=%s, history size=%d)", token, len(brainstorm_history))
+        return web.json_response({
+            'status': 'brainstorm_choice',
+            'token': token,
+            'brainstorm_history': brainstorm_history,
+            'summary': summary,
+            'integration_note': integration_note,
+        })
+
     await _broadcast_ws({'type': 'progress', 'message': 'Answering your question…'})
 
     try:
         answer = await answer_brainstorm_question(
-            parsed_data, video_summary, brainstorm_history, user_question, update_context,
+            parsed_data,
+            video_summary,
+            brainstorm_history,
+            user_text,
+            update_context,
+            clarification_history,
+            active_question,
         )
     except Exception:
         logger.warning("answer_brainstorm_question failed in /brainstorm-ask-agent", exc_info=True)
         answer = "Sorry, I wasn't able to answer that just now."
 
-    new_qa = {'question': user_question, 'answer': answer}
-    brainstorm_history = brainstorm_history + [new_qa]
-    entry['brainstorm_history'] = brainstorm_history
-
     try:
-        summary, integration_note = await generate_understanding_summary(
-            parsed_data, video_summary, brainstorm_history,
-            latest_qa=new_qa, latest_qa_role='user_question',
+        follow_up = await generate_brainstorm_clarification_followup(
+            parsed_data,
+            video_summary,
+            brainstorm_history,
+            clarification_history,
+            active_question,
+            user_text,
+            answer,
+            update_context,
         )
     except Exception:
-        logger.warning("generate_understanding_summary failed in /brainstorm-ask-agent", exc_info=True)
-        summary, integration_note = '', ''
+        logger.warning("follow-up generation failed in /brainstorm-ask-agent", exc_info=True)
+        follow_up = "How would you like to proceed?"
 
-    if not summary:
-        summary = entry.get('last_summary', '')
-    entry['last_summary'] = summary
+    clarification_history = clarification_history + [{
+        'active_question': active_question,
+        'user_question': user_text,
+        'agent_answer': answer,
+        'follow_up_question': follow_up,
+    }]
+    entry['clarification_history'] = clarification_history
+    entry['last_question'] = follow_up
+    entry['phase'] = 'awaiting_answer'
+    _append_brainstorm_transcript(entry, 'user_clarification', user_text)
+    _append_brainstorm_transcript(entry, 'assistant_clarification', answer)
+    _append_brainstorm_transcript(entry, 'assistant_question', follow_up)
 
-    logger.info("Answered free-form brainstorm question (token=%s, history size=%d)", token, len(brainstorm_history))
+    logger.info(
+        "Answered brainstorm clarification (token=%s, committed=%d, clarification turns=%d)",
+        token,
+        len(brainstorm_history),
+        len(clarification_history),
+    )
     return web.json_response({
         'status': 'clarification',
         'token': token,
         'answer': answer,
+        'question': follow_up,
         'brainstorm_history': brainstorm_history,
-        'summary': summary,
-        'integration_note': integration_note,
+        # Preserve the legacy response fields without recalculating or
+        # mutating the understanding during a clarification turn.
+        'summary': entry.get('last_summary', ''),
+        'integration_note': '',
     })
 
 
@@ -7439,22 +7714,28 @@ async def handle_update_submit(request: web.Request) -> web.Response:
     if not issue_number:
         return web.json_response({'status': 'error', 'error': 'No issue_number provided'}, status=400)
 
-    if token and ideation_answer:
+    if token and (ideation_answer or choice == 'start_building'):
         entry = pending_ideation_http.get(token)
         if entry is None:
             return web.json_response(
                 {'status': 'error', 'error': 'Ideation session expired or not found'},
                 status=400,
             )
+        if choice == 'start_building' and entry.get('phase', 'awaiting_choice') != 'awaiting_choice':
+            return web.json_response(
+                {'status': 'error', 'error': 'Answer the current brainstorming question first.'},
+                status=409,
+            )
 
         last_question = entry.get('last_question', '')
         brainstorm_history = entry.get('brainstorm_history', [])
-        if last_question and ideation_answer.strip():
+        if choice != 'start_building' and last_question and ideation_answer.strip():
             brainstorm_history.append({
                 'question': last_question,
                 'answer': ideation_answer.strip(),
             })
             entry['brainstorm_history'] = brainstorm_history
+            _append_brainstorm_transcript(entry, 'user_answer', ideation_answer)
 
         if choice != 'start_building':
             await _broadcast_ws({'type': 'progress', 'message': 'Summarizing what I understood…'})
@@ -7468,6 +7749,8 @@ async def handle_update_submit(request: web.Request) -> web.Response:
             if not summary:
                 summary = entry.get('last_summary', '')
             entry['last_summary'] = summary
+            entry['clarification_history'] = []
+            entry['phase'] = 'awaiting_choice'
             return web.json_response({
                 'status': 'brainstorm_choice',
                 'token': token,
@@ -7482,6 +7765,7 @@ async def handle_update_submit(request: web.Request) -> web.Response:
             entry.get('original_request', ''),
             [qa.get('question', '') for qa in brainstorm_history],
             [qa.get('answer', '') for qa in brainstorm_history],
+            entry.get('brainstorm_transcript'),
         )
         video_summary = entry.get('video_summary', '')
     else:
@@ -7564,9 +7848,14 @@ async def handle_update_submit(request: web.Request) -> web.Response:
                 'parsed_data': parsed_data,
                 'video_summary': video_summary,
                 'brainstorm_history': [],
+                'clarification_history': [],
+                'brainstorm_transcript': [
+                    {'kind': 'assistant_question', 'text': question},
+                ],
                 'question_queue': question_queue[1:],
                 'last_question': question,
                 'last_summary': summary,
+                'phase': 'awaiting_answer',
                 'update_context': update_context,
                 'created_at': datetime.now(),
             }

@@ -154,8 +154,14 @@ def build_clarified_update_request(
     original_request: str,
     questions: List[str],
     answers: List[str],
+    session_transcript: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     lines = ["Original update request:", _stringify(original_request)]
+    transcript = format_brainstorm_transcript(session_transcript)
+    if transcript:
+        lines.extend(["", "Full brainstorming session:", transcript])
+        return "\n".join(lines).strip()
+
     pairs = [
         (q.strip(), (answers[index] if index < len(answers) else "").strip())
         for index, q in enumerate(questions or [])
@@ -168,6 +174,25 @@ def build_clarified_update_request(
             lines.append(f"{index}. Q: {question}")
             lines.append(f"   A: {answer}")
     return "\n".join(lines).strip()
+
+
+def format_brainstorm_transcript(
+    session_transcript: Optional[List[Dict[str, str]]],
+) -> str:
+    """Format the complete dialogue while preserving who supplied each detail."""
+    labels = {
+        "assistant_question": "Q",
+        "user_clarification": "User clarification question",
+        "assistant_clarification": "Assistant clarification answer",
+        "user_answer": "A",
+    }
+    lines: List[str] = []
+    for event in session_transcript or []:
+        text = _stringify((event or {}).get("text"))
+        kind = _stringify((event or {}).get("kind"))
+        if text and kind in labels:
+            lines.append(f"{labels[kind]}: {text}")
+    return "\n".join(lines)
 
 
 def _format_brainstorm_history(brainstorm_context: Optional[List[Dict[str, str]]]) -> str:
